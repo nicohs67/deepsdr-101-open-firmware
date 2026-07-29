@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug GD32F450 (OpenOCD + ST-Link)",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/firmware.elf",
+      "request": "launch",
+      "type": "cortex-debug",
+      "servertype": "openocd",
+      "configFiles": [
+        "interface/stlink.cfg",
+        "${workspaceFolder}/openocd/gd32f450.cfg"
+      ],
+      "preLaunchTask": "build",
+      "runToEntryPoint": "main",
+      "svdFile": ""
+    }
+  ]
+}

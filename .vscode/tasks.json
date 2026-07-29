@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "make",
+      "args": ["-j4"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "make",
+      "args": ["clean"],
+      "group": "build"
+    },
+    {
+      "label": "flash",
+      "type": "shell",
+      "command": "make",
+      "args": ["flash"],
+      "group": "build",
+      "dependsOn": "build"
+    },
+    {
+      "label": "erase",
+      "type": "shell",
+      "command": "make",
+      "args": ["erase"],
+      "group": "build"
+    }
+  ]
+}

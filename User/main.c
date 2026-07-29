@@ -17,41 +17,40 @@ static void demo_screen_draw(void);
 static void sdr_spectrum_waterfall_tick(void);
 static void demo_touch_poll(void);
 
-/* Cambiar a 0 para volver a la demo normal una vez calibrada la altura real. */
+/* Set to 0 to go back to the normal demo once the real panel height is calibrated. */
 #define CALIB_HEIGHT_TEST 0
 #if CALIB_HEIGHT_TEST
 static void calib_height_ruler_draw(void);
 #endif
 
-volatile uint32_t g_msticks = 0; /* incrementado en SysTick_Handler, 1 tick = 1ms real */
-volatile uint16_t g_last_rddpm  = 0; /* ultimo valor leido de RDDPM (0x0A00) */
-volatile uint16_t g_last_rddsdr = 0; /* ultimo valor leido de RDDSDR (0x0F00) */
-volatile uint32_t g_fill_count  = 0; /* cuantos rellenos completos se han hecho */
-volatile uint16_t g_panel_id_check1 = 0; /* respuesta a comando 0x000A del panel */
-volatile uint16_t g_panel_id_check2 = 0; /* respuesta a comando 0x3A00 del panel */
-volatile uint32_t g_system_clock_snapshot = 0; /* copia de SystemCoreClock, para verificar si el reloj arranca bien en frio */
+volatile uint32_t g_msticks = 0; /* incremented in SysTick_Handler, 1 tick = 1ms real time */
+volatile uint16_t g_last_rddpm  = 0; /* last value read from RDDPM (0x0A00) */
+volatile uint16_t g_last_rddsdr = 0; /* last value read from RDDSDR (0x0F00) */
+volatile uint32_t g_fill_count  = 0; /* how many full fills have been done */
+volatile uint16_t g_panel_id_check1 = 0; /* response to panel command 0x000A */
+volatile uint16_t g_panel_id_check2 = 0; /* response to panel command 0x3A00 */
+volatile uint32_t g_system_clock_snapshot = 0; /* copy of SystemCoreClock, to verify clock startup */
 
 int main(void)
 {
-    /* CRITICO al vivir encadenados tras el bootloader: nuestra tabla de
-     * vectores ya no esta en 0x08000000 (esa es la del bootloader), sino
-     * en 0x08020000. Sin esto, CUALQUIER interrupcion (incluido nuestro
-     * propio SysTick) buscaria su manejador en la tabla de vectores DEL
-     * BOOTLOADER, no en la nuestra - debe ser lo PRIMERO que hagamos. */
+    /* Critical when chained after a bootloader: our vector table is no
+     * longer at 0x08000000 (that's the bootloader's), but at
+     * 0x08020000. Without this, any interrupt (including our own
+     * SysTick) would look up its handler in the BOOTLOADER's vector
+     * table, not ours - this must be the FIRST thing we do. */
     SCB->VTOR = 0x08020000;
 
     /*
-     * Limpiar el NVIC heredado del bootloader ANTES de reactivar
-     * interrupciones globales. El bootloader pudo dejar habilitadas a
-     * nivel de NVIC interrupciones suyas (su propio SysTick, algun DMA,
-     * etc.) que, con VTOR ya apuntando a NUESTRA tabla de vectores
-     * (posiciones sin usar = Default_Handler, un bucle infinito mudo),
-     * saltarian a un cuelgue silencioso en cuanto se desenmascararan -
-     * exactamente lo que paso al mover __enable_irq() demasiado pronto
-     * sin este paso antes. Deshabilitar todo + limpiar pendientes deja
-     * un estado limpio; nuestro propio codigo reactiva selectivamente
-     * solo lo que configura (SysTick_Config mas abajo, EXTI2 en
-     * touch_init() mas adelante).
+     * Clear the NVIC state inherited from the bootloader BEFORE
+     * re-enabling global interrupts. The bootloader may have left some
+     * of its own interrupts enabled at the NVIC level (its own
+     * SysTick, some DMA, etc.) which, with VTOR already pointing at
+     * OUR vector table (unused entries = Default_Handler, a silent
+     * infinite loop), would jump into a silent hang the moment they
+     * got unmasked. Disabling everything and clearing pending flags
+     * gives a clean slate; our own code then selectively re-enables
+     * only what it configures (SysTick_Config below, EXTI2 later in
+     * touch_init()).
      */
     {
         uint8_t i;
@@ -62,36 +61,26 @@ int main(void)
     }
 
     /*
-     * Tambien critico al vivir encadenados tras el bootloader: es
-     * practica habitual que un bootloader deje las interrupciones
-     * globalmente deshabilitadas (PRIMASK) antes de saltar a la
-     * aplicacion, para no traspasar estado de IRQ a medias. Sin este
-     * __enable_irq() aqui, NINGUNA interrupcion (SysTick incluido, EXTI
-     * de touch.c mas adelante) llegaria a dispararse nunca, aunque toda
-     * la configuracion de NVIC/EXTI sea correcta - exactamente lo que se
-     * vio en pruebas reales: PENIRQ cambia de nivel bien (eso es lectura
-     * directa de GPIO, no depende de interrupciones), pero
-     * EXTI2_IRQHandler nunca se ejecutaba ni una sola vez.
+     * Also critical when chained after a bootloader: it's common for a
+     * bootloader to leave interrupts globally disabled (PRIMASK)
+     * before jumping to the application, to avoid handing off IRQ
+     * state half-configured. Without this __enable_irq() here, NO
+     * interrupt (SysTick included, touch.c's EXTI later on) would ever
+     * fire, even with fully correct NVIC/EXTI configuration.
      */
     __enable_irq();
 
     /*
-     * SystemInit() ya se ha llamado desde el startup antes de main():
-     * configura PLL/HXTAL segun system_gd32f4xx.c. Revisa ese fichero
-     * si necesitas otra frecuencia de reloj distinta a la de fabrica.
+     * SystemInit() has already been called from the startup code
+     * before main(): it configures PLL/HXTAL per system_gd32f4xx.c.
+     * See that file for the active clock configuration.
      *
-     * IMPORTANTE: la funcion de reloj activa (system_clock_200m_25m_hxtal)
-     * asume 25MHz de HXTAL en sus divisores de PLL fijos (PSC=25), pero
-     * el cristal real de esta placa es de 12.288MHz (confirmado con
-     * osciloscopio en PH0). HXTAL_VALUE ya esta corregido via -D en el
-     * Makefile, pero eso NO cambia los divisores PSC/PLLN/PLLP ya
-     * programados en el hardware (son fijos, calculados para 25MHz) -
-     * solo corrige el CALCULO de SystemCoreClock para que refleje la
-     * realidad: el nucleo esta corriendo a ~98.3MHz de verdad, no a
-     * 200MHz. SystemCoreClockUpdate() releé los registros reales del PLL
-     * y recalcula SystemCoreClock con el HXTAL_VALUE correcto - sin
-     * llamar a esto, SystemCoreClock se queda en el literal 200000000
-     * incorrecto con el que arranca el fichero del fabricante.
+     * HXTAL_VALUE is set correctly via -D in the Makefile, matching
+     * this board's real 12.288MHz crystal. SystemCoreClockUpdate()
+     * re-reads the live PLL registers and recalculates
+     * SystemCoreClock using that value - without calling it,
+     * SystemCoreClock stays at the incorrect literal the vendor
+     * startup file initializes it to.
      */
     SystemCoreClockUpdate();
 
@@ -99,68 +88,44 @@ int main(void)
     led_gpio_init();
     debug_uart_init();
 
-    debug_print("\n\n=== ARRANQUE (encadenado tras bootloader) ===\n");
-    debug_print_hex32("VTOR leido de vuelta", SCB->VTOR);
+    debug_print("\n\n=== STARTUP (chained after bootloader) ===\n");
+    debug_print_hex32("VTOR read back", SCB->VTOR);
 
-    /* Snapshot de SystemCoreClock lo antes posible, para verificar por
-     * depurador si el reloj arranco a los 200MHz esperados o si el
-     * cristal HXTAL fallo y quedo en un estado distinto (silenciosamente). */
+    /* Snapshot of SystemCoreClock as early as possible, to verify via
+     * debugger whether the clock came up at the expected frequency or
+     * whether the HXTAL crystal failed and silently settled elsewhere. */
     g_system_clock_snapshot = SystemCoreClock;
     debug_print_hex32("SystemCoreClock", g_system_clock_snapshot);
 
-    /* DIAGNOSTICO: RCU_PLLI2S lo antes posible, para acotar en que punto
-     * exacto del arranque cambia de 0x40003000 (valor visto con el
-     * firmware original) a 0x24003000 (visto con el nuestro justo antes
-     * de gd32_i2s_init_master_48k) - quitar una vez localizada la causa. */
-    debug_print_hex32("RCU_PLLI2S lo antes posible en main()", RCU_PLLI2S);
+    debug_print_hex32("RCU_PLLI2S as early as possible in main()", RCU_PLLI2S);
 
-    /*
-     * Hasta ahora esta sesion completa confiaba en que el bootloader
-     * dejara GPIO/EXMC/panel ya inicializados, y dibujabamos encima sin
-     * tocar nada (por eso funciono todo el rato sin llamar a
-     * rm68120_init()). Con el reloj ya corregido (HXTAL=12.288MHz real,
-     * afecta a la precision de los tiempos del bus EXMC) y una
-     * secuencia de init nueva confirmada en hardware real (ver
-     * rm68120_exmc.h/.c), toca probar rm68120_init() por primera vez en
-     * toda la sesion. RIESGO: si esto deja la pantalla peor de lo que
-     * estaba (en vez de mejor), cambiar TRY_RM68120_INIT a 0 para volver
-     * al comportamiento anterior (confiar en el bootloader, no tocar
-     * GPIO/EXMC nosotros).
-     */
-#define TRY_RM68120_INIT 1
-#if TRY_RM68120_INIT
-    debug_print("Llamando a rm68120_init() por primera vez esta sesion...\n");
+    debug_print("Calling rm68120_init() for the first time this session...\n");
     rm68120_init();
-    debug_print("rm68120_init() completado\n");
-    debug_print_hex32("RCU_PLLI2S tras rm68120_init", RCU_PLLI2S);
-#else
-    debug_print("PRUEBA: NO llamamos a rm68120_init(). Confiamos en que el bootloader\n"
-                "ya dejo el GPIO/EXMC/panel correctamente inicializados, y dibujamos\n"
-                "directamente encima.\n");
-#endif
+    debug_print("rm68120_init() done\n");
+    debug_print_hex32("RCU_PLLI2S after rm68120_init", RCU_PLLI2S);
 
     waterfall_init();
     touch_init();
-    debug_print_hex32("RCU_PLLI2S tras touch_init", RCU_PLLI2S);
+    debug_print_hex32("RCU_PLLI2S after touch_init", RCU_PLLI2S);
 
-    debug_print("\n--- AIC3204: fase 1 (solo comunicacion I2C) ---\n");
+    debug_print("\n--- AIC3204: phase 1 (I2C communication only) ---\n");
     aic3204_init(AIC3204_ADDR_DEFAULT);
     if (!aic3204_probe_and_reset()) {
-        debug_print("aic3204: probando con 0x19 (pin MODE a VDD)...\n");
+        debug_print("aic3204: trying 0x19 (MODE pin tied to VDD)...\n");
         aic3204_init(0x19);
         if (!aic3204_probe_and_reset()) {
             aic3204_scan_bus();
         }
     }
-    debug_print_hex32("RCU_PLLI2S tras aic3204", RCU_PLLI2S);
+    debug_print_hex32("RCU_PLLI2S after aic3204", RCU_PLLI2S);
 
-    debug_print("\n--- I2S1: fase 3 (relojes + DMA circular, tono de prueba) ---\n");
+    debug_print("\n--- I2S1: phase 3 (clocks + circular DMA, test tone) ---\n");
     gd32_i2s_init_master_48k();
 
-    debug_print("\n--- AIC3204: fase 2 (reloj + ADC diferencial I/Q + power-up) ---\n");
+    debug_print("\n--- AIC3204: phase 2 (clock + differential I/Q ADC + power-up) ---\n");
     aic3204_phase2_init();
 
-    debug_print("\n--- SDR: fase 4 (captura RX real + FFT + espectro/cascada) ---\n");
+    debug_print("\n--- SDR: phase 4 (real RX capture + FFT + spectrum/waterfall) ---\n");
     fft_init();
     sdr_rx_init();
 
@@ -170,7 +135,7 @@ int main(void)
     demo_screen_draw();
 #endif
 
-    debug_print("main: entrando en el bucle principal\n");
+    debug_print("main: entering the main loop\n");
 
     while (1) {
         gpio_bit_toggle(GPIOA, GPIO_PIN_8);
@@ -185,21 +150,21 @@ int main(void)
         if ((g_fill_count % 50) == 0) {
             debug_print_dec("waterfall ticks", g_fill_count);
 #if !CALIB_HEIGHT_TEST
-            debug_print_dec("PENIRQ nivel crudo (1=activo/bajo)", touch_is_pressed());
-            debug_print_dec("EXTI2 disparos reales desde el arranque", touch_irq_count());
+            debug_print_dec("PENIRQ raw level (1=active/low)", touch_is_pressed());
+            debug_print_dec("EXTI2 real triggers since startup", touch_irq_count());
 #endif
         }
     }
 }
 
 /*
- * Build de calibracion: dibuja una regla horizontal (marca + etiqueta de
- * texto con el valor de Y) cada 40px desde 0 hasta GFX_SCREEN_HEIGHT-1,
- * mas un borde exacto en (0,0,GFX_SCREEN_WIDTH-1,GFX_SCREEN_HEIGHT-1).
- * Fotografiar el panel y comparar: la ultima etiqueta que se lea
- * COMPLETA (no cortada) antes del borde inferior real del panel indica
- * la altura util de verdad. Si el borde inferior dibujado no llega a
- * verse, GFX_SCREEN_HEIGHT sigue siendo mayor que la altura fisica real.
+ * Calibration build: draws a horizontal ruler (tick + text label with
+ * the Y value) every 40px from 0 to GFX_SCREEN_HEIGHT-1, plus an exact
+ * border at (0,0,GFX_SCREEN_WIDTH-1,GFX_SCREEN_HEIGHT-1). Photograph
+ * the panel and compare: the last label that reads COMPLETE (not cut
+ * off) before the panel's real bottom edge indicates the true usable
+ * height. If the drawn bottom border isn't visible at all,
+ * GFX_SCREEN_HEIGHT is still larger than the real physical height.
  */
 #if CALIB_HEIGHT_TEST
 static void calib_height_ruler_draw(void)
@@ -209,7 +174,7 @@ static void calib_height_ruler_draw(void)
 
     gfx_fill_screen(GFX_COLOR_BLACK);
 
-    /* Borde exacto en los limites que asumimos ahora mismo */
+    /* Exact border at the limits we currently assume */
     gfx_rect(0, 0, GFX_SCREEN_WIDTH, GFX_SCREEN_HEIGHT, GFX_COLOR_RED);
 
     for (y = 0; y < GFX_SCREEN_HEIGHT; y += 40) {
@@ -218,7 +183,7 @@ static void calib_height_ruler_draw(void)
         char tmp[8];
         uint8_t n = 0;
 
-        /* itoa manual (sin sprintf, para no arrastrar mas newlib) */
+        /* Manual itoa (no sprintf, to avoid pulling in more of newlib) */
         if (v == 0) {
             tmp[n++] = '0';
         } else {
@@ -240,22 +205,22 @@ static void calib_height_ruler_draw(void)
 #endif /* CALIB_HEIGHT_TEST */
 
 /*
- * Pantalla de demo fija: valida gfx.c/ui.c en hardware real (panel,
- * bus EXMC, orientacion) y sirve de plantilla para como registrar
- * widgets en un ui_screen_t. Se pinta una sola vez; el waterfall se va
- * actualizando aparte en demo_waterfall_tick().
+ * Fixed demo screen: validates gfx.c/ui.c on real hardware (panel,
+ * EXMC bus, orientation) and serves as a template for how to register
+ * widgets in a ui_screen_t. Drawn once; the waterfall is updated
+ * separately in sdr_spectrum_waterfall_tick().
  *
- * Layout (horizontal 800x480 - confirmado con hardware real, ver
- * comentario de GFX_SCREEN_WIDTH/HEIGHT en gfx.h):
- *   - Barra de titulo arriba (24px)
- *   - Marco de "espectro" (placeholder, aun sin datos de FFT reales)
- *   - Zona de waterfall (WATERFALL_ROWS filas de WATERFALL_WIDTH px)
- *   - Fila de botones de ejemplo abajo
+ * Layout (landscape 800x480 - confirmed on real hardware, see the
+ * GFX_SCREEN_WIDTH/HEIGHT comment in gfx.h):
+ *   - Title bar at the top (24px)
+ *   - "Spectrum" frame
+ *   - Waterfall area (WATERFALL_ROWS rows of WATERFALL_WIDTH px)
+ *   - Example button row at the bottom
  *
- * Las Y de cada zona se definen como constantes con enlazado interno
- * (static const, no macros) para que demo_waterfall_tick() use
- * exactamente el mismo valor de waterfall_y que demo_screen_draw(), sin
- * duplicar el calculo a mano.
+ * Each zone's Y coordinate is defined as an internally-linked constant
+ * (static const, not a macro) so sdr_spectrum_waterfall_tick() uses
+ * exactly the same waterfall_y value as demo_screen_draw(), without
+ * duplicating the calculation by hand.
  */
 static const uint16_t DEMO_TITLE_H     = 24;
 static const uint16_t DEMO_SPECTRUM_Y  = 24;
@@ -264,14 +229,14 @@ static const uint16_t DEMO_WATERFALL_Y = 24 + 140 + 2;
 static const uint16_t DEMO_BTN_Y       = 24 + 140 + 2 + WATERFALL_ROWS + 10;
 
 /*
- * IMPORTANTE: estos widgets son estaticos (no locales de
- * demo_screen_draw()) a proposito. ui_screen_t solo guarda PUNTEROS a
- * ellos (para no duplicar datos ni depender de malloc), asi que tienen
- * que seguir vivos mientras exista la pantalla - si fueran variables de
- * pila de una funcion que ya ha retornado, ui_screen_touch() estaria
- * leyendo memoria de stack ya reutilizada por otra llamada. Esto es
- * justo el tipo de bug que no da error de compilacion pero corrompe
- * memoria silenciosamente en tiempo de ejecucion.
+ * IMPORTANT: these widgets are static (not local to
+ * demo_screen_draw()) on purpose. ui_screen_t only stores POINTERS to
+ * them (to avoid duplicating data or depending on malloc), so they
+ * must stay alive for as long as the screen exists - if they were
+ * stack variables of a function that already returned,
+ * ui_screen_touch() would be reading stack memory already reused by
+ * another call. This is exactly the kind of bug that doesn't produce
+ * a compile error but silently corrupts memory at runtime.
  */
 static ui_screen_t s_demo_screen;
 static ui_panel_t  s_title_panel;
@@ -282,11 +247,9 @@ static ui_button_t s_btn_tune;
 static ui_button_t s_btn_mode;
 
 /*
- * Callback de ejemplo compartido por los 3 botones de la demo. Cuando
- * exista el driver de tactil, cada lectura de (x,y,pressed) que llegue a
- * ui_screen_touch() puede terminar disparando esto en RELEASE (el
- * "click" real) - de momento no hay nada que lo invoque todavia, es solo
- * la plantilla de como conectar la logica de la app a los eventos de UI.
+ * Example callback shared by the demo's 3 buttons. Fires on RELEASE
+ * (the actual "click") - this is just a template for wiring app logic
+ * to UI events.
  */
 static void demo_button_callback(void *widget, ui_event_t event, void *user_data)
 {
@@ -294,7 +257,7 @@ static void demo_button_callback(void *widget, ui_event_t event, void *user_data
     (void)user_data;
 
     if (event == UI_EVENT_RELEASE) {
-        debug_print("boton pulsado: ");
+        debug_print("button pressed: ");
         debug_print(btn->label);
         debug_print("\n");
     }
@@ -319,9 +282,10 @@ static void demo_screen_draw(void)
                                       (uint16_t)(WATERFALL_ROWS + 4), GFX_COLOR_BLACK, GFX_COLOR_GRAY};
     ui_screen_add_panel(&s_demo_screen, &s_waterfall_panel);
 
-    /* enabled=1 puesto explicitamente - si se omite, un ui_button_t
-     * recien declarado queda con enabled=0 (inicializacion a cero de C)
-     * y ui_screen_touch() lo ignorara siempre aunque se dibuje bien. */
+    /* enabled=1 set explicitly - if omitted, a freshly declared
+     * ui_button_t defaults to enabled=0 (C zero-initialization) and
+     * ui_screen_touch() will always ignore it even though it draws
+     * fine. */
     s_btn_menu = (ui_button_t){btn_gap, DEMO_BTN_Y, btn_w, btn_h, "MENU",
                                 GFX_COLOR_WHITE, GFX_COLOR_BLUE, GFX_COLOR_WHITE,
                                 1, 0, 1, demo_button_callback, NULL};
@@ -337,12 +301,12 @@ static void demo_screen_draw(void)
 
     ui_screen_draw(&s_demo_screen);
 
-    /* Texto suelto que no necesita ser interactivo ni sobrevivir despues
-     * de pintarse: se sigue pudiendo llamar a gfx_text()/ui_label_draw()
-     * directo, sin pasar por el screen, para cosas que no cambian ni
-     * reciben toques. */
-    gfx_text(4, 4, "DEEPSDR - DEMO GFX/UI", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, 2);
-    gfx_text(4, (uint16_t)(DEMO_SPECTRUM_Y + 4), "ESPECTRO (PLACEHOLDER)",
+    /* Loose text that doesn't need to be interactive or survive after
+     * being drawn: gfx_text()/ui_label_draw() can still be called
+     * directly, bypassing the screen, for things that never change or
+     * receive touches. */
+    gfx_text(4, 4, "DEEPSDR - GFX/UI DEMO", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, 2);
+    gfx_text(4, (uint16_t)(DEMO_SPECTRUM_Y + 4), "SPECTRUM",
               GFX_COLOR_GREEN, GFX_COLOR_BLACK, 1);
     gfx_line(0, (uint16_t)(DEMO_SPECTRUM_Y + DEMO_SPECTRUM_H - 20),
               GFX_SCREEN_WIDTH - 1, (uint16_t)(DEMO_SPECTRUM_Y + DEMO_SPECTRUM_H - 20),
@@ -350,20 +314,20 @@ static void demo_screen_draw(void)
 }
 
 /*
- * Punto de enganche con touch.c, ya activo. touch_read() hace el trabajo
- * pesado (transacciones SPI bit-banged + promediado) SOLO cuando
- * touch_is_pressed() ya dio positivo (barato, un simple gpio_input_bit_get),
- * asi que llamarlo cada iteracion del bucle principal no es costoso
- * mientras no haya contacto.
+ * Touch input hook, already active. touch_read() does the heavy
+ * lifting (bit-banged SPI transactions + averaging) ONLY once
+ * touch_is_pressed() has already returned true (a cheap plain GPIO
+ * read), so calling it every main-loop iteration is not expensive
+ * while there's no contact.
  *
- * OJO CALIBRACION: sin haber llamado a touch_set_calibration(), touch.c
- * usa una correspondencia identidad (raw 0-4095 -> pantalla 0-800/0-480)
- * que casi seguro NO coincide con la orientacion/escala real del panel
- * resistivo. Sirve para validar que el pipeline entero funciona (que un
- * toque llega a mover/pulsar un boton), pero antes de dar esto por
- * terminado hay que calibrar: tocar las 4 esquinas conocidas del panel,
- * anotar los raw_x/raw_y que da touch_debug_raw() en cada una, y rellenar
- * un touch_calibration_t real via touch_set_calibration().
+ * CALIBRATION NOTE: without calling touch_set_calibration(), touch.c
+ * uses an identity mapping (raw 0-4095 -> screen 0-800/0-480) that
+ * almost certainly does not match the resistive panel's real
+ * orientation/scale. It's enough to validate that the whole pipeline
+ * works (that a touch reaches and presses a button), but a real
+ * calibration - touching the 4 known corners, noting the raw_x/raw_y
+ * from touch_debug_raw() at each, and filling in a real
+ * touch_calibration_t via touch_set_calibration() - is still pending.
  */
 static void demo_touch_poll(void)
 {
@@ -373,30 +337,27 @@ static void demo_touch_poll(void)
     ui_screen_touch(&s_demo_screen, x, y, pressed);
 
     if (touch_irq_pending()) {
-        debug_print("touch: flanco PENIRQ (nuevo contacto) -> ");
+        debug_print("touch: PENIRQ edge (new contact) -> ");
         touch_debug_raw();
     }
 }
 
 /*
- * DIAGNOSTICO/CALIBRACION PENDIENTE (28/07/2026): SDR_DB_MIN/MAX son un
- * rango de trabajo INVENTADO, no calibrado - nuestra "dB" sale de una
- * aproximacion de log2 por bit-manipulation (ver fft.c), no de una
- * medida real referenciada. Sirve para que se vea algo razonable en
- * pantalla desde el primer momento, pero UNA VEZ que Jorge tenga una
- * señal real de referencia (tono conocido, ruido de fondo del AIC3204
- * sin señal, etc.) hay que reajustar estos dos numeros mirando que
- * valores de s_db salen realmente en la practica - no dar esta escala
- * por buena todavia.
+ * SDR_DB_MIN/MAX define an UNCALIBRATED working dB range - the "dB"
+ * value comes from a bit-manipulation log2 approximation (see fft.c),
+ * not a referenced measurement. Good enough to show something
+ * reasonable on screen from the start, but these two numbers should
+ * be re-tuned once a real reference signal is available, by looking
+ * at what s_db values actually come out in practice.
  */
 static const float SDR_DB_MIN = -10.0f;
 static const float SDR_DB_MAX = 90.0f;
 
-/* sdr_rx.h y fft.h definen sus tamanos de forma independiente - si
- * algun dia cambia uno sin el otro, mejor un error de compilacion claro
- * que un desbordamiento silencioso de s_rx_block. */
+/* sdr_rx.h and fft.h define their sizes independently - if one is ever
+ * changed without the other, a clear compile error is better than a
+ * silent overflow of s_rx_i/s_rx_q. */
 #if SDR_RX_BLOCK_SAMPLES != FFT_SIZE
-#error "SDR_RX_BLOCK_SAMPLES (sdr_rx.h) y FFT_SIZE (fft.h) deben coincidir"
+#error "SDR_RX_BLOCK_SAMPLES (sdr_rx.h) and FFT_SIZE (fft.h) must match"
 #endif
 
 static int16_t s_rx_i[SDR_RX_BLOCK_SAMPLES];
@@ -404,21 +365,21 @@ static int16_t s_rx_q[SDR_RX_BLOCK_SAMPLES];
 static float   s_db[FFT_BINS_USEFUL];
 
 /*
- * VERIFICACION CANAL Q (28/07/2026, decimoquinta vuelta): I(IN2_L/R) ya
- * esta confirmado en hardware real por Jorge. Q(IN3_R/L) sigue siendo
- * una extrapolacion del registro (ver aic3204.c) sin verificar. Cambiar
- * este define a 1 para que el espectro/cascada muestren Q en vez de I -
- * si al inyectar algo conocido en IN3_R/IN3_L (y NADA en IN2) aparece
- * en pantalla igual que antes aparecia con IN2, confirma que el ruteo
- * de Q esta bien. Los min/max de AMBOS canales se imprimen siempre,
- * muestres el que muestres, para tener el dato numerico sin necesidad
- * de mirar la pantalla.
+ * Q-CHANNEL VERIFICATION: I (IN2_L/R) is already confirmed on real
+ * hardware. Q (IN3_R/L) is still an extrapolated register value (see
+ * aic3204.c) pending independent verification. Set this define to 1
+ * to show Q instead of I on the spectrum/waterfall - if injecting a
+ * known signal into IN3_R/IN3_L (with nothing on IN2) shows up on
+ * screen the same way IN2 used to, that confirms Q routing is
+ * correct. Min/max of BOTH channels are always printed regardless of
+ * which one is shown, so the numeric evidence doesn't require looking
+ * at the screen.
  */
-#define SDR_SHOW_CHANNEL_Q   0   /* 0 = mostrar I (IN2), 1 = mostrar Q (IN3) */
+#define SDR_SHOW_CHANNEL_Q   0   /* 0 = show I (IN2), 1 = show Q (IN3) */
 
-/* debug_uart.h no trae una version con signo - los min/max de las
- * muestras I/Q son int16_t y pueden ser negativos, asi que un helper
- * minimo local en vez de tocar el modulo de UART para esto. */
+/* debug_uart.h has no signed decimal print - I/Q sample min/max are
+ * int16_t and can be negative, hence this small local helper instead
+ * of touching the UART module for it. */
 static void debug_print_dec_signed(const char *label, int32_t val)
 {
     if (val < 0) {
@@ -431,12 +392,10 @@ static void debug_print_dec_signed(const char *label, int32_t val)
 }
 
 /*
- * Reemplaza al antiguo demo_waterfall_tick() (gradiente sintetico) -
- * ver el comentario que quedaba en waterfall.h: "sustituir por datos
- * reales de FFT cuando lleguemos a las funciones de SDR". No bloqueante:
- * si sdr_rx_poll_block_iq() no tiene bloque nuevo todavia, no hace nada
- * este tick (el resto del bucle principal - touch, UI - sigue igual de
- * fluido).
+ * Replaces the earlier synthetic-gradient waterfall demo with the real
+ * capture -> FFT -> spectrum/waterfall pipeline. Non-blocking: if
+ * sdr_rx_poll_block_iq() has no new block yet, this tick does nothing
+ * (the rest of the main loop - touch, UI - stays just as responsive).
  */
 static void sdr_spectrum_waterfall_tick(void)
 {
@@ -453,11 +412,12 @@ static void sdr_spectrum_waterfall_tick(void)
         return;
     }
 
-    /* min/max de AMBOS canales, cada bloque - es la prueba numerica de
-     * si IN2 e IN3 estan viendo cosas distintas (senal real en cada
-     * uno) o si Q esta "muerto" (min=max=0 o clavado en un valor fijo,
-     * lo que delataria que el ruteo P1_R55/P1_R57 no esta llegando de
-     * verdad al ADC derecho pese a que el registro acepto el ACK). */
+    /* Min/max of BOTH channels, every block - the numeric evidence for
+     * whether IN2 and IN3 are seeing different things (real signal on
+     * each) or whether Q is "dead" (min=max=0, or pinned at a fixed
+     * value), which would indicate the P1_R55/P1_R57 routing is not
+     * actually reaching the right ADC despite the register write
+     * being ACKed. */
     i_min = s_rx_i[0]; i_max = s_rx_i[0];
     q_min = s_rx_q[0]; q_max = s_rx_q[0];
     for (n = 1; n < SDR_RX_BLOCK_SAMPLES; n++) {
@@ -473,15 +433,13 @@ static void sdr_spectrum_waterfall_tick(void)
     show_block = s_rx_i;
 #endif
 
-    /* DIAGNOSTICO (28/07/2026): en vez de seguir optimizando a ciegas,
-     * medimos con el DWT (mismo mecanismo que en gd32_i2s.c) cuanto
-     * tarda cada tramo del pipeline, Y ADEMAS cuanto tiempo real pasa
-     * entre bloque y bloque (periodo observado) - si el periodo total
-     * es mucho mayor que fft+spectrum+waterfall sumados, el cuello de
-     * botella esta en OTRA parte del bucle principal (touch, systick,
-     * etc), no en este tick. Se imprime solo 1 de cada 20 bloques para
-     * no saturar el UART ni afectar el tiempo medido con el propio
-     * print. */
+    /* Profiling: measure with the DWT cycle counter (same mechanism as
+     * gd32_i2s.c) how long each stage of the pipeline takes, plus the
+     * real elapsed time between blocks - if the observed period is
+     * much larger than fft+spectrum+waterfall combined, the bottleneck
+     * is elsewhere in the main loop (touch, systick, etc), not in this
+     * tick. Printed for only 1 in 20 blocks to avoid flooding the UART
+     * or skewing the very timing being measured. */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
         DWT->CYCCNT = 0U;
@@ -496,9 +454,9 @@ static void sdr_spectrum_waterfall_tick(void)
 
     t_spec0 = DWT->CYCCNT;
 
-    /* espectro instantaneo, dentro del panel ya reservado en la UI
-     * (ver DEMO_SPECTRUM_Y/H) - se deja un margen para no pisar el
-     * texto "ESPECTRO" ni la linea separadora de abajo */
+    /* Instantaneous spectrum, inside the panel already reserved by the
+     * UI (see DEMO_SPECTRUM_Y/H) - a margin is left so it doesn't
+     * overlap the "SPECTRUM" label or the separator line below it */
     spectrum_draw(s_db, FFT_BINS_USEFUL,
                   2, (uint16_t)(DEMO_SPECTRUM_Y + 18),
                   (uint16_t)(GFX_SCREEN_WIDTH - 4),
@@ -507,8 +465,8 @@ static void sdr_spectrum_waterfall_tick(void)
     t_spec1 = DWT->CYCCNT;
 
     t_wf0 = DWT->CYCCNT;
-    /* cascada: una fila de WATERFALL_WIDTH px, cada columna mapeada
-     * (vecino mas cercano) a su bin de FFT correspondiente */
+    /* Waterfall: one row of WATERFALL_WIDTH px, each column mapped
+     * (nearest neighbor) to its corresponding FFT bin */
     for (x = 0; x < WATERFALL_WIDTH; x++) {
         uint32_t bin = ((uint32_t)x * FFT_BINS_USEFUL) / WATERFALL_WIDTH;
         line[x] = spectrum_colormap(s_db[bin], SDR_DB_MIN, SDR_DB_MAX);
@@ -525,18 +483,18 @@ static void sdr_spectrum_waterfall_tick(void)
         debug_print_dec("sdr_tick: fft (us)", fft_us);
         debug_print_dec("sdr_tick: spectrum_draw (us)", spec_us);
         debug_print_dec("sdr_tick: waterfall push+blit (us)", wf_us);
-        debug_print_dec("sdr_tick: TOTAL tramo medido (us)", fft_us + spec_us + wf_us);
+        debug_print_dec("sdr_tick: TOTAL measured (us)", fft_us + spec_us + wf_us);
         if (s_have_prev) {
             uint32_t period_us = (uint32_t)(((uint64_t)(t_now - s_t_prev_block)) * 1000000U / SystemCoreClock);
-            debug_print_dec("sdr_tick: PERIODO real entre bloques (us) - compara con el "
-                            "TOTAL de arriba", period_us);
+            debug_print_dec("sdr_tick: real PERIOD between blocks (us) - compare with "
+                            "TOTAL above", period_us);
         }
-        /* VERIFICACION CANAL Q: min/max de cada canal, cada 20 bloques.
-         * Si Q(IN3) esta muerto (min=max, o clavado en un valor fijo
-         * mientras I(IN2) se mueve), es la señal de que el ruteo
-         * extrapolado de P1_R55/P1_R57 no esta llegando de verdad al
-         * ADC derecho. Inyecta algo conocido en IN3_R/IN3_L (con IN2
-         * quieto) y comprueba que estos numeros SI cambian. */
+        /* Q-channel verification: min/max of each channel, every 20
+         * blocks. If Q(IN3) is dead (min=max, or pinned at a fixed
+         * value while I(IN2) moves), that's the signal that the
+         * extrapolated P1_R55/P1_R57 routing is not actually reaching
+         * the right ADC. Inject a known signal into IN3_R/IN3_L (with
+         * IN2 quiet) and check that these numbers DO change. */
         debug_print_dec_signed("sdr_tick: I(IN2) min", i_min);
         debug_print_dec_signed("sdr_tick: I(IN2) max", i_max);
         debug_print_dec_signed("sdr_tick: Q(IN3) min", q_min);
@@ -555,14 +513,13 @@ static void led_gpio_init(void)
 
 static void systick_delay_init(void)
 {
-    /* SysTick a 1ms real, basado en SystemCoreClock (actualizado por
-     * SystemInit()/system_gd32f4xx.c). Antes esto estaba vacio y
-     * rm68120_exmc.c usaba un bucle sin calibrar para los delays -
-     * sospechoso de dar tiempos de espera incorrectos en la secuencia
-     * de arranque de tensiones del panel, que es sensible a timing. */
+    /* SysTick at a real 1ms, based on SystemCoreClock (updated by
+     * SystemInit()/system_gd32f4xx.c). Timing-sensitive code such as
+     * the panel's power-up sequence in rm68120_exmc.c relies on this
+     * being calibrated correctly. */
     if (SysTick_Config(SystemCoreClock / 1000U)) {
         while (1) {
-            /* fallo configurando SysTick, no deberia pasar */
+            /* SysTick configuration failed - should never happen */
         }
     }
 }
@@ -573,20 +530,19 @@ void SysTick_Handler(void)
 }
 
 /*
- * El HardFault_Handler por defecto (Default_Handler, definido debil en
- * el startup) es un bucle infinito MUDO - exactamente el sintoma que
- * describiste (se para en seco sin avisar por UART). Esta version SI
- * avisa, para poder distinguir un HardFault real de cualquier otro tipo
- * de cuelgue (bucle infinito en codigo propio, por ejemplo) con solo
- * mirar si aparece este mensaje.
+ * The default HardFault_Handler (Default_Handler, weakly defined in
+ * the startup file) is a SILENT infinite loop. This version does
+ * report over UART, so a real HardFault can be told apart from any
+ * other kind of hang (e.g. an infinite loop in application code) just
+ * by checking whether this message appears.
  *
- * No decodifica el registro CFSR/HFSR (para eso hace falta un depurador
- * conectado y mirar el stack frame) - de momento es solo la señal de
- * "hemos entrado aqui", suficiente para confirmar o descartar la hipotesis.
+ * It does not decode CFSR/HFSR (that needs a debugger attached and the
+ * stack frame inspected) - for now it's just the "we ended up here"
+ * signal, enough to confirm or rule out a hard fault as the cause.
  */
 void HardFault_Handler(void)
 {
-    debug_print("\n*** HARDFAULT_HANDLER: ha ocurrido un fallo de bus/acceso ***\n");
+    debug_print("\n*** HARDFAULT_HANDLER: a bus/access fault has occurred ***\n");
     while (1) {
         __NOP();
     }

@@ -4,37 +4,35 @@
 #include <stdint.h>
 
 /*
- * Captura de muestras RX del AIC3204 via I2S1_ADD (extension full-duplex
- * de SPI1/I2S1, PB14=SDext), por DMA en modo circular.
+ * Captures RX samples from the AIC3204 via I2S1_ADD (the full-duplex
+ * extension of SPI1/I2S1, PB14=SDext), using circular DMA.
  *
- * MAPEO DMA (28/07/2026, confirmado contra datasheet real - Jorge aporto
- * la foto de la Tabla 10-2 "Peripheral requests to DMA0" del GD32F4xx
- * User Manual, la misma tabla que ya nos saco del atolladero con
- * SPI1_TX): I2S1_ADD_RX -> DMA0, Channel 3, PERIEN[2:0]=011
- * (DMA_SUBPERI3). Esta vez SI viene de la tabla, no de memoria.
+ * DMA mapping: I2S1_ADD_RX -> DMA0, Channel 3, PERIEN[2:0]=011
+ * (DMA_SUBPERI3). Confirmed against the GD32F4xx User Manual's DMA
+ * request mapping table (Table 10-2, "Peripheral requests to DMA0").
  *
- * MODELO PING-PONG: un unico buffer circular de 2*SDR_RX_BLOCK_SAMPLES
- * (estereo, 16 bits). Cuando el DMA lleva la primera mitad (flag HTF) la
- * primera mitad del buffer ya esta completa y estable (el DMA esta
- * escribiendo en la segunda); cuando completa la vuelta (flag FTF) es
- * la segunda mitad la que esta lista. sdr_rx_poll_block() hace ese
- * seguimiento y devuelve NULL si no hay bloque nuevo listo todavia
- * (no bloqueante, pensado para llamarse desde el bucle principal igual
- * que el resto del proyecto).
+ * PING-PONG MODEL: a single circular buffer of 2*SDR_RX_BLOCK_SAMPLES
+ * (stereo, 16-bit). When the DMA finishes the first half (HTF flag),
+ * that half is complete and stable while the DMA writes into the
+ * second half; when it completes the full circular round (FTF flag),
+ * the second half is the one that's ready. sdr_rx_poll_block_iq()
+ * tracks this and returns 0 if no new block is ready yet (non-blocking,
+ * meant to be called from the main loop like the rest of this project).
  */
 
-#define SDR_RX_BLOCK_SAMPLES   512U   /* muestras MONO por bloque entregado (= tamano de FFT) */
+#define SDR_RX_BLOCK_SAMPLES   512U   /* mono samples per delivered block (= FFT size) */
 
-/* Arranca el DMA de captura. Llamar DESPUES de gd32_i2s_init_master_48k()
- * (necesita que SPI1/I2S1_ADD ya esten inicializados y habilitados). */
+/* Starts the capture DMA. Must be called AFTER
+ * gd32_i2s_init_master_48k() (needs SPI1/I2S1_ADD already initialized
+ * and enabled). */
 void sdr_rx_init(void);
 
 /*
- * Si hay un bloque nuevo completo desde la ultima llamada, copia
- * SDR_RX_BLOCK_SAMPLES muestras de I (izquierdo, IN2_L/IN2_R) a
- * `i_out` y de Q (derecho, IN3_R/IN3_L) a `q_out`, ya deintercaladas,
- * y devuelve 1. Si todavia no hay bloque nuevo, devuelve 0 y no toca
- * ninguno de los dos buffers. No bloqueante.
+ * If a new complete block is available since the last call, copies
+ * SDR_RX_BLOCK_SAMPLES samples of I (left, IN2_L/IN2_R) into `i_out`
+ * and of Q (right, IN3_R/IN3_L) into `q_out`, already de-interleaved,
+ * and returns 1. If no new block is ready yet, returns 0 and leaves
+ * both buffers untouched. Non-blocking.
  */
 uint32_t sdr_rx_poll_block_iq(int16_t *i_out, int16_t *q_out);
 

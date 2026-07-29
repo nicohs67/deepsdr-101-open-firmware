@@ -24,7 +24,7 @@ INCLUDES += -ICMSIS/GD/GD32F4xx/Include
 INCLUDES += -IFirmware/Include
 INCLUDES += -IUser
 
-# --- Fuentes ---
+# --- Sources ---
 C_SOURCES   = $(wildcard User/*.c)
 C_SOURCES  += $(wildcard Firmware/Source/*.c)
 C_SOURCES  += CMSIS/GD/GD32F4xx/Source/system_gd32f4xx.c
@@ -71,20 +71,21 @@ $(BUILD_DIR):
 clean:
 	rm -rf $(BUILD_DIR)
 
-# --- Programacion con ST-Link + OpenOCD ---
-# Usamos un target/gd32f450.cfg propio (en openocd/) en vez del
-# target/stm32f4x.cfg de serie: el ID de silicio del GD32F450 hace que
-# OpenOCD lo detecte como STM32F42x/43x de doble banco y 2048KB, cuando
-# la VET6 real es de 512KB en banco unico. Ver openocd/gd32f450.cfg.
+# --- Programming with ST-Link + OpenOCD ---
+# We use our own target/gd32f450.cfg (in openocd/) instead of the
+# stock target/stm32f4x.cfg: the GD32F450's silicon ID makes OpenOCD
+# detect it as a dual-bank, 2048KB STM32F42x/43x, when the real VET6
+# part is 512KB single-bank. See openocd/gd32f450.cfg.
 #
-# IMPORTANTE: sin direccion al final. El .elf ya lleva la direccion de
-# carga incrustada en cada seccion (0x08020000, puesta por el linker
-# script). Si se pasa una direccion extra aqui, OpenOCD la trata como
-# "offset de reubicacion" que se SUMA a la de cada seccion del .elf
-# (funcion pensada solo para .bin, que no llevan direccion propia) -
-# eso es lo que pasaba antes: intentaba escribir en 0x08020000+0x08020000
-# = 0x10040000, fuera del rango de flash (0x08000000-0x08080000), y por
-# eso "no programaba" nada.
+# IMPORTANT: no address at the end of the program command. The .elf
+# already carries the load address embedded in each section
+# (0x08020000, set by the linker script). Passing an extra address
+# here makes OpenOCD treat it as a "relocation offset" that gets ADDED
+# to each section's address in the .elf (a feature meant for .bin
+# files, which carry no address of their own) - that's what used to
+# happen: it tried to write at 0x08020000+0x08020000 = 0x10040000,
+# outside the flash range (0x08000000-0x08080000), silently failing to
+# program anything.
 flash: $(BUILD_DIR)/$(TARGET).elf
 	openocd -f interface/stlink.cfg -f openocd/gd32f450.cfg \
 		-c "program $(BUILD_DIR)/$(TARGET).elf verify reset exit"
@@ -93,12 +94,12 @@ erase:
 	openocd -f interface/stlink.cfg -f openocd/gd32f450.cfg \
 		-c "init; reset halt; stm32f2x mass_erase 0; reset; exit"
 
-# --- Generar update4.bin para el bootloader real ---
-# El bootloader exige una firma fija de 8 bytes en el offset 0x40000
-# (256KB) del archivo, o se cuelga con "APP not Programmed". Esta
-# firma es constante (la misma en cualquier firmware valido del
-# fabricante, no depende del contenido), extraida por analisis del
-# bootloader. Este target rellena nuestro .bin hasta 256KB y la añade.
+# --- Generate update4.bin for the real bootloader ---
+# The bootloader requires a fixed 8-byte signature at offset 0x40000
+# (256KB) of the file, or it hangs with "APP not Programmed". This
+# signature is constant (the same across any valid vendor firmware,
+# independent of content), extracted by analyzing the bootloader. This
+# target pads our .bin to 256KB and appends it.
 UPDATE4_MAGIC := 8f25c865599c5531
 update4: $(BUILD_DIR)/$(TARGET).bin
 	python3 -c "\
@@ -106,5 +107,5 @@ firmware = open('$(BUILD_DIR)/$(TARGET).bin','rb').read(); \
 magic = bytes.fromhex('$(UPDATE4_MAGIC)'); \
 padded = firmware + b'\x00' * (0x40000 - len(firmware)) + magic; \
 open('update4.bin','wb').write(padded); \
-print('update4.bin generado:', len(padded), 'bytes')"
+print('update4.bin generated:', len(padded), 'bytes')"
 

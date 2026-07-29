@@ -871,22 +871,24 @@ static void system_clock_200m_25m_hxtal(void)
     RCU_CFG0 |= RCU_APB1_CKAHB_DIV4;
 
     /*
-     * CORREGIDO (28/07/2026): PSC=25 estaba pensado para un cristal de
-     * 25MHz, aplicado erroneamente al cristal real de 12.288MHz -
-     * frecuencia de comparacion = 12.288/25 = 491.5kHz, fuera del rango
-     * sano de 1-2MHz. Con PSC=8: comparacion = 12.288/8 = 1.536MHz (en
-     * rango). PLL_N=260, PLL_P=2 -> VCO=399.36MHz (dentro de 100-432MHz),
-     * SYSCLK~=199.68MHz (bajo el maximo de 200MHz). PLL_Q=8 (aproximado,
-     * USB no se usa en este proyecto).
-     * NOTA IMPORTANTE: PSC es el mismo campo que usa el PLLI2S como
-     * divisor de entrada (rcu_plli2s_config lee RCU_PLL_PLLPSC) - ver el
-     * cambio correspondiente en gd32_i2s.c (N=400/R=4 -> N=128/R=4) para
-     * mantener el mismo i2sclock=49.152MHz ya validado, sin tener que
-     * volver a medir BCLK/MCLK con el osciloscopio.
-     * Wait-states de Flash: NO se tocan - el datasheet confirma que el
-     * GD32F450 opera a 200MHz con 0 wait-states (arquitectura de Flash
-     * distinta a la familia STM32F4 equivalente), y WSCNT=0 es
-     * precisamente el valor de reset ya en uso.
+     * PSC was originally 25, intended for a 25MHz crystal, but this
+     * board uses a real 12.288MHz crystal - comparison frequency =
+     * 12.288/25 = 491.5kHz, well outside the healthy 1-2MHz range.
+     * With PSC=8: comparison = 12.288/8 = 1.536MHz (in range).
+     * PLL_N=260, PLL_P=2 -> VCO=399.36MHz (within 100-432MHz),
+     * SYSCLK~=199.68MHz (just under the 200MHz maximum). PLL_Q=8
+     * (approximate - USB is not used in this project).
+     *
+     * IMPORTANT: PSC is the same field used by PLLI2S as its input
+     * divider (rcu_plli2s_config reads RCU_PLL_PLLPSC) - see the
+     * matching change in gd32_i2s.c (N/R recalculated to keep the
+     * same i2sclock) whenever this value changes.
+     *
+     * Flash wait-states are intentionally left untouched: per the
+     * datasheet, this device operates at 200MHz with 0 flash wait
+     * states (a different flash architecture from the equivalent
+     * STM32F4 parts), and WSCNT=0 is exactly the reset value already
+     * in use.
      */
     RCU_PLL = (8U | (260U << 6U) | (((2U >> 1U) - 1U) << 16U) |
                    (RCU_PLLSRC_HXTAL) | (8U << 24U));

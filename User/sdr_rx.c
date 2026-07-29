@@ -3,20 +3,20 @@
 #include "debug_uart.h"
 
 /*
- * Buffer circular RAW (estereo, L/R intercalado), doble del tamano de
- * bloque entregado: primera mitad + segunda mitad, ping-pong via las
- * flags HTF/FTF del propio canal DMA (mismo patron de poll no
- * bloqueante que usamos en gd32_i2s_dma_start_test_tone(), coherente
- * con el resto del proyecto).
+ * Raw circular buffer (stereo, L/R interleaved), twice the delivered
+ * block size: first half + second half, ping-pong via the DMA
+ * channel's own HTF/FTF flags (same non-blocking poll pattern used in
+ * gd32_i2s_dma_start_test_tone(), consistent with the rest of the
+ * project).
  */
-#define RAW_HALF_WORDS   (SDR_RX_BLOCK_SAMPLES * 2U) /* palabras de 16 bits por mitad (L+R intercalado) */
+#define RAW_HALF_WORDS   (SDR_RX_BLOCK_SAMPLES * 2U) /* 16-bit words per half (L/R interleaved) */
 #define RAW_TOTAL_WORDS  (RAW_HALF_WORDS * 2U)
 
 static int16_t s_raw_buf[RAW_TOTAL_WORDS];
 
-/* 0 = todavia no se ha entregado ninguna mitad; 1 = la ultima entregada
- * fue la primera mitad (toca esperar FTF para la segunda); 2 = la
- * ultima entregada fue la segunda (toca esperar HTF para la primera). */
+/* 0 = no half delivered yet; 1 = the first half was the last one
+ * delivered (waiting on FTF for the second); 2 = the second half was
+ * the last one delivered (waiting on HTF for the first). */
 static uint8_t s_last_half_delivered;
 
 void sdr_rx_init(void)
@@ -28,10 +28,10 @@ void sdr_rx_init(void)
     rcu_periph_clock_enable(RCU_DMA0);
 
     /*
-     * I2S1_ADD_RX -> DMA0, Channel 3, DMA_SUBPERI3 - confirmado contra
-     * la Tabla 10-2 del GD32F4xx User Manual (misma fuente que resolvio
-     * el canal de TX). Direccion PERIPH_TO_MEMORY (leemos del
-     * periferico hacia la RAM), al contrario que en el tono de prueba.
+     * I2S1_ADD_RX -> DMA0, Channel 3, DMA_SUBPERI3 - confirmed against
+     * the DMA request mapping table (same source that resolved the TX
+     * channel). Direction is PERIPH_TO_MEMORY (reading from the
+     * peripheral into RAM), the opposite of the test tone's TX path.
      */
     dma_deinit(DMA0, DMA_CH3);
 
@@ -53,13 +53,13 @@ void sdr_rx_init(void)
     dma_flag_clear(DMA0, DMA_CH3, DMA_FLAG_FTF);
     dma_channel_enable(DMA0, DMA_CH3);
 
-    /* Habilitar la peticion DMA de recepcion en I2S1_ADD - sin esto el
-     * canal esta armado pero nadie lo dispara (mismo fallo que ya
-     * tuvimos en TX, aqui aplicado al lado RX). */
+    /* Enable the DMA receive request on I2S1_ADD itself - without
+     * this, the channel is armed but nothing ever triggers it (the
+     * mirror image of the same mistake we had on the TX side). */
     spi_dma_enable(I2S1_ADD, SPI_DMA_RECEIVE);
 
-    debug_print("sdr_rx: DMA0 CH3 (I2S1_ADD_RX) armado en modo circular ping-pong, "
-                "bloque = ");
+    debug_print("sdr_rx: DMA0 CH3 (I2S1_ADD_RX) armed in circular ping-pong mode, "
+                "block = ");
     debug_print_dec("sdr_rx: SDR_RX_BLOCK_SAMPLES", SDR_RX_BLOCK_SAMPLES);
 }
 
@@ -67,13 +67,13 @@ uint32_t sdr_rx_poll_block_iq(int16_t *i_out, int16_t *q_out)
 {
     uint32_t n;
 
-    /* Mitad 1 (offset 0): lista cuando salta HTF y no era ya la ultima
-     * entregada. */
+    /* First half (offset 0): ready when HTF fires and it wasn't
+     * already the last one delivered. */
     if ((s_last_half_delivered != 1U) &&
         (dma_flag_get(DMA0, DMA_CH3, DMA_FLAG_HTF) == SET)) {
         dma_flag_clear(DMA0, DMA_CH3, DMA_FLAG_HTF);
         for (n = 0; n < SDR_RX_BLOCK_SAMPLES; n++) {
-            /* deintercalar: par=izquierdo(I, IN2), impar=derecho(Q, IN3) */
+            /* de-interleave: even=left (I, IN2), odd=right (Q, IN3) */
             i_out[n] = s_raw_buf[2U * n];
             q_out[n] = s_raw_buf[2U * n + 1U];
         }
@@ -81,7 +81,7 @@ uint32_t sdr_rx_poll_block_iq(int16_t *i_out, int16_t *q_out)
         return 1U;
     }
 
-    /* Mitad 2 (offset RAW_HALF_WORDS): lista cuando salta FTF. */
+    /* Second half (offset RAW_HALF_WORDS): ready when FTF fires. */
     if ((s_last_half_delivered != 2U) &&
         (dma_flag_get(DMA0, DMA_CH3, DMA_FLAG_FTF) == SET)) {
         dma_flag_clear(DMA0, DMA_CH3, DMA_FLAG_FTF);

@@ -4,25 +4,23 @@
 #include <stdint.h>
 
 /*
- * Dibuja el espectro instantaneo (traza en vivo, no historico - la
- * historia es el waterfall.c ya existente) en un rectangulo fijo de
- * pantalla, y expone el mismo mapa de color dB->RGB565 para que
- * gd32_i2s.c/main.c lo reutilicen al colorear la fila que se empuja a
- * waterfall_push_line() - un unico mapa de color para los dos, para
- * que la escala se lea igual en ambos.
+ * Draws the instantaneous spectrum (live trace, not history - history
+ * is what waterfall.c is for) inside a fixed screen rectangle, and
+ * exposes the same dB->RGB565 colormap so gd32_i2s.c/main.c can reuse
+ * it when coloring the row pushed to waterfall_push_line() - one
+ * shared colormap for both, so the scale reads consistently.
  */
 
-/* dB -> RGB565, escala fija db_min..db_max (clamp fuera de rango).
- * Paleta clasica de waterfall SDR: azul (frio/silencio) -> cian ->
- * verde -> amarillo -> rojo (caliente/señal fuerte). */
+/* dB -> RGB565, fixed scale db_min..db_max (clamped outside that
+ * range). Classic SDR waterfall palette: blue (cold/quiet) -> cyan ->
+ * green -> yellow -> red (hot/strong signal). */
 uint16_t spectrum_colormap(float db, float db_min, float db_max);
 
 /*
- * Pinta `n_bins` valores de dB como barras verticales que llenan el
- * rectangulo (x,y,w,h). Si n_bins != w, se resamplea (vecino mas
- * cercano) para estirar/encoger al ancho real de pantalla. db_min/max
- * fijan la escala vertical (y tambien se usan para el color, via
- * spectrum_colormap).
+ * Draws `n_bins` dB values as vertical bars filling the rectangle
+ * (x,y,w,h). If n_bins != w, resamples (nearest neighbor) to stretch/
+ * shrink to the actual screen width. db_min/max set the vertical
+ * scale (and are also used for color, via spectrum_colormap).
  */
 void spectrum_draw(const float *db, uint32_t n_bins,
                     uint16_t x, uint16_t y, uint16_t w, uint16_t h,

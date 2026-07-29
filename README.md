@@ -1,3 +1,7 @@
+# Intro
+
+This project is a collaboration between UA6YKK Alexandr and EA8DGL Esteban, aiming to create open firmware for the DEEPSDR 101 with the GD32F450 MCU. It is currently under development, and there is no usable firmware yet. We would welcome any collaboration or assistance with its development. Regards.
+
 # Proyecto GD32F450VET6 + RM68120 (EXMC)
 
 Proyecto verificado: **compila sin errores** con `arm-none-eabi-gcc` (13.2.1)

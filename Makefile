@@ -17,26 +17,63 @@ MCUFLAGS = $(CPU) -mthumb $(FPU) $(FLOAT)
 
 # --- Defines ---
 DEFS = -DGD32F450 -DUSE_STDPERIPH_DRIVER -DHXTAL_VALUE=12288000U
+# ARM_MATH_DSP: the GD32F450 (Cortex-M4F) really does have the DSP
+# extension, so let CMSIS-DSP call the real __QADD8/__SSAT/... it
+# needs instead of pulling in its dsp/none.h software-emulation
+# fallback (which would redefine the same intrinsics our CMSIS-Core
+# headers already provide - see CMSIS/DSP/Include/cmsis_compiler.h).
+DEFS += -DARM_MATH_DSP=1 -DARM_MATH_CM4
 
 # --- Includes ---
 INCLUDES  = -ICMSIS/Include
 INCLUDES += -ICMSIS/GD/GD32F4xx/Include
 INCLUDES += -IFirmware/Include
 INCLUDES += -IUser
+# CMSIS-DSP: PrivateInclude before Include isn't required, but keeping
+# both on the path matches upstream's own build files.
+INCLUDES += -ICMSIS/DSP/Include
+INCLUDES += -ICMSIS/DSP/PrivateInclude
 
 # --- Sources ---
 C_SOURCES   = $(wildcard User/*.c)
 C_SOURCES  += $(wildcard Firmware/Source/*.c)
 C_SOURCES  += CMSIS/GD/GD32F4xx/Source/system_gd32f4xx.c
+# CMSIS-DSP: only the specific functions demod_am.c uses (biquad
+# cascade DF1 float32 + complex magnitude float32), not the whole
+# library - keeps build times and flash usage down. Add more
+# CMSIS/DSP/Source/*/arm_*.c files here if you use more of it.
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_biquad_cascade_df1_f32.c
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_biquad_cascade_df1_init_f32.c
+C_SOURCES  += CMSIS/DSP/Source/ComplexMathFunctions/arm_cmplx_mag_f32.c
+# arm_fir_f32/_init_f32: the Hilbert transformer for SSB (USB/LSB).
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_fir_f32.c
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_fir_init_f32.c
+# arm_fir_decimate/_interpolate: the SSB decimated architecture
+# (192kHz -> 12kHz for the Hilbert stage, then back up for the DAC).
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_fir_decimate_f32.c
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_fir_decimate_init_f32.c
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_fir_interpolate_f32.c
+C_SOURCES  += CMSIS/DSP/Source/FilteringFunctions/arm_fir_interpolate_init_f32.c
 
 ASM_SOURCES = CMSIS/GD/GD32F4xx/Source/GCC/startup_gd32f450_470.S
 
 # --- Linker ---
 LDSCRIPT = GD32F450VE_FLASH.ld
+# -lm: needed as of 31/07/2026 for atan2f() (demod_am.c's WFM
+# discriminator, see demod_am.h's WFM note on why libm instead of
+# CMSIS-DSP's arm_atan2_f32()) - nano.specs/nosys.specs alone don't
+# pull libm in, only libc; without this the link fails with
+# "undefined reference to atan2f". Nothing else in the project uses
+# libm, so this wasn't needed before.
 LDFLAGS  = $(MCUFLAGS) -specs=nano.specs -specs=nosys.specs -T$(LDSCRIPT) \
-           -Wl,-Map=$(BUILD_DIR)/$(TARGET).map,--cref -Wl,--gc-sections
+           -Wl,-Map=$(BUILD_DIR)/$(TARGET).map,--cref -Wl,--gc-sections -lm
 
-CFLAGS  = $(MCUFLAGS) $(DEFS) $(INCLUDES) -Wall -O0 -g3 -ffunction-sections -fdata-sections
+# -O0 was costing far more than the AM filter itself: with the FPU
+# enabled but nothing optimized, every per-sample float op in the
+# demod/filter path re-spilled to memory instead of staying in FPU
+# registers, run from the RX DMA ISR on top of it. -O2 -g3 keeps full
+# debug symbols (just some locals become "optimized out" in gdb).
+CFLAGS  = $(MCUFLAGS) $(DEFS) $(INCLUDES) -Wall -O2 -g3 -ffunction-sections -fdata-sections
 ASFLAGS = $(MCUFLAGS) -g3
 
 OBJECTS  = $(addprefix $(BUILD_DIR)/,$(notdir $(C_SOURCES:.c=.o)))

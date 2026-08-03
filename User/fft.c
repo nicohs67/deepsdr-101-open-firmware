@@ -86,19 +86,14 @@ void fft_init(void)
     }
 }
 
-void fft_compute_db(const int16_t *samples, float *db_out)
+/* The iterative radix-2 DIT butterfly pass, in-place over s_re/s_im.
+ * Shared by the real and the complex (I/Q) entry points - the core
+ * was always complex, only the load stage differs. */
+static void fft_run(void)
 {
-    uint32_t n, stage, i, j;
+    uint32_t i, j;
     uint32_t half_size, step;
 
-    /* Window + load, with bit-reversal reordering applied on load */
-    for (n = 0; n < FFT_SIZE; n++) {
-        uint16_t src = s_bitrev[n];
-        s_re[n] = (float)samples[src] * s_hann[src];
-        s_im[n] = 0.0f;
-    }
-
-    /* Iterative radix-2 DIT, in-place */
     for (half_size = 1U, step = FFT_SIZE / 2U; half_size < FFT_SIZE;
          half_size <<= 1U, step >>= 1U) {
         for (i = 0; i < FFT_SIZE; i += (half_size << 1U)) {
@@ -117,6 +112,20 @@ void fft_compute_db(const int16_t *samples, float *db_out)
             }
         }
     }
+}
+
+void fft_compute_db(const int16_t *samples, float *db_out)
+{
+    uint32_t n;
+
+    /* Window + load, with bit-reversal reordering applied on load */
+    for (n = 0; n < FFT_SIZE; n++) {
+        uint16_t src = s_bitrev[n];
+        s_re[n] = (float)samples[src] * s_hann[src];
+        s_im[n] = 0.0f;
+    }
+
+    fft_run();
 
     /* Power -> "dB" (10*log10(x) = 3.0103*log2(x)), only the useful
      * bins 0..N/2-1 (the rest is the mirror image of a real input) */
@@ -124,4 +133,52 @@ void fft_compute_db(const int16_t *samples, float *db_out)
         float power = s_re[n] * s_re[n] + s_im[n] * s_im[n];
         db_out[n] = 3.0103f * log2_approx(power);
     }
+}
+
+void fft_compute_db_iq(const int16_t *i_samples, const int16_t *q_samples,
+                        float *db_out)
+{
+    uint32_t n;
+
+    /* Complex load: I -> real, Q -> imaginary. With a complex input
+     * the transform distinguishes +f from -f, which is the whole
+     * point: signals above the LO land on the right half of the
+     * display, below the LO on the left. */
+    for (n = 0; n < FFT_SIZE; n++) {
+        uint16_t src = s_bitrev[n];
+        s_re[n] = (float)i_samples[src] * s_hann[src];
+        s_im[n] = (float)q_samples[src] * s_hann[src];
+    }
+
+    fft_run();
+
+    /* All FFT_SIZE bins are meaningful now. Output in fftshift order:
+     * db_out[0] = -Fs/2 ... db_out[N/2] = DC (the VFO) ...
+     * db_out[N-1] = +Fs/2 - 1 bin. Natural bin k maps to output index
+     * (k + N/2) mod N. */
+    for (n = 0; n < FFT_SIZE; n++) {
+        uint32_t out = (n + FFT_SIZE / 2U) & (FFT_SIZE - 1U);
+        float power = s_re[n] * s_re[n] + s_im[n] * s_im[n];
+        db_out[out] = 3.0103f * log2_approx(power);
+    }
+
+#if FFT_IQ_DC_BLANK
+    /* The QSD + codec chain has a DC offset that shows up as a tall
+     * spike exactly at the center (on top of the VFO line), dwarfing
+     * real signals visually. Replace DC and its two Hann-spread
+     * neighbors with the average of the adjacent clean bins - purely
+     * cosmetic, the underlying data is not used for demodulation. */
+    {
+        uint32_t c = FFT_SIZE / 2U;
+        float fill = 0.5f * (db_out[c - 4U] + db_out[c + 4U]);
+        /* +/-2 bins: Hann leakage from a strong DC component reaches
+         * measurably beyond the immediate neighbors (verified with a
+         * synthetic full-scale DC on the host test). */
+        db_out[c - 2U] = fill;
+        db_out[c - 1U] = fill;
+        db_out[c]      = fill;
+        db_out[c + 1U] = fill;
+        db_out[c + 2U] = fill;
+    }
+#endif
 }

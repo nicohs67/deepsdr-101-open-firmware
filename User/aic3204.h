@@ -64,25 +64,67 @@ uint8_t aic3204_probe_and_reset(void);
 void aic3204_scan_bus(void);
 
 /*
- * Phase 2 init: clock (MCLK fed directly to CODEC_CLKIN, no PLL) +
- * differential input routing (I=IN2_L/IN2_R, confirmed on real
- * hardware; Q=IN3_R/IN3_L, extrapolated from the register bit pattern
- * of an earlier Arduino driver for this same board and confirmed at
- * the architecture level against TI's SLAA557 Application Reference
- * Guide - the exact register value is still pending independent
- * verification) + ADC power-up.
+ * Phase 2 init: the AIC3204's clock/PLL, ADC input routing, and ADC
+ * power-up, ported byte-for-byte (138 register writes, exact order)
+ * from a REAL I2C bus capture of the original, known-working
+ * firmware's own configuration of this same codec on this same board
+ * - not derived, not extrapolated, not guessed.
  *
- * Confirmed with an oscilloscope: MCLK=12.288MHz, BCLK=1.536MHz,
- * WCLK=48kHz - no longer dependent on any formula prediction.
- * NADC=1/MADC=2/AOSR=128 are calculated from these real, measured
- * values (formula: CODEC_CLKIN = NADC x MADC x AOSR x ADC_FS =
- * 1x2x128x48000 = 12,288,000, exact).
+ * This capture revealed the actual clock architecture: the AIC3204's
+ * own PLL is enabled, clocked from BCLK (not a separate MCLK signal).
+ * Confirmed by exact arithmetic against oscilloscope measurements:
+ * BCLK=6.144MHz, PLL J=14/D=0 -> PLL_CLK=86.016MHz=CODEC_CLKIN, which
+ * both the ADC (NADC=1/MADC=7/AOSR=64) and DAC (NDAC=2/MDAC=7/DOSR=32)
+ * divider chains reduce to exactly Fs=192kHz. See gd32_i2s.c - no
+ * MCLK pin is configured at all now, since the codec doesn't need one
+ * for this design.
  *
  * Call this after aic3204_probe_and_reset() AND after the I2S side is
  * already generating a real clock towards the codec
- * (gd32_i2s_init_master_48k already executed) - phase 2 configures
- * clock registers that depend on MCLK/BCLK/WCLK already running.
+ * (gd32_i2s_init_slave_192k already executed) - phase 2 configures
+ * clock registers that depend on BCLK/WCLK already running.
  */
 void aic3204_phase2_init(void);
+
+/*
+ * Sets the DAC digital output volume, both L/R channels identically.
+ * Range -63.5dB to +24dB in 0.5dB steps (silently clamped) - the
+ * AIC3204's native DAC digital volume control (Page 0, R65/R66).
+ * aic3204_phase2_init() leaves both at 0dB (unity, the byte-exact
+ * captured baseline); call this afterwards to move away from that.
+ * Does NOT touch the analog HPL/HPR headphone driver gain (Page 1,
+ * R16/R17) - see the comment above this function's definition in
+ * aic3204.c for why. Returns 1 if both L/R writes were ACKed.
+ */
+uint8_t aic3204_set_volume_db(float db);
+
+/*
+ * Sets the MIC_PGA analog input gain (Page 1, R59/R60), both L/R
+ * channels identically - the stage BEFORE the ADC, unlike
+ * aic3204_set_volume_db() above (which is after the DAC, on the
+ * output side). Range 0dB to 47.5dB in 0.5dB steps (silently
+ * clamped, unsigned - there's no attenuation direction, only gain).
+ * aic3204_phase2_init() leaves both at 20dB (0x28, the byte-exact
+ * captured baseline); call this afterwards to move away from that.
+ * Returns 1 if both L/R writes were ACKed.
+ */
+uint8_t aic3204_set_pga_gain_db(float db);
+
+/*
+ * TEMPORARY DIAGNOSTIC (28/07/2026): TI documents a digital "Audio Bus
+ * Loopback" mode (Page 0 / Register 29, bit D5) that reflects
+ * whatever comes in on DIN straight back out on DOUT, entirely
+ * bypassing the ADC/DAC converters - designed specifically to verify
+ * host<->codec digital bus communication in isolation from the analog
+ * front-end. Set to 1 to enable it: if a known TX pattern comes back
+ * correctly on RX, the whole digital I2S/DMA path is proven working
+ * end-to-end and the remaining problem is isolated to the ADC analog
+ * front-end. If RX is still stuck even in loopback, the bug is in the
+ * digital bus framing/format itself. Set back to 0 for normal
+ * operation. Also read by gd32_i2s.c, to automatically feed a real TX
+ * pattern instead of silence while this is enabled (silence looped
+ * back is still silence - not a useful test).
+ */
+#define AIC3204_TEST_LOOPBACK 0
 
 #endif /* AIC3204_H */

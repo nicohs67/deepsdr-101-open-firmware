@@ -7,6 +7,25 @@
 #define I2C_SDA_PORT GPIOB
 #define I2C_SDA_PIN  GPIO_PIN_9
 
+/*
+ * FORCED -O0 (30/07/2026): this loop's timing was never calibrated to
+ * an instruction count (see the comment below) - it was only ever
+ * "however long 200 NOPs take at whatever optimization level the
+ * project happened to build at". When the project-wide CFLAGS moved
+ * from -O0 to -O2 (for the demod/filter framerate fix), this same
+ * loop got compiled tighter and the real wall-clock delay shrank,
+ * slicing into the I2C bit-bang edge timing on a bus shared by BOTH
+ * the AIC3204 codec and the MS5351 clock synth - the actual cause of
+ * the "espectro muy alto / saltos / ruido continuo" regression (a
+ * garbled I2C write during codec or LO setup, not the low-IF/tuning
+ * changes that were tried and reverted first). Pinning just this
+ * function to -O0 keeps its timing exactly as before, independent of
+ * whatever CFLAGS the rest of the project builds at from now on. If
+ * this ever needs to change, replace the whole approach with a real
+ * timer (see touch.c's g_msticks-based note for the same issue),
+ * don't just delete this attribute.
+ */
+__attribute__((optimize("O0")))
 static void delay_i2c(void)
 {
     /* ~100kHz aproximado a instruccion, igual de sin calibrar que el

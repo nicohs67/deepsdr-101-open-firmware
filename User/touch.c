@@ -48,6 +48,14 @@ static touch_calibration_t s_cal = {
  * (tiempo de adquisicion tras seleccionar el chip). */
 extern volatile uint32_t g_msticks;
 
+/*
+ * FORCED -O0 (30/07/2026): same uncalibrated-NOP-loop issue as
+ * i2c_bitbang.c's delay_i2c() - pinned here for the same reason, even
+ * though this one (touch SPI bit-bang) wasn't the confirmed cause of
+ * the spectrum/noise regression. See delay_i2c()'s comment for the
+ * full story before removing this.
+ */
+__attribute__((optimize("O0")))
 static void delay_us_approx(uint32_t us)
 {
     /* Bucle sin calibrar a instruccion - solo para los ~1-2us de guarda

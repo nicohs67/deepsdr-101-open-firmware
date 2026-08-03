@@ -1,6 +1,9 @@
 #include "gd32_i2s.h"
 #include "gd32f4xx.h"
 #include "debug_uart.h"
+#include "aic3204.h" /* only for the shared AIC3204_TEST_LOOPBACK diagnostic
+                      * flag - temporary coupling, see the note below where
+                      * it's used. */
 
 static void tone_buf_fill_1khz(void);
 static float sinf_approx(float x);
@@ -52,106 +55,11 @@ void gd32_i2s_pins_gpio_toggle_test(uint32_t cycles)
     debug_print("gd32_i2s: GPIO toggle test done\n");
 }
 
-void gd32_i2s2_isolation_test(void)
-{
-    /*
-     * Plain GPIO toggle on PA4/PC10/PC12 first, same idea as the
-     * toggle test above, to rule out a basic wiring issue on these
-     * pins before interpreting the I2S2 isolation result.
-     */
-    {
-        uint32_t i;
-
-        rcu_periph_clock_enable(RCU_GPIOA);
-        rcu_periph_clock_enable(RCU_GPIOC);
-
-        gpio_mode_set(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO_PIN_4);
-        gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_4);
-        gpio_mode_set(GPIOC, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO_PIN_10 | GPIO_PIN_12);
-        gpio_output_options_set(GPIOC, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_10 | GPIO_PIN_12);
-
-        debug_print("gd32_i2s2_test: GPIO toggle on PA4/PC10/PC12 (no I2S) - probe now\n");
-
-        for (i = 0; i < 15; i++) {
-            gpio_bit_set(GPIOA, GPIO_PIN_4);
-            gpio_bit_set(GPIOC, GPIO_PIN_10 | GPIO_PIN_12);
-            {
-                volatile uint32_t d;
-                for (d = 0; d < 500000U; d++) { __NOP(); }
-            }
-            gpio_bit_reset(GPIOA, GPIO_PIN_4);
-            gpio_bit_reset(GPIOC, GPIO_PIN_10 | GPIO_PIN_12);
-            {
-                volatile uint32_t d;
-                for (d = 0; d < 500000U; d++) { __NOP(); }
-            }
-        }
-        debug_print("gd32_i2s2_test: GPIO toggle done, configuring I2S2 now\n");
-    }
-
-    rcu_periph_clock_enable(RCU_GPIOA);
-    rcu_periph_clock_enable(RCU_GPIOC);
-    rcu_periph_clock_enable(RCU_SPI2);
-
-    spi_i2s_deinit(SPI2);
-
-    /* PA4=WS, PC10=CK, PC12=SD - free pins, unrelated to the AIC3204 */
-    {
-        gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_4);
-        gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_4);
-        gpio_af_set(GPIOA, GPIO_AF_5, GPIO_PIN_4);
-    }
-    {
-        uint32_t pinsC = GPIO_PIN_10 | GPIO_PIN_12;
-        gpio_mode_set(GPIOC, GPIO_MODE_AF, GPIO_PUPD_NONE, pinsC);
-        gpio_output_options_set(GPIOC, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, pinsC);
-        gpio_af_set(GPIOC, GPIO_AF_5, pinsC);
-    }
-
-    /* PLLI2S is left at its reset value here (this test does not need
-     * a specific rate). */
-    i2s_init(SPI2, I2S_MODE_MASTERTX, I2S_STD_PHILLIPS, I2S_CKPL_LOW);
-    i2s_psc_config(SPI2, I2S_AUDIOSAMPLE_48K, I2S_FRAMEFORMAT_DT16B_CH16B, I2S_MCKOUT_DISABLE);
-    i2s_enable(SPI2);
-
-    /*
-     * A single dummy word only produces ~16 clock cycles (a couple of
-     * microseconds at 6MHz) - essentially invisible without a
-     * single-shot trigger. Feed data continuously instead, so the
-     * isolation test result is actually interpretable on a scope.
-     */
-    {
-        uint32_t i;
-        uint32_t timeout_hits = 0;
-        debug_print("gd32_i2s2_test: feeding dummy data continuously for ~3s - probe PC10 now\n");
-        for (i = 0; i < 1200000U; i++) {
-            uint32_t wait_cycles = 0;
-            while (spi_i2s_flag_get(SPI2, SPI_FLAG_TBE) == RESET) {
-                wait_cycles++;
-                if (wait_cycles > 100000U) { timeout_hits++; break; }
-            }
-            if (timeout_hits > 3) {
-                debug_print("gd32_i2s2_test: TBE never clears - aborting loop\n");
-                break;
-            }
-            spi_i2s_data_transmit(SPI2, (i & 1U) ? 0xAAAAU : 0x5555U);
-        }
-        debug_print("gd32_i2s2_test: continuous feed done\n");
-    }
-
-    debug_print_hex32("gd32_i2s2_test: SPI_I2SCTL(SPI2) after enable", SPI_I2SCTL(SPI2));
-    debug_print_hex32("gd32_i2s2_test: SPI_I2SPSC(SPI2)", SPI_I2SPSC(SPI2));
-    debug_print("gd32_i2s2_test: SPI2/I2S2 configured - WS=PA4 CK=PC10 SD=PC12 "
-                "(no MCK). Check PC10 (CK) with a scope.\n");
-}
-
-void gd32_i2s_init_master_48k(void)
+void gd32_i2s_init_slave_192k(void)
 {
     rcu_periph_clock_enable(RCU_GPIOB);
     rcu_periph_clock_enable(RCU_GPIOC);
     rcu_periph_clock_enable(RCU_SPI1);
-
-    debug_print_hex32("gd32_i2s: RCU_PLLI2S before spi_i2s_deinit", RCU_PLLI2S);
 
     /*
      * Clean reset of SPI1/I2S1/I2S1_ADD in case any state was
@@ -160,8 +68,6 @@ void gd32_i2s_init_master_48k(void)
      * on every flash, so residual peripheral state is possible.
      */
     spi_i2s_deinit(SPI1);
-    debug_print("gd32_i2s: SPI1/I2S1 reset via RCU before configuring\n");
-    debug_print_hex32("gd32_i2s: RCU_PLLI2S after spi_i2s_deinit", RCU_PLLI2S);
 
     /*
      * PLLI2S must be configured explicitly (not left at its reset/
@@ -173,41 +79,70 @@ void gd32_i2s_init_master_48k(void)
      * be recalculated together with it to keep the same i2sclock -
      * they are not independent.
      *
-     * Current values (PSC=8 in system_gd32f4xx.c, N=128/R=4 here):
-     * i2sclock = (12.288MHz/8) * 128/4 = 49.152MHz exactly.
+     * Current values (PSC=8 in system_gd32f4xx.c, N=400/R=4 here):
+     * i2sclock = (12.288MHz/8) * 400/4 = 49.152MHz exactly.
      */
-    debug_print_hex32("gd32_i2s: RCU_PLLI2S before forcing N=128/R=4", RCU_PLLI2S);
     rcu_osci_off(RCU_PLLI2S_CK);
-    if (rcu_plli2s_config(128U, 4U) != SUCCESS) {
-        debug_print("gd32_i2s: rcu_plli2s_config(128,4) FAILED\n");
+    if (rcu_plli2s_config(400U, 4U) != SUCCESS) {
+        debug_print("gd32_i2s: rcu_plli2s_config(400,4) FAILED\n");
     }
     rcu_osci_on(RCU_PLLI2S_CK);
     if (rcu_osci_stab_wait(RCU_PLLI2S_CK) != SUCCESS) {
         debug_print("gd32_i2s: *** PLLI2S DID NOT LOCK (stab_wait ERROR) - no i2sclock ***\n");
-    } else {
-        debug_print("gd32_i2s: PLLI2S locked OK (stab_wait SUCCESS)\n");
     }
-    debug_print_hex32("gd32_i2s: RCU_PLLI2S after forcing N=128/R=4", RCU_PLLI2S);
-
-    i2s_init(SPI1, I2S_MODE_MASTERTX, I2S_STD_PHILLIPS, I2S_CKPL_LOW);
 
     /*
-     * Confirmed with a real oscilloscope measurement: MCLK=12.288MHz,
-     * BCLK=1.536MHz, WCLK=48kHz - the fixed 256x/32x ratio that this
-     * MCU's native MCKOUT block always produces for 16-bit words once
-     * enabled. The real working sample rate is 48kHz.
+     * BLOCK ROLES SWAPPED (28/07/2026): a real I2C capture combined
+     * with disassembly of the original firmware's own I2S setup code
+     * shows the struct tied to the SPI1_BASE literal being initialized
+     * with Mode=0x100 - which matches I2S_MODE_SLAVERX exactly (this
+     * project's own I2SCTL_I2SOPMOD(1) encoding). That means the
+     * ORIGINAL firmware configures the MAIN SPI1/I2S1 block as the
+     * RECEIVE side (ADC capture, on PB15/SD) and the I2S1_ADD
+     * extension as the TRANSMIT side (DAC feed, on PB14/SDext) - the
+     * OPPOSITE of what this driver assumed for a very long time (main
+     * block = TX, extension = RX). The GD32F4xx User Manual's DMA0
+     * request mapping table confirms both halves of this swap exist
+     * as distinct, real options on the exact same DMA channels we
+     * were already using (DMA0/CH3: SPI1_RX at SUBPERI0 vs
+     * I2S1_ADD_RX at SUBPERI3; DMA0/CH4: I2S1_ADD_TX at SUBPERI2 vs
+     * SPI1_TX at SUBPERI0) - meaning this whole time, ADC samples were
+     * very plausibly being captured from the wrong subperipheral of
+     * the right DMA channel, which would explain why no amount of
+     * clock, DMA priority, or master/slave fixing on the OTHER half
+     * ever changed anything: the real ADC data path was never the one
+     * being read from at all.
+     *
+     * SLAVE mode (still applies, unrelated to this swap): a real I2C
+     * capture of the original firmware's AIC3204 configuration shows
+     * register 0x1B=0x0C, which (confirmed against a real TI forum
+     * example using this exact byte, plus TI's own SLAA404C app note
+     * describing bits D3:D2 of this register as the BCLK/WCLK
+     * direction control) sets BOTH BCLK and WCLK as OUTPUTS on the
+     * codec - i.e. the codec is the I2S master in this design. The
+     * GD32 must be the SLAVE to match (confirmed clean, single-source
+     * BCLK/WCLK on a real oscilloscope once this was corrected).
      */
-    i2s_psc_config(SPI1, I2S_AUDIOSAMPLE_48K, I2S_FRAMEFORMAT_DT16B_CH16B, I2S_MCKOUT_ENABLE);
+    i2s_init(SPI1, I2S_MODE_SLAVERX, I2S_STD_PHILLIPS, I2S_CKPL_LOW);
 
-    debug_print_hex32("gd32_i2s: SPI_I2SCTL after i2s_init (SPI1)", SPI_I2SCTL(SPI1));
-    debug_print_hex32("gd32_i2s: SPI_I2SPSC after i2s_psc_config (SPI1)", SPI_I2SPSC(SPI1));
+    /*
+     * MCLK: now resolved - see gd32_i2s_mclk_timer_start(), called
+     * before this function from main.c. Confirmed on a real
+     * oscilloscope: MCLK=1.536MHz, BCLK=6.144MHz, WCLK=192kHz, exactly
+     * matching the real board's measured values.
+     */
+    i2s_psc_config(SPI1, I2S_AUDIOSAMPLE_192K, I2S_FRAMEFORMAT_DT16B_CH16B, I2S_MCKOUT_DISABLE);
 
     /* I2S1_ADD extension block: passed the SAME mode as the main block
-     * (I2S_MODE_MASTERTX) - the library internally derives that the
-     * extension block must be I2S_MODE_SLAVERX (shares the clock with
-     * the master block, receive-only). This is the path the AIC3204's
-     * I/Q samples arrive on (PB14), captured by DMA in sdr_rx.c. */
-    i2s_full_duplex_mode_config(I2S1_ADD, I2S_MODE_MASTERTX, I2S_STD_PHILLIPS,
+     * (I2S_MODE_SLAVERX) - the library internally derives the OPPOSITE
+     * role for the extension block, I2S_MODE_SLAVETX in this case
+     * (shares the clock with the master - now the CODEC, not the GD32
+     * - transmit-only). This is now the path that feeds the AIC3204's
+     * DAC (silence/test tone), captured... err, driven, by DMA in
+     * gd32_i2s_dma_start_silence()/gd32_i2s_dma_start_test_tone()
+     * below, via PB14 (SDext). The MAIN block above is now the one
+     * capturing ADC samples on PB15 (SD), via DMA in sdr_rx.c. */
+    i2s_full_duplex_mode_config(I2S1_ADD, I2S_MODE_SLAVERX, I2S_STD_PHILLIPS,
                                  I2S_CKPL_LOW, I2S_FRAMEFORMAT_DT16B_CH16B);
 
     /*
@@ -218,7 +153,8 @@ void gd32_i2s_init_master_48k(void)
      * physical pins at all.
      *
      * WS, CK, SD(TX): AF5 on PB12/13/14/15 (SPI1/I2S1 block). PC6
-     * (MCLK) is also AF5, confirmed wired to the AIC3204's MCLK pin.
+     * (MCLK) is intentionally NOT configured - see the MCKOUT note
+     * above.
      */
     {
         uint32_t pins = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_15;
@@ -227,131 +163,55 @@ void gd32_i2s_init_master_48k(void)
         gpio_af_set(GPIOB, GPIO_AF_5, pins);
     }
     {
+        /*
+         * AF6 for I2S1_ADD_SD (RX data in), confirmed against the
+         * GD32F450xx datasheet's Port B alternate function table:
+         * PB14 lists SPI1_MISO on AF5 and I2S1_ADD_SD on AF6.
+         */
         gpio_mode_set(GPIOB, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_14);
         gpio_output_options_set(GPIOB, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_14);
-        gpio_af_set(GPIOB, GPIO_AF_5, GPIO_PIN_14);
+        gpio_af_set(GPIOB, GPIO_AF_6, GPIO_PIN_14);
     }
-    {
-        gpio_mode_set(GPIOC, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_6);
-        gpio_output_options_set(GPIOC, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_6);
-        gpio_af_set(GPIOC, GPIO_AF_5, GPIO_PIN_6);
-    }
-
-    debug_print_hex32("gd32_i2s: GPIOB_CTL raw (pins 12-15 in bits[31:24], AF=10b)", GPIO_CTL(GPIOB));
-    debug_print_hex32("gd32_i2s: GPIOB_AFSEL1 raw (should be 0x55550000 in nibbles 12-15)", GPIO_AFSEL1(GPIOB));
-    debug_print_hex32("gd32_i2s: GPIOC_CTL raw (pin6 = bits[13:12], AF=10b)", GPIO_CTL(GPIOC));
-    debug_print_hex32("gd32_i2s: GPIOC_AFSEL0 raw (pin6 = bits[27:24], should be 0x5)",
-                       GPIO_AFSEL0(GPIOC));
-    debug_print("gd32_i2s: PC6/MCLK enabled (MCKOUT). Confirmed on hardware: "
-                "MCLK=12.288MHz, BCLK=1.536MHz, WCLK=48kHz.\n");
 
     i2s_enable(SPI1);
     i2s_enable(I2S1_ADD);
 
     /*
-     * Known behavior on STM32/GD32-style I2S peripherals in
-     * master-transmit mode: the internal clock generator can fail to
-     * start until at least one data word is written to the data
-     * register, even though I2SEN is already set. The loop below
-     * feeds data continuously (not just once) for two reasons: a
-     * single word only produces a couple of microseconds of clock
-     * activity (invisible without a single-shot trigger), and this
-     * loop doubles as a bring-up diagnostic - it proves the whole
-     * clock chain end-to-end (comparison frequency, VCO lock, GPIO/AF
-     * routing) by making the result directly observable both on a
-     * scope and in this log.
-     */
-    {
-        uint32_t i;
-        uint32_t timeout_hits = 0;
-        uint32_t wait_events = 0;   /* iterations that had to wait on TBE */
-        uint32_t ch_left = 0, ch_right = 0; /* I2S channel-side flag samples */
-        uint32_t t0, t1, elapsed_ms;
-
-        /* DWT cycle counter, used to measure the loop's real duration */
-        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-        DWT->CYCCNT = 0U;
-        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-        t0 = DWT->CYCCNT;
-
-        debug_print("gd32_i2s: feeding dummy data continuously for a few seconds - probe now\n");
-        for (i = 0; i < 1200000U; i++) {
-            uint32_t wait_cycles = 0;
-            if (spi_i2s_flag_get(SPI1, SPI_FLAG_TBE) == RESET) {
-                wait_events++;
-            }
-            while (spi_i2s_flag_get(SPI1, SPI_FLAG_TBE) == RESET) {
-                wait_cycles++;
-                if (wait_cycles > 100000U) {
-                    timeout_hits++;
-                    break;
-                }
-            }
-            if (timeout_hits > 3) {
-                debug_print("gd32_i2s: TBE never clears (repeated timeout) - aborting "
-                            "the feed loop so the rest of the system is not blocked\n");
-                break;
-            }
-            spi_i2s_data_transmit(SPI1, (i & 1U) ? 0xAAAAU : 0x5555U);
-            /* Sample the channel-side flag every so often: if the frame
-             * counter is running, both values (left and right) should
-             * show up over time. Sampling stride must be ODD (not a
-             * multiple of 2), or it will alias onto a single
-             * even/odd phase and always report the same channel. */
-            if ((i % 1023U) == 0U) {
-                if (spi_i2s_flag_get(SPI1, I2S_FLAG_CH) == SET) { ch_right++; }
-                else { ch_left++; }
-            }
-        }
-        t1 = DWT->CYCCNT;
-        elapsed_ms = (uint32_t)(((uint64_t)(t1 - t0)) * 1000U / SystemCoreClock);
-
-        debug_print("gd32_i2s: continuous feed done (or aborted on timeout)\n");
-        /*
-         * How to read this diagnostic:
-         * - Non-zero wait_events, elapsed time matching the expected
-         *   word rate, and BOTH ch_left/ch_right > 0 -> the internal
-         *   clock is running and the shifter is transmitting; if
-         *   there's still no signal on the scope, look at AF/pin
-         *   routing next.
-         * - elapsed time of only a few ms and wait_events = 0 -> TBE
-         *   never cleared: writes to the data register are not
-         *   actually being accepted by the peripheral.
-         */
-        debug_print_dec("gd32_i2s: loop duration (ms)", elapsed_ms);
-        debug_print_dec("gd32_i2s: words written", i);
-        debug_print_dec("gd32_i2s: wait_events (times we waited on TBE)", wait_events);
-        debug_print_dec("gd32_i2s: left-channel samples", ch_left);
-        debug_print_dec("gd32_i2s: right-channel samples", ch_right);
-    }
-
-    /*
-     * Continuous audio requires circular DMA (see
-     * gd32_i2s_dma_start_test_tone below) - the manual feed loop above
-     * only produces clocks while it is actively writing; the clock
-     * generator on this peripheral is gated by data availability, not
-     * free-running.
+     * REMOVED (28/07/2026): this loop used to write dummy TX data to
+     * SPI1 to prime this MCU's old MASTER-mode clock generator. Now
+     * that SPI1/I2S1 is a SLAVE **and** the RECEIVE side of the swap
+     * above, writing to its data register doesn't make sense at all
+     * (SPI_DATA(SPI1) is now an input path) - removed rather than
+     * adapted, since none of its original rationale applies anymore.
      */
 
     debug_print_hex32("gd32_i2s: SPI_I2SCTL after i2s_enable (SPI1, bit10=I2SEN should be 1)",
                        SPI_I2SCTL(SPI1));
     debug_print_hex32("gd32_i2s: RCU_CFG0 raw (I2SSEL toggle bit is bit 23)", RCU_CFG0);
 
-    debug_print("gd32_i2s: I2S1 (SPI1) master configured - WS=PB12 CK=PB13 SD=PB15 "
-                "SDext=PB14, MCK=PC6. i2sclock=49.152MHz (N=128/R=4). "
-                "Fs=48kHz, BCLK=1.536MHz, MCLK=12.288MHz (confirmed on hardware).\n");
+    debug_print("gd32_i2s: I2S1 SLAVE configured, roles SWAPPED to match the original "
+                "firmware - SPI1(main)=RX (ADC capture, PB15/SD), I2S1_ADD=TX (DAC feed, "
+                "PB14/SDext). WS=PB12 CK=PB13, MCK=PC6 via TIMER2_CH0 (confirmed on "
+                "hardware: MCLK=1.536MHz, BCLK=6.144MHz, WCLK=192kHz, matching the real "
+                "board exactly).\n");
 
+#if AIC3204_TEST_LOOPBACK
+    /* Loopback test needs a real, recognizable TX pattern - silence
+     * looped back is still silence, not a useful test. */
     gd32_i2s_dma_start_test_tone();
+#else
+    gd32_i2s_dma_start_silence();
+#endif
 }
 
 /*
  * 1kHz sine tone table, stereo (L=R), 16-bit, at the real confirmed
- * frame rate (48kHz). 48000/1000 = 48 samples per cycle exactly, so
+ * frame rate (192kHz). 192000/1000 = 192 samples per cycle exactly, so
  * the table is short and there is no frequency rounding error.
  * Amplitude is moderate (not full-scale) to be safe on a speaker or
  * headphones during bring-up testing.
  */
-#define TONE_SAMPLES_PER_CYCLE   48U
+#define TONE_SAMPLES_PER_CYCLE   192U
 static int16_t s_tone_buf[TONE_SAMPLES_PER_CYCLE * 2U]; /* *2: interleaved L/R */
 
 static void tone_buf_fill_1khz(void)
@@ -384,6 +244,186 @@ static float sinf_approx(float x)
     return negate ? -x2 : x2;
 }
 
+/*
+ * IMPORTANT: this MCU's I2S master clock generator only produces
+ * continuous BCLK/WS while TX data keeps flowing - it is NOT
+ * free-running (see the manual feed loop in
+ * gd32_i2s_init_slave_192k()). Since I2S1_ADD (RX) is wired as a
+ * SLAVE sharing the SAME BCLK/WS lines as the TX master block, RX
+ * capture silently stops the moment BCLK/WS stop - even though RX
+ * itself has nothing to do with the TX audio content. A continuous TX
+ * feed is therefore required to keep the whole bus alive, not just to
+ * produce audio output. Feeding silence (all zeros) instead of the
+ * audible test tone keeps BCLK/WS running without an audible tone.
+ */
+static const int16_t s_silence_buf[16] = {0}; /* small, doesn't need to match any tone period */
+
+/*
+ * MCLK generation via TIMER2_CH0 on PC6, AF2 - confirmed against the
+ * GD32F450xx datasheet's Port C alternate function table (Table 2-8),
+ * cross-checked against the already-empirically-confirmed AF5=I2S1_MCK
+ * on the same row.
+ *
+ * Targets exactly 1.536MHz, matching the real board's confirmed MCLK
+ * frequency. With this project's clock config (PSC=8/PLLN=260/PLLP=2
+ * in system_gd32f4xx.c -> SYSCLK=199.68MHz, APB1_PSC=4 -> PCLK1=
+ * 49.92MHz -> TIMER2CLK=2xPCLK1=99.84MHz when APB1 prescaler != 1,
+ * standard on this family): 99.84MHz / 65 = 1.536MHz exactly. PSC=0,
+ * period=64 (65 total counts) gives that division with no remainder -
+ * a clean, exact match, not a rounded approximation.
+ *
+ * Duty cycle is close to but not exactly 50% (32/65 ~= 49.2%) since 65
+ * is odd and can't split evenly - a minor asymmetry that should not
+ * matter for a clock reference input.
+ */
+void gd32_i2s_mclk_timer_start(void)
+{
+    timer_parameter_struct timer_init_struct;
+    timer_oc_parameter_struct oc_init_struct;
+
+    rcu_periph_clock_enable(RCU_GPIOC);
+    rcu_periph_clock_enable(RCU_TIMER2);
+
+    gpio_mode_set(GPIOC, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_6);
+    gpio_output_options_set(GPIOC, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_6);
+    gpio_af_set(GPIOC, GPIO_AF_2, GPIO_PIN_6);
+
+    timer_deinit(TIMER2);
+
+    timer_struct_para_init(&timer_init_struct);
+    timer_init_struct.prescaler         = 0U;
+    timer_init_struct.alignedmode       = TIMER_COUNTER_EDGE;
+    timer_init_struct.counterdirection  = TIMER_COUNTER_UP;
+    timer_init_struct.clockdivision     = TIMER_CKDIV_DIV1;
+    timer_init_struct.period            = 64U; /* 65 counts: 99.84MHz/65 = 1.536MHz exact */
+    timer_init_struct.repetitioncounter = 0U;
+    gd32_timer_init(TIMER2, &timer_init_struct);
+
+    timer_channel_output_struct_para_init(&oc_init_struct);
+    oc_init_struct.outputstate  = TIMER_CCX_ENABLE;
+    oc_init_struct.ocpolarity   = TIMER_OC_POLARITY_HIGH;
+    timer_channel_output_config(TIMER2, TIMER_CH_0, &oc_init_struct);
+
+    timer_channel_output_pulse_value_config(TIMER2, TIMER_CH_0, 32U); /* ~49.2% duty */
+    timer_channel_output_mode_config(TIMER2, TIMER_CH_0, TIMER_OC_MODE_PWM0);
+
+    timer_auto_reload_shadow_enable(TIMER2);
+    timer_enable(TIMER2);
+
+    debug_print("gd32_i2s: MCLK started via TIMER2_CH0/PC6 (AF2), target 1.536MHz "
+                "exact - verify with a scope before relying on it\n");
+}
+
+
+void gd32_i2s_dma_start_silence(void)
+{
+    dma_single_data_parameter_struct dma_init_struct;
+
+    rcu_periph_clock_enable(RCU_DMA0);
+
+    /* DMA0, Channel 4, PERIEN=010 (SUBPERI2) for I2S1_ADD_TX - now the
+     * TX side after the block-role swap (see gd32_i2s_init_slave_192k)
+     * - confirmed against the GD32F4xx User Manual's DMA request
+     * mapping table (Table 10-2, "Peripheral requests to DMA0"). Same
+     * channel as gd32_i2s_dma_start_test_tone(), just a silent source
+     * buffer. */
+    dma_deinit(DMA0, DMA_CH4);
+
+    dma_single_data_para_struct_init(&dma_init_struct);
+    dma_init_struct.periph_addr         = (uint32_t)&SPI_DATA(I2S1_ADD);
+    dma_init_struct.periph_inc          = DMA_PERIPH_INCREASE_DISABLE;
+    dma_init_struct.memory0_addr        = (uint32_t)s_silence_buf;
+    dma_init_struct.memory_inc          = DMA_MEMORY_INCREASE_ENABLE;
+    dma_init_struct.periph_memory_width = DMA_PERIPH_WIDTH_16BIT;
+    dma_init_struct.circular_mode       = DMA_CIRCULAR_MODE_ENABLE;
+    dma_init_struct.direction           = DMA_MEMORY_TO_PERIPH;
+    dma_init_struct.number              = 16U;
+    dma_init_struct.priority            = DMA_PRIORITY_HIGH;
+    dma_single_data_mode_init(DMA0, DMA_CH4, &dma_init_struct);
+
+    dma_channel_subperipheral_select(DMA0, DMA_CH4, DMA_SUBPERI2);
+
+    dma_circulation_enable(DMA0, DMA_CH4);
+    dma_channel_enable(DMA0, DMA_CH4);
+
+    spi_dma_enable(I2S1_ADD, SPI_DMA_TRANSMIT);
+}
+
+/*
+ * --- TX audio stream (demodulated audio -> DAC) ---------------------
+ *
+ * A 2-half ping-pong buffer played by the same circular DMA channel
+ * (DMA0/CH4) that the silence/test-tone paths use. Each half holds
+ * exactly one RX block's worth of stereo frames: since RX and TX are
+ * clocked by the SAME codec-driven BCLK/WS at the same rate, every
+ * completed RX half corresponds to exactly one TX half consumed -
+ * the two sides cannot drift, only the phase offset at startup
+ * varies, and gd32_i2s_stream_write_half() re-derives the safe half
+ * from the live DMA position on every call, so it self-corrects.
+ */
+#define STREAM_FRAMES_PER_HALF 512U /* MUST equal SDR_RX_BLOCK_SAMPLES */
+#define STREAM_WORDS_PER_HALF  (STREAM_FRAMES_PER_HALF * 2U) /* stereo */
+#define STREAM_TOTAL_WORDS     (STREAM_WORDS_PER_HALF * 2U)
+
+static int16_t s_stream_buf[STREAM_TOTAL_WORDS]; /* zero-initialized: silence */
+
+void gd32_i2s_dma_start_stream(void)
+{
+    dma_single_data_parameter_struct dma_init_struct;
+    uint32_t w;
+
+    for (w = 0; w < STREAM_TOTAL_WORDS; w++) {
+        s_stream_buf[w] = 0;
+    }
+
+    rcu_periph_clock_enable(RCU_DMA0);
+
+    /* Take over DMA0/CH4 from whatever fed it before (silence or the
+     * test tone): disable cleanly, wait for CHEN to drop, deinit,
+     * re-arm over the stream buffer. */
+    dma_channel_disable(DMA0, DMA_CH4);
+    while ((DMA_CHCTL(DMA0, DMA_CH4) & DMA_CHXCTL_CHEN) != 0U) {
+        /* a disable request can take a few cycles to complete */
+    }
+    dma_deinit(DMA0, DMA_CH4);
+
+    dma_single_data_para_struct_init(&dma_init_struct);
+    dma_init_struct.periph_addr         = (uint32_t)&SPI_DATA(I2S1_ADD);
+    dma_init_struct.periph_inc          = DMA_PERIPH_INCREASE_DISABLE;
+    dma_init_struct.memory0_addr        = (uint32_t)s_stream_buf;
+    dma_init_struct.memory_inc          = DMA_MEMORY_INCREASE_ENABLE;
+    dma_init_struct.periph_memory_width = DMA_PERIPH_WIDTH_16BIT;
+    dma_init_struct.circular_mode       = DMA_CIRCULAR_MODE_ENABLE;
+    dma_init_struct.direction           = DMA_MEMORY_TO_PERIPH;
+    dma_init_struct.number              = STREAM_TOTAL_WORDS;
+    dma_init_struct.priority            = DMA_PRIORITY_HIGH;
+    dma_single_data_mode_init(DMA0, DMA_CH4, &dma_init_struct);
+
+    dma_channel_subperipheral_select(DMA0, DMA_CH4, DMA_SUBPERI2);
+    dma_circulation_enable(DMA0, DMA_CH4);
+    dma_channel_enable(DMA0, DMA_CH4);
+    spi_dma_enable(I2S1_ADD, SPI_DMA_TRANSMIT);
+
+    debug_print("gd32_i2s: TX stream DMA armed (2x512 stereo frames, starts silent)\n");
+}
+
+void gd32_i2s_stream_write_half(const int16_t *stereo_frames)
+{
+    /* Remaining count -> current playback position -> half being
+     * PLAYED right now; write the OTHER one. Called once per RX block
+     * (every 2.67ms) from the RX DMA interrupt. */
+    uint32_t remaining = dma_transfer_number_get(DMA0, DMA_CH4);
+    uint32_t pos = STREAM_TOTAL_WORDS - remaining;
+    uint32_t playing_half = (pos < STREAM_WORDS_PER_HALF) ? 0U : 1U;
+    uint32_t write_half = 1U - playing_half;
+    int16_t *dst = &s_stream_buf[write_half * STREAM_WORDS_PER_HALF];
+    uint32_t w;
+
+    for (w = 0; w < STREAM_WORDS_PER_HALF; w++) {
+        dst[w] = stereo_frames[w];
+    }
+}
+
 void gd32_i2s_dma_start_test_tone(void)
 {
     dma_single_data_parameter_struct dma_init_struct;
@@ -392,17 +432,18 @@ void gd32_i2s_dma_start_test_tone(void)
 
     rcu_periph_clock_enable(RCU_DMA0);
 
-    debug_print_hex32("gd32_i2s: SPI_STAT(SPI1) right before arming DMA "
+    debug_print_hex32("gd32_i2s: SPI_STAT(I2S1_ADD) right before arming DMA "
                        "(bit1=TBE should be 1 if ready to write)",
-                       SPI_STAT(SPI1));
+                       SPI_STAT(I2S1_ADD));
 
-    /* DMA0, Channel 4, PERIEN=000 (SUBPERI0) for SPI1_TX - confirmed
-     * against the GD32F4xx User Manual's DMA request mapping table
-     * (Table 10-2, "Peripheral requests to DMA0"). */
+    /* DMA0, Channel 4, PERIEN=010 (SUBPERI2) for I2S1_ADD_TX - now the
+     * TX side after the block-role swap - confirmed against the
+     * GD32F4xx User Manual's DMA request mapping table (Table 10-2,
+     * "Peripheral requests to DMA0"). */
     dma_deinit(DMA0, DMA_CH4);
 
     dma_single_data_para_struct_init(&dma_init_struct);
-    dma_init_struct.periph_addr         = (uint32_t)&SPI_DATA(SPI1);
+    dma_init_struct.periph_addr         = (uint32_t)&SPI_DATA(I2S1_ADD);
     dma_init_struct.periph_inc          = DMA_PERIPH_INCREASE_DISABLE;
     dma_init_struct.memory0_addr        = (uint32_t)s_tone_buf;
     dma_init_struct.memory_inc          = DMA_MEMORY_INCREASE_ENABLE;
@@ -413,18 +454,18 @@ void gd32_i2s_dma_start_test_tone(void)
     dma_init_struct.priority            = DMA_PRIORITY_HIGH;
     dma_single_data_mode_init(DMA0, DMA_CH4, &dma_init_struct);
 
-    dma_channel_subperipheral_select(DMA0, DMA_CH4, DMA_SUBPERI0);
+    dma_channel_subperipheral_select(DMA0, DMA_CH4, DMA_SUBPERI2);
 
     dma_circulation_enable(DMA0, DMA_CH4);
     dma_channel_enable(DMA0, DMA_CH4);
 
-    /* Enable the DMA transmit request on SPI1/I2S1 itself - without
+    /* Enable the DMA transmit request on I2S1_ADD itself - without
      * this, the DMA channel is armed but the peripheral never
      * triggers it. */
-    spi_dma_enable(SPI1, SPI_DMA_TRANSMIT);
+    spi_dma_enable(I2S1_ADD, SPI_DMA_TRANSMIT);
 
     debug_print("gd32_i2s: circular DMA armed, 1kHz test tone should now be continuous "
-                "(no longer stopping) on PB13/PB12, and audible on the AIC3204 output if "
+                "(no longer stopping) on PB14, and audible on the AIC3204 output if "
                 "phase 1 (I2C) left the codec unmuted\n");
 
     /*
@@ -441,8 +482,8 @@ void gd32_i2s_dma_start_test_tone(void)
         uint32_t cnt_a, cnt_b;
         volatile uint32_t d;
 
-        debug_print_hex32("gd32_i2s: SPI_CTL1(SPI1) after spi_dma_enable (bit1=DMATEN should be 1)",
-                           SPI_CTL1(SPI1));
+        debug_print_hex32("gd32_i2s: SPI_CTL1(I2S1_ADD) after spi_dma_enable (bit1=DMATEN should be 1)",
+                           SPI_CTL1(I2S1_ADD));
         debug_print_hex32("gd32_i2s: DMA_CHCTL(DMA0,CH4) raw (bit0=CHEN should be 1)",
                            DMA_CHCTL(DMA0, DMA_CH4));
 

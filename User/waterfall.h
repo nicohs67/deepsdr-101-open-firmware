@@ -40,16 +40,21 @@
  * capa de SDR/DSP mas adelante.
  */
 
-#define WATERFALL_WIDTH  800   /* ancho de pantalla completo (horizontal, ver gfx.h) */
-#define WATERFALL_ROWS   60    /* filas visibles simultaneamente, ver presupuesto de RAM arriba */
+#define WATERFALL_WIDTH  672   /* main display column width: screen (800) minus the
+                                  right-hand status column (124px) and panel borders -
+                                  see main.c's radio layout constants (30/07/2026:
+                                  narrowed from full-screen 800 for the redesigned UI) */
+#define WATERFALL_ROWS   72    /* filas visibles simultaneamente, ver presupuesto de RAM arriba
+                                  (672*72*2 = ~97KB - same budget as the old 800*60*2) */
 
 /* Reserva el buffer (en .bss, RAM principal) y lo pone a negro. Llamar
  * una vez al arrancar, antes del primer waterfall_push_line(). */
 void waterfall_init(void);
 
-/* Desplaza el buffer una fila hacia abajo y mete `line` (WATERFALL_WIDTH
- * pixeles RGB565) como fila superior nueva. O(WATERFALL_WIDTH*WATERFALL_ROWS)
- * por el memmove - a tener en cuenta si se llama a alta frecuencia. */
+/* Mete `line` (WATERFALL_WIDTH pixeles RGB565) como fila superior nueva
+ * y "desplaza" el resto. Desde el rediseño en anillo (30/07/2026) es
+ * O(WATERFALL_WIDTH): solo mueve un indice y copia la fila nueva, sin
+ * memmove del buffer completo. */
 void waterfall_push_line(const uint16_t *line);
 
 /* Vuelca el buffer completo a la GRAM en (x,y). No hace falta llamarlo en

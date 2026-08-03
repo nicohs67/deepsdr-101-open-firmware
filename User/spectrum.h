@@ -124,10 +124,30 @@ uint16_t spectrum_colormap(float db, float db_min, float db_max);
  * true horizontal center by this many pixels (positive = right, i.e.
  * higher frequency) - pass 0 to mark the true center (the LO) as
  * before. Clamped internally to stay inside the plot area.
+ *
+ * band_active/band_lo_offset_px/band_hi_offset_px - added 03/08/2026,
+ * per the project owner: an optional tinted background region behind
+ * the trace showing WHICH slice of the panadapter is actually being
+ * demodulated right now (AM/USB/LSB's audio bandwidth, mapped back
+ * onto the frequency axis) - so it's visually obvious what you're
+ * listening to, not just where the LO/demod point sits. band_active=0
+ * skips it entirely (draw exactly as before - used for NFM/WFM, which
+ * don't have a caller-selectable audio bandwidth the way AM/SSB do).
+ * When active, band_lo_offset_px/band_hi_offset_px are pixel offsets
+ * from the panel's horizontal center, SAME origin and sign convention
+ * as center_mark_offset_px (so the caller can build them directly on
+ * top of that same value - see main.c's call site) - lo/hi order
+ * doesn't matter, both get clamped and sorted internally. The tint
+ * only ever replaces BACKGROUND pixels (gridline or plain fill,
+ * whichever would've shown) - it never covers the trace, the bar
+ * fill, the peak marker, or the center mark, all of which keep
+ * drawing on top of it exactly as they would without it.
  */
 void spectrum_draw(const float *db, uint32_t n_bins,
                     uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     float db_min, float db_max,
-                    int16_t center_mark_offset_px);
+                    int16_t center_mark_offset_px,
+                    uint8_t band_active,
+                    int16_t band_lo_offset_px, int16_t band_hi_offset_px);
 
 #endif /* SPECTRUM_H */

@@ -94,6 +94,17 @@ uint16_t spectrum_colormap(float db, float db_min, float db_max)
 #define SPEC_LINE_TRACE 0x6D9F
 #define SPEC_LINE_GRID  0x10C5
 
+/* Demodulated-bandwidth background tint - see spectrum_draw()'s
+ * comment in spectrum.h. Deliberately a hue the rest of each style's
+ * palette never uses (dim PURPLE) - the HEATMAP palette's own low end
+ * ramps black->BLUE->cyan->green/yellow->red, and the LINE style is
+ * all blues (background/fill/trace/grid), so a weak real signal could
+ * never accidentally read as "this is the tint", or vice versa.
+ * HEATMAP: RGB (40,0,60). LINE: RGB (34,0,52), slightly dimmer since
+ * SPEC_LINE_BG is already non-black. */
+#define SPEC_COLOR_BAND_TINT      0x2807
+#define SPEC_LINE_BAND_TINT       0x2006
+
 static float    s_col_ema[SPEC_MAX_W];   /* smoothed dB per column      */
 #if SPECTRUM_PEAK_HOLD
 static float    s_col_peak[SPEC_MAX_W];  /* peak-hold dB per column     */
@@ -128,11 +139,14 @@ uint8_t spectrum_get_line_smooth(void)
 void spectrum_draw(const float *db, uint32_t n_bins,
                     uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     float db_min, float db_max,
-                    int16_t center_mark_offset_px)
+                    int16_t center_mark_offset_px,
+                    uint8_t band_active,
+                    int16_t band_lo_offset_px, int16_t band_hi_offset_px)
 {
     uint16_t col, row;
     float scale_t;
     uint16_t center_mark_col;
+    uint16_t band_col_lo = 0, band_col_hi = 0; /* only meaningful when band_active */
 
     if (db_max <= db_min || w == 0U || h == 0U ||
         w > SPEC_MAX_W || h > SPEC_MAX_H || n_bins == 0U) {
@@ -150,6 +164,26 @@ void spectrum_draw(const float *db, uint32_t n_bins,
         if (c < 0) { c = 0; }
         if (c > (int32_t)(w - 1U)) { c = (int32_t)(w - 1U); }
         center_mark_col = (uint16_t)c;
+    }
+
+    /* Same clamp, applied to both band edges independently, then
+     * sorted - the caller (main.c) builds these from
+     * center_mark_offset_px +/- a bandwidth in pixels, so which one
+     * ends up smaller depends on the demod mode (AM straddles both
+     * ways, USB/LSB only extend one way - see the call site), not
+     * worth requiring the caller to pre-sort them here too. */
+    if (band_active) {
+        int32_t lo = (int32_t)(w / 2U) + (int32_t)band_lo_offset_px;
+        int32_t hi = (int32_t)(w / 2U) + (int32_t)band_hi_offset_px;
+        int32_t tmp;
+
+        if (lo > hi) { tmp = lo; lo = hi; hi = tmp; }
+        if (lo < 0) { lo = 0; }
+        if (hi > (int32_t)(w - 1U)) { hi = (int32_t)(w - 1U); }
+        if (lo > (int32_t)(w - 1U)) { lo = (int32_t)(w - 1U); }
+        if (hi < 0) { hi = 0; }
+        band_col_lo = (uint16_t)lo;
+        band_col_hi = (uint16_t)hi;
     }
 
     /* Reset smoothing state when the geometry changes (first call
@@ -293,6 +327,7 @@ void spectrum_draw(const float *db, uint32_t n_bins,
         uint16_t bg_color    = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_BG    : GFX_COLOR_BLACK;
         uint16_t grid_color  = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_GRID  : SPEC_COLOR_GRID;
         uint16_t trace_color = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_TRACE : SPEC_COLOR_TRACE;
+        uint16_t band_color  = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_BAND_TINT : SPEC_COLOR_BAND_TINT;
 
         for (row = 0; row < h; row++) {
             uint16_t level_from_bottom = (uint16_t)(h - row);
@@ -315,6 +350,8 @@ void spectrum_draw(const float *db, uint32_t n_bins,
                 } else if (col == center_mark_col) {
                     px = SPEC_COLOR_CENTER;           /* demod point marker, under signals */
 #endif
+                } else if (band_active && col >= band_col_lo && col <= band_col_hi) {
+                    px = band_color;                  /* demodulated-bandwidth tint, under everything else */
                 } else {
                     px = empty;
                 }

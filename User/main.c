@@ -1438,6 +1438,14 @@ static const char *k_agc_profile_labels[4] = { "MAN", "SLW", "MED", "FST" };
 /* Indexed directly by audio_bw_t (demod_am.h) - AUDIO_BW_4K0,
  * AUDIO_BW_2K3, AUDIO_BW_1K8 in that order. */
 static const char *k_audio_bw_labels[3] = { "4K0", "2K3", "1K8" };
+/* Same indexing, in Hz - the nominal -3dB corner each ALPF_*_COEFFS
+ * table was designed for (see their comments in demod_am.c). Added
+ * 03/08/2026 for the spectrum panadapter's demodulated-bandwidth tint
+ * (see sdr_spectrum_waterfall_tick()'s call to spectrum_draw()) - the
+ * labels above are for display only and aren't parseable back into a
+ * number, so this is a second small table rather than deriving one
+ * from the other. */
+static const uint32_t k_audio_bw_hz[3] = { 4000UL, 2300UL, 1800UL };
 
 /*
  * Cycles MANUAL -> SLOW -> MEDIUM -> FAST -> MANUAL and redraws
@@ -1687,42 +1695,140 @@ typedef enum {
 static spec_zoom_t s_spec_zoom = SPEC_ZOOM_1X;
 
 /*
- * Panadapter span labels (+/- edge frequencies and the "LO" center
- * marker) - factored out of radio_screen_draw() 31/07/2026 so it can
- * be zoom-aware AND redrawn on demand, not just painted once at boot.
- * Two call sites: radio_screen_draw() (initial paint) and
- * menu_screen_close() (restoring this row - it lives inside the
- * spectrum panel, so the menu's black fill wipes it same as the panel
- * border, and it needs the SAME explicit restore ui_panel_draw()
- * already gets there - this was a gap in that change, fixed here
- * alongside adding zoom-awareness rather than as a separate patch).
+ * Panadapter frequency scale under the spectrum trace - 5 reference
+ * points (both edges, both quarter-points, and center), each showing
+ * the ACTUAL absolute frequency at that point, TRUNCATED to kHz (last
+ * 3 digits dropped - "quitando los 3 ultimos digitos", per the
+ * project owner, once 3 points at full Hz precision didn't leave room
+ * for more of them). Same grouped-thousands look as
+ * freq_display_draw()'s title-bar readout (via tune_freq_format() -
+ * already defined above, reused here on the truncated kHz value
+ * rather than the raw Hz one - e.g. 180096345 Hz -> 180096 -> shown as
+ * "180.096", not "180.096.345").
+ *
+ * PANEL-CENTER FREQUENCY - the one thing this function has to get
+ * right that a naive "s_tune_hz +/- half_span" wouldn't: the pixel
+ * grid's true center is NOT always s_tune_hz. Whenever the low-IF
+ * down-mix is active (demod_am_get_if_offset_active(), AM/USB/LSB/NFM
+ * at 1X zoom - see demod_am.h's LOW-IF TUNING note), the LO itself
+ * sits DEMOD_IF_OFFSET_HZ BELOW the selected/displayed station, and
+ * the FFT (hence this whole panel) is centered on the LO, not the
+ * station - s_tune_hz actually shows up center_mark_offset_px pixels
+ * to the right of center (see sdr_spectrum_waterfall_tick()'s comment
+ * and the red marker it draws there). Under ZOOM, on the other hand,
+ * zoom_process_block() re-centers on s_tune_hz BEFORE decimating, so
+ * the panel center genuinely IS s_tune_hz there. panel_center_hz
+ * below picks the right one of those two, the EXACT same condition
+ * center_mark_offset_px uses - so this scale, the red center marker,
+ * and the demodulated-bandwidth tint all agree on which frequency
+ * sits at which pixel. Getting this wrong would silently mislabel
+ * every non-WFM reading by 48kHz at 1X zoom - worth the extra
+ * conditional to avoid.
+ *
+ * The two edges are the exact +/-half_span_hz boundary of whatever
+ * the CURRENT zoom shows (96/48/24/12kHz - see the switch below), so
+ * they track ZOOM automatically, same as the marker/tint do.
+ * panel_center_hz +/- half_span_hz can, in principle, run outside
+ * TUNE_MIN_HZ/MAX_HZ (e.g. tuned near the 100kHz floor, minus 96kHz
+ * of span) - int64_t math + a floor-at-0 clamp keeps that from
+ * wrapping a uint32_t negative into a huge bogus frequency; showing
+ * an edge label below the tunable floor is harmless (there's no
+ * corresponding "real" edge case to get wrong here, it's just a
+ * label), unlike clamping the LO itself would be.
+ *
+ * MUST be redrawn on every actual frequency change, not just at
+ * init/menu-close - "esta escala tiene que variar con la frecuencia".
+ * Call sites: radio_screen_draw() (initial paint), menu_screen_close()
+ * (also covers band-preset/mode changes applied from the menu, which
+ * both close it on their way out - see menu_band_preset_callback()'s
+ * and menu_mode_preset_callback()'s comments), tune_encoder_poll()'s
+ * TUNE branch (knob retune) and spec_drag_tune_apply() (touch drag-
+ * to-tune) - the two places s_tune_hz changes WITHOUT going through
+ * the menu. Cheap enough (a handful of small draws, same cost class
+ * as freq_display_draw() it's always paired with) to just redraw on
+ * every change rather than diffing against the last-drawn value.
  */
+#define SPEC_SCALE_TEXT_SIZE 2 /* was 1 - bumped 03/08/2026, per the
+                                 * project owner: "casi no se ve" */
+
 static void spec_span_labels_draw(void)
 {
-    const char *lo_label, *hi_label;
+    uint32_t full_span_hz;
+    int32_t half_span_hz;
+    uint32_t panel_center_hz;
+    uint8_t i;
 
     switch (s_spec_zoom) {
-    case SPEC_ZOOM_2X: lo_label = "-48K"; hi_label = "+48K"; break;
-    case SPEC_ZOOM_4X: lo_label = "-24K"; hi_label = "+24K"; break;
-    case SPEC_ZOOM_8X: lo_label = "-12K"; hi_label = "+12K"; break;
+    case SPEC_ZOOM_2X: full_span_hz = 96000UL;  break;
+    case SPEC_ZOOM_4X: full_span_hz = 48000UL;  break;
+    case SPEC_ZOOM_8X: full_span_hz = 24000UL;  break;
     case SPEC_ZOOM_1X:
-    default:            lo_label = "-96K"; hi_label = "+96K"; break;
+    default:           full_span_hz = 192000UL; break;
+    }
+    half_span_hz = (int32_t)(full_span_hz / 2U);
+
+    /* See this function's PANEL-CENTER FREQUENCY comment above - same
+     * condition sdr_spectrum_waterfall_tick() uses for
+     * center_mark_offset_px. s_tune_hz > DEMOD_IF_OFFSET_HZ always
+     * holds here (TUNE_MIN_HZ=100kHz > DEMOD_IF_OFFSET_HZ=48kHz), so
+     * the subtraction below never underflows. */
+    panel_center_hz = s_tune_hz;
+    if (s_spec_zoom == SPEC_ZOOM_1X && demod_am_get_if_offset_active()) {
+        panel_center_hz = s_tune_hz - DEMOD_IF_OFFSET_HZ;
     }
 
-    /* Clear the row first - all four zoom labels happen to be the
-     * same width today, but this stays correct if that ever changes. */
-    gfx_fill_rect(0, (uint16_t)(SPEC_Y + SPEC_H - 16), MAIN_W, 12, GFX_COLOR_BLACK);
-    gfx_text(4, (uint16_t)(SPEC_Y + SPEC_H - 16), lo_label,
-              GFX_COLOR_GRAY, GFX_COLOR_BLACK, 1);
-    gfx_text((uint16_t)(MAIN_W / 2 - 9),
-              (uint16_t)(SPEC_Y + SPEC_H - 16), "LO",
-              GFX_COLOR_RED, GFX_COLOR_BLACK, 1);
-    gfx_text((uint16_t)(MAIN_W - 4 - 24),
-              (uint16_t)(SPEC_Y + SPEC_H - 16), hi_label,
-              GFX_COLOR_GRAY, GFX_COLOR_BLACK, 1);
+    /* Clear the whole scale strip (ticks + labels) in one go, then
+     * the horizontal baseline the ticks hang from. Taller than the
+     * old single-height-1 row to fit SPEC_SCALE_TEXT_SIZE's bigger
+     * glyphs. */
+    gfx_fill_rect(0, (uint16_t)(SPEC_Y + SPEC_H - 24), MAIN_W, 24, GFX_COLOR_BLACK);
     gfx_line(1, (uint16_t)(SPEC_Y + SPEC_H - 20),
               (uint16_t)(MAIN_W - 2), (uint16_t)(SPEC_Y + SPEC_H - 20),
               GFX_COLOR_DARKGRAY);
+
+    for (i = 0; i < 5U; i++) {
+        /* i=0..4 -> k=-2..+2 -> off_hz = k * half_span_hz/2, i.e. left
+         * edge, left-quarter, center, right-quarter, right edge -
+         * evenly spaced in Hz (and therefore in pixels too, since the
+         * Hz->px mapping is linear). half_span_hz/2 is always exact
+         * for every full_span_hz above (96000/48000/24000/12000 all
+         * divide cleanly by 4 total), so no rounding to worry about. */
+        int32_t k = (int32_t)i - 2;
+        int32_t off_hz = k * (half_span_hz / 2);
+        int32_t px = (int32_t)(((int64_t)SPEC_TRACE_W * off_hz) / (int64_t)full_span_hz);
+        uint16_t cx = (uint16_t)((int32_t)(MAIN_W / 2) + px);
+        int64_t freq_i64 = (int64_t)panel_center_hz + (int64_t)off_hz;
+        int64_t khz_i64;
+        char buf[FREQ_FIELD_CHARS + 1];
+        const char *label;
+        uint16_t label_color = (k == 0) ? GFX_COLOR_RED : GFX_COLOR_WHITE;
+        uint16_t tw;
+        int32_t tx;
+        uint8_t s;
+
+        gfx_line(cx, (uint16_t)(SPEC_Y + SPEC_H - 24),
+                  cx, (uint16_t)(SPEC_Y + SPEC_H - 20), GFX_COLOR_DARKGRAY);
+
+        if (freq_i64 < 0) { freq_i64 = 0; } /* see this function's
+                                              * comment - a label-only
+                                              * clamp, not a tuning
+                                              * limit */
+        khz_i64 = freq_i64 / 1000; /* drop the last 3 digits */
+        tune_freq_format((uint32_t)khz_i64, buf);
+        /* Skip the leading space-padding tune_freq_format() adds for
+         * its fixed-width title-bar use - here each label is
+         * individually centered, so the field doesn't need to stay a
+         * constant width the way the live readout does. */
+        for (s = 0; buf[s] == ' ' && s < FREQ_FIELD_CHARS; s++) { }
+        label = &buf[s];
+
+        tw = gfx_text_width(label, SPEC_SCALE_TEXT_SIZE);
+        tx = (int32_t)cx - (int32_t)(tw / 2U);
+        if (tx < 0) { tx = 0; }
+        if (tx > (int32_t)(MAIN_W - tw)) { tx = (int32_t)(MAIN_W - tw); }
+        gfx_text((uint16_t)tx, (uint16_t)(SPEC_Y + SPEC_H - 18), label,
+                  label_color, GFX_COLOR_BLACK, SPEC_SCALE_TEXT_SIZE);
+    }
 }
 
 static void menu_tile_agc_refresh(void)
@@ -3122,6 +3228,8 @@ static void tune_encoder_poll(void)
 
     if (changed) {
         freq_display_draw();
+        spec_span_labels_draw(); /* "esta escala tiene que variar con
+                                   * la frecuencia" - see its comment */
     }
 }
 
@@ -3328,7 +3436,7 @@ static void radio_screen_draw(void)
  * feel (like dragging a map or photo: dragging right reveals what was
  * further left, i.e. LOWER frequency on this panadapter, since
  * frequency increases left-to-right - see spec_span_labels_draw()'s
- * -96K/+96K labels).
+ * tick ruler).
  *
  * QUANTIZED to whole SPEC_DRAG_HZ_STEP jumps (1kHz) rather than
  * applied as continuous fractional Hz - added same day, per the
@@ -3400,6 +3508,8 @@ static void spec_drag_tune_apply(uint16_t x, uint16_t prev_x, float *hz_accum)
         s_tune_hz = (uint32_t)f;
         apply_lo_tune(s_tune_hz);
         freq_display_draw();
+        spec_span_labels_draw(); /* "esta escala tiene que variar con
+                                   * la frecuencia" - see its comment */
     }
 }
 
@@ -4031,9 +4141,77 @@ static void sdr_spectrum_waterfall_tick(void)
      * correcting for something the zoom pipeline already fixed. */
     {
         int16_t center_mark_offset_px = 0;
+        uint8_t band_active = 0U;
+        int16_t band_lo_offset_px = 0;
+        int16_t band_hi_offset_px = 0;
 
         if (s_spec_zoom == SPEC_ZOOM_1X && demod_am_get_if_offset_active()) {
             center_mark_offset_px = (int16_t)((uint32_t)SPEC_TRACE_W * DEMOD_IF_OFFSET_HZ / 192000UL);
+        }
+
+        /*
+         * Demodulated-bandwidth tint (see spectrum_draw()'s comment
+         * in spectrum.h) - added 03/08/2026, per the project owner:
+         * shows which slice of the panadapter the CURRENT audio
+         * bandwidth selection (BW tile - see k_audio_bw_hz above)
+         * actually covers, anchored on the SAME point
+         * center_mark_offset_px already marks (so it moves together
+         * with the low-IF marker, and collapses to the panel center
+         * under ZOOM exactly like that marker does - see its comment
+         * above for why).
+         *
+         * Only meaningful for AM/USB/LSB, which are the only modes
+         * with a caller-selectable audio bandwidth (NFM's channel
+         * filter and WFM's full-Nyquist width are both FIXED - see
+         * the BW badge's "6K3"/"96K", non-interactive, in
+         * aux_row_display_draw()) - band_active stays 0 for those,
+         * same as the project owner asked ("en WFM, NFM no se
+         * muestra").
+         *
+         * full_span_hz: the SAME halving-per-zoom-step span
+         * spec_span_labels_draw() uses for its tick ruler (192000 at
+         * 1X, matching DEMOD_IF_OFFSET_HZ's own scale above) - needed
+         * here too since the tint's WIDTH in pixels must shrink/grow
+         * the same way the ruler's tick spacing (and the marker's
+         * position) does when ZOOM changes what one pixel is worth in
+         * Hz.
+         *
+         * AM is double-sideband: the tint straddles the center point
+         * both ways, +/-bw_hz. USB only demodulates the UPPER
+         * sideband: the tint extends RIGHT (higher frequency) only,
+         * from the center point out to +bw_hz. LSB is the mirror:
+         * LEFT only, -bw_hz to the center point - exactly the "a la
+         * derecha o la izquierda" the project owner asked for.
+         */
+        {
+            demod_mode_t mode = demod_am_get_mode();
+
+            if (mode == DEMOD_MODE_AM || mode == DEMOD_MODE_USB || mode == DEMOD_MODE_LSB) {
+                uint32_t full_span_hz;
+                uint32_t bw_hz = k_audio_bw_hz[(uint8_t)demod_am_get_audio_bw()];
+                int16_t bw_px;
+
+                switch (s_spec_zoom) {
+                case SPEC_ZOOM_2X: full_span_hz = 96000UL; break;
+                case SPEC_ZOOM_4X: full_span_hz = 48000UL; break;
+                case SPEC_ZOOM_8X: full_span_hz = 24000UL; break;
+                case SPEC_ZOOM_1X:
+                default:           full_span_hz = 192000UL; break;
+                }
+                bw_px = (int16_t)((uint32_t)SPEC_TRACE_W * bw_hz / full_span_hz);
+
+                band_active = 1U;
+                if (mode == DEMOD_MODE_USB) {
+                    band_lo_offset_px = center_mark_offset_px;
+                    band_hi_offset_px = (int16_t)(center_mark_offset_px + bw_px);
+                } else if (mode == DEMOD_MODE_LSB) {
+                    band_lo_offset_px = (int16_t)(center_mark_offset_px - bw_px);
+                    band_hi_offset_px = center_mark_offset_px;
+                } else { /* DEMOD_MODE_AM */
+                    band_lo_offset_px = (int16_t)(center_mark_offset_px - bw_px);
+                    band_hi_offset_px = (int16_t)(center_mark_offset_px + bw_px);
+                }
+            }
         }
 
         spectrum_draw(s_db_frame, FFT_BINS_IQ,
@@ -4041,7 +4219,8 @@ static void sdr_spectrum_waterfall_tick(void)
                       SPEC_TRACE_W,
                       (uint16_t)(SPEC_H - 4 - 20 - 2),
                       s_db_min, s_db_max,
-                      center_mark_offset_px);
+                      center_mark_offset_px,
+                      band_active, band_lo_offset_px, band_hi_offset_px);
     }
     t_spec1 = DWT->CYCCNT;
 

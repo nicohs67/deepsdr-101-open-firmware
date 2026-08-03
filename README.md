@@ -11,31 +11,38 @@ DEEPSDR radio features.
 We would welcome any collaboration or assistance with its development. 
 Regards.
 
-# License
+## Disclaimer
 
-GD32F450 QSD SDR Receiver
-Copyright (c) 2026 Esteban
+This firmware is provided **"as is"**, without warranty of any kind,
+express or implied, including but not limited to warranties of
+merchantability, fitness for a particular purpose, and
+non-infringement.
 
-This work is licensed under a Creative Commons
-Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+This is a hobbyist, experimental project. Flashing this firmware onto
+your hardware, and any hardware modifications you make in order to
+use it (wiring, GPIO changes, RF front-end changes, etc.), are done
+**entirely at your own risk**. The author assumes no responsibility
+and accepts no liability for any damage, malfunction, data loss, or
+other harm to your equipment - or to any other equipment, property,
+or person - resulting from downloading, building, flashing, modifying,
+or otherwise using this firmware, whether used as-is or altered by you
+or any third party.
 
-You are free to:
-  - Share   — copy and redistribute the material in any medium or format
-  - Adapt   — remix, transform, and build upon the material
+You are solely responsible for:
+- Verifying that this firmware is suitable for and compatible with
+  your specific hardware before flashing it.
+- Complying with all applicable radio spectrum, transmission, and
+  equipment regulations in your country/region. (This firmware
+  targets a *receiver* - it is not designed or intended to transmit -
+  but it is still your responsibility to ensure your use of it, and
+  of the underlying RF hardware, is fully compliant with local law.)
+- Any consequences of modifying, adapting, or redistributing this
+  firmware, including modifications made by you or by anyone else who
+  obtains it from you.
 
-Under the following terms:
-  - Attribution   — You must give appropriate credit, provide a link to
-    the license, and indicate if changes were made. You may do so in any
-    reasonable manner, but not in any way that suggests the licensor
-    endorses you or your use.
-  - NonCommercial — You may not use the material for commercial purposes.
-
-No additional restrictions — You may not apply legal terms or
-technological measures that legally restrict others from doing
-anything the license permits.
-
-Full legal code:      https://creativecommons.org/licenses/by-nc/4.0/legalcode
-Human-readable deed:  https://creativecommons.org/licenses/by-nc/4.0/
+No support, maintenance, or fitness for any particular use case is
+guaranteed. Use of this project constitutes acceptance of this
+disclaimer.
 
 # GD32F450 QSD SDR Receiver
 

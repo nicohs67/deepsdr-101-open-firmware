@@ -11,6 +11,32 @@ DEEPSDR radio features.
 We would welcome any collaboration or assistance with its development. 
 Regards.
 
+# License
+
+GD32F450 QSD SDR Receiver
+Copyright (c) 2026 Jorge
+
+This work is licensed under a Creative Commons
+Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+You are free to:
+  - Share   — copy and redistribute the material in any medium or format
+  - Adapt   — remix, transform, and build upon the material
+
+Under the following terms:
+  - Attribution   — You must give appropriate credit, provide a link to
+    the license, and indicate if changes were made. You may do so in any
+    reasonable manner, but not in any way that suggests the licensor
+    endorses you or your use.
+  - NonCommercial — You may not use the material for commercial purposes.
+
+No additional restrictions — You may not apply legal terms or
+technological measures that legally restrict others from doing
+anything the license permits.
+
+Full legal code:      https://creativecommons.org/licenses/by-nc/4.0/legalcode
+Human-readable deed:  https://creativecommons.org/licenses/by-nc/4.0/
+
 # GD32F450 QSD SDR Receiver
 
 Bare-metal firmware for a custom GD32F450VET6-based SDR receiver

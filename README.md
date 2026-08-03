@@ -46,6 +46,8 @@ disclaimer.
 
 # GD32F450 QSD SDR Receiver
 
+![Texto alternativo](deepsdr_1.jpg) 
+
 Bare-metal firmware for a custom GD32F450VET6-based SDR receiver
 board: an 800x480 RM68120 TFT display, resistive touch, and a
 TLV320AIC3204 audio codec used as the I/Q ADC/DAC front-end for a QSD

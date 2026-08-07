@@ -2,6 +2,7 @@
 #define GD32_I2S_H
 
 #include <stdint.h>
+#include "aic3204.h" /* aic3204_rate_t, for gd32_i2s_init_slave(rate) */
 
 /*
  * I2S1 (SPI1) peripheral configuration for the GD32F450, SLAVE mode,
@@ -43,7 +44,31 @@
  *                                     AF5 on this pin is SPI1_MISO, a
  *                                     different peripheral entirely)
  */
+/*
+ * NOTE (04/08/2026): despite the name, this now brings up the I2S
+ * peripheral for 48kHz, not 192kHz - see gd32_i2s.c's own comment on
+ * why the function itself needs almost no change for the Fs move (the
+ * GD32 is the I2S SLAVE; the codec's own divider chain, in aic3204.c,
+ * is what actually sets Fs). Left un-renamed today to keep this
+ * change's diff contained to what actually needed to move, not
+ * because the name is still accurate - a rename is a reasonable
+ * follow-up, just a separate one.
+ */
 void gd32_i2s_init_slave_192k(void);
+
+/*
+ * *** 05/08/2026, added for the "full reinit instead of live resync"
+ * rewrite *** - generalized version of gd32_i2s_init_slave_192k()
+ * above (which is now a thin AIC3204_RATE_96K wrapper around this, for
+ * the one cold-boot call site in main.c). Does the FULL teardown/
+ * rebuild every time: spi_i2s_deinit(SPI1), a full PLLI2S off/
+ * reconfigure/on/wait-for-lock, i2s_init()/i2s_full_duplex_mode_
+ * config(), and GPIO AF replay - not just re-enabling what was already
+ * there. See gd32_i2s.c's own comment on this function for why: this
+ * is the only sequence real hardware testing has ever found to run
+ * FERR-free after a rate change, cold boot or live.
+ */
+void gd32_i2s_init_slave(aic3204_rate_t rate);
 
 /*
  * Diagnostic utility: toggles the five I2S pins as plain GPIO (no I2S
@@ -83,19 +108,62 @@ void gd32_i2s_dma_start_silence(void);
 void gd32_i2s_dma_start_test_tone(void);
 
 /*
- * Re-arms DMA0/CH4 as a circular 2-half ping-pong TX stream (2 x 512
- * stereo frames, starts silent), replacing the silence/test-tone
- * feed. This is the DAC-side transport for demodulated audio. Call
- * after the codec is fully configured (phase 2).
+ * Re-arms DMA0/CH4 as a circular 2-half ping-pong TX stream (2 x
+ * SDR_RX_BLOCK_SAMPLES stereo frames, starts silent - was a literal
+ * "512" here and in gd32_i2s.c until 04/08/2026, when that hand-
+ * copied number silently went stale after the 48kHz move and caused
+ * a real out-of-bounds read bug - see STREAM_FRAMES_PER_HALF's
+ * comment in gd32_i2s.c for the full story), replacing the silence/
+ * test-tone feed. This is the DAC-side transport for demodulated
+ * audio. Call after the codec is fully configured (phase 2).
  */
 void gd32_i2s_dma_start_stream(void);
 
 /*
- * Copies one half's worth of stereo frames (512 frames = 1024 int16,
- * L/R interleaved) into whichever stream half is NOT currently being
- * played, derived from the live DMA position. Intended to be called
- * once per RX block from the RX DMA interrupt (see demod_am.c).
+ * Cleanly stops the TX stream DMA channel - call BEFORE tearing down
+ * the I2S peripherals for a rate change (see main.c's apply_demod_
+ * mode()).
+ */
+void gd32_i2s_stream_stop(void);
+
+/*
+ * *** 05/08/2026, added for the "full reinit instead of live resync"
+ * rewrite - see gd32_i2s.c's own comment *** - arms the TX stream at
+ * `frames_per_half` stereo frames (MUST be SDR_RX_BLOCK_SAMPLES or
+ * SDR_RX_BLOCK_SAMPLES_WFM, sdr_rx.h - the two sides must always
+ * agree, since RX and TX share the same codec-driven BCLK/WS at the
+ * same rate). Call ONLY after gd32_i2s_init_slave(rate) has already
+ * done a full teardown/rebuild of I2S1_ADD for that same rate -
+ * supersedes the old gd32_i2s_stream_reconfigure()+gd32_i2s_stream_
+ * start() pair, which used to separately resync I2S1_ADD; that's now
+ * gd32_i2s_init_slave(rate)'s job, done once, the same way for cold
+ * boot and every live switch.
+ */
+void gd32_i2s_stream_arm(uint32_t frames_per_half);
+
+/*
+ * Copies one half's worth of stereo frames (SDR_RX_BLOCK_SAMPLES
+ * frames = SDR_RX_BLOCK_SAMPLES*2 int16, L/R interleaved - see
+ * gd32_i2s_dma_start_stream()'s comment for why this is phrased in
+ * terms of that constant now, not a literal count) into whichever
+ * stream half is NOT currently being played, derived from the live
+ * DMA position. Intended to be called once per RX block from the RX
+ * DMA interrupt (see demod_am.c). The caller's buffer MUST be at
+ * least that many stereo frames long - demod_am.c's s_audio_out[] is
+ * sized exactly to match (SDR_RX_BLOCK_SAMPLES*2 int16), which is the
+ * invariant that broke on 04/08/2026 (see above) when this file's own
+ * copy of the frame count didn't move with it. As of 05/08/2026, WFM's
+ * own demod_wfm_process_raw() calls this too, passing its own
+ * SDR_RX_BLOCK_SAMPLES_WFM-sized s_wfm_audio_out - safe either way
+ * since gd32_i2s_stream_reconfigure() above keeps this function's own
+ * idea of "one half" in sync with whichever rate is actually active.
  */
 void gd32_i2s_stream_write_half(const int16_t *stereo_frames);
+
+/* TX-side FERR diagnostics (see gd32_i2s.c's own comments) - was
+ * missing from this header (implicit-declaration warning fixed
+ * 05/08/2026 alongside the R27/R30 clock-start reordering). */
+uint32_t gd32_i2s_get_tx_ferr_count(void);
+void gd32_i2s_reset_tx_ferr_count(void);
 
 #endif /* GD32_I2S_H */

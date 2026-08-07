@@ -74,10 +74,13 @@ void aic3204_scan_bus(void);
  * own PLL is enabled, clocked from BCLK (not a separate MCLK signal).
  * Confirmed by exact arithmetic against oscilloscope measurements:
  * BCLK=6.144MHz, PLL J=14/D=0 -> PLL_CLK=86.016MHz=CODEC_CLKIN, which
- * both the ADC (NADC=1/MADC=7/AOSR=64) and DAC (NDAC=2/MDAC=7/DOSR=32)
- * divider chains reduce to exactly Fs=192kHz. See gd32_i2s.c - no
- * MCLK pin is configured at all now, since the codec doesn't need one
- * for this design.
+ * both the ADC (NADC=1/MADC=28/AOSR=64) and DAC (NDAC=2/MDAC=7/DOSR=128)
+ * divider chains reduce to exactly Fs=48kHz (was MADC=7/DOSR=32 ->
+ * 192kHz before 04/08/2026 - see aic3204_phase2_init()'s header
+ * comment for the full story, including the DAC processing-block
+ * change that had to come with it). See gd32_i2s.c - no MCLK pin is
+ * configured at all now, since the codec doesn't need one for this
+ * design.
  *
  * Call this after aic3204_probe_and_reset() AND after the I2S side is
  * already generating a real clock towards the codec
@@ -85,6 +88,56 @@ void aic3204_scan_bus(void);
  * clock registers that depend on BCLK/WCLK already running.
  */
 void aic3204_phase2_init(void);
+
+/*
+ * Which sample rate the codec's ADC/DAC divider chains are currently
+ * configured for - see aic3204_set_rate()'s comment in aic3204.c for
+ * exactly which registers each value touches.
+ */
+typedef enum {
+    AIC3204_RATE_96K = 0,  /* AM/USB/LSB/NFM - the default after aic3204_phase2_init() */
+    AIC3204_RATE_192K      /* WFM */
+} aic3204_rate_t;
+
+/*
+ * Live rate switch, split into SEVERAL calls - see main.c's
+ * apply_demod_mode() for where this whole sequence is actually
+ * enforced:
+ *
+ *   1. sdr_rx_stop() + gd32_i2s_stream_stop()
+ *   2. aic3204_rate_switch_reset() - genuine hardware nRESET pulse,
+ *      codec falls fully silent (no BCLK/WCLK at all).
+ *   3. gd32_i2s_init_slave(rate) (gd32_i2s.h) - *** 05/08/2026, "full
+ *      reinit instead of live resync" rewrite *** - a FULL teardown/
+ *      rebuild of SPI1/I2S1_ADD for the new rate (spi_i2s_deinit(),
+ *      PLLI2S reconfigure, i2s_init(), GPIO AF replay), the same
+ *      sequence cold boot always used - not just a disable/re-enable
+ *      of what was already configured. Also re-arms DMA0/CH4 with
+ *      silence. See gd32_i2s.c's own comment for why this replaced the
+ *      earlier partial-resync approach.
+ *   4. aic3204_configure_rate(rate) - reprograms the PLL and the
+ *      NDAC/MDAC/DOSR/NADC/MADC/AOSR divider chains, plus everything
+ *      else aic3204_phase2_init() originally set (analog routing,
+ *      biquad/DRC coefficient banks) - but does NOT touch R27/R30, so
+ *      BCLK/WCLK stay silent even though the clock tree behind them is
+ *      now fully configured for the new rate. ADC/DAC left powered
+ *      DOWN.
+ *   5. sdr_rx_bringup(block_samples) + gd32_i2s_stream_arm(block_samples)
+ *      (sdr_rx.h/gd32_i2s.h) - arms BOTH DMA channels at the new block
+ *      size. SPI1/I2S1_ADD are already freshly enabled from step 3, so
+ *      no separate resync is needed here anymore.
+ *   6. aic3204_start_bclk_wclk(rate) - NOW, and only now, BCLK/WCLK go
+ *      live (R30 then R27) - the GD32 side is already listening at
+ *      this point, so this is the first real edge it sees.
+ *   7. aic3204_set_rate_power_up() - ADC/DAC start producing real
+ *      samples at the new rate, straight into an already-armed DMA
+ *      path.
+ */
+void aic3204_rate_switch_reset(void);
+void aic3204_configure_rate(aic3204_rate_t rate);
+void aic3204_start_bclk_wclk(aic3204_rate_t rate);
+void aic3204_set_rate_power_up(void);
+
 
 /*
  * Sets the DAC digital output volume, both L/R channels identically.

@@ -17,6 +17,12 @@ MCUFLAGS = $(CPU) -mthumb $(FPU) $(FLOAT)
 
 # --- Defines ---
 DEFS = -DGD32F450 -DUSE_STDPERIPH_DRIVER -DHXTAL_VALUE=12288000U
+# Master switch for all debug_print*() UART logging (238 call sites,
+# see User/debug_uart.h) - off by default. For a bring-up/debug
+# session, build with `make DEBUG_UART_ENABLED=1` (no source edits
+# needed).
+DEBUG_UART_ENABLED ?= 0
+DEFS += -DDEBUG_UART_ENABLED=$(DEBUG_UART_ENABLED)
 # ARM_MATH_DSP: the GD32F450 (Cortex-M4F) really does have the DSP
 # extension, so let CMSIS-DSP call the real __QADD8/__SSAT/... it
 # needs instead of pulling in its dsp/none.h software-emulation

@@ -112,6 +112,8 @@ static float    s_col_peak[SPEC_MAX_W];  /* peak-hold dB per column     */
 static uint16_t s_bar_h[SPEC_MAX_W];     /* bar height, px from bottom  */
 static uint16_t s_bar_h_smooth[SPEC_MAX_W]; /* scratch buf for spatial smoothing */
 static uint16_t s_peak_h[SPEC_MAX_W];    /* peak marker height          */
+static uint16_t s_bar_lo[SPEC_MAX_W];    /* OUTLINE only: vertical trace bridge, low end  */
+static uint16_t s_bar_hi[SPEC_MAX_W];    /* OUTLINE only: vertical trace bridge, high end */
 static uint16_t s_row_color[SPEC_MAX_H]; /* gradient fill color per row */
 static uint8_t  s_row_grid[SPEC_MAX_H];  /* 1 = gridline on this row    */
 static uint16_t s_row_buf[SPEC_MAX_W];   /* stripe assembled in RAM     */
@@ -283,6 +285,37 @@ void spectrum_draw(const float *db, uint32_t n_bins,
     }
 
     /*
+     * Pass 1.6 (per column, integer - only ~w iterations, OUTLINE
+     * only): the single bright trace pixel per column only lands on
+     * ONE row (bh == level_from_bottom). Where a signal edge is
+     * steep, adjacent columns' bar heights can differ by more than
+     * 1px, so their trace pixels don't share a row and the contour
+     * reads as scattered dots instead of a line. HEATMAP/LINE don't
+     * have this problem - their fill occupies the vertical gap
+     * between differing column heights, so the top edge still reads
+     * as continuous even though the bright trace pixel itself is
+     * exactly as sparse. OUTLINE has no fill to hide the gap, so it
+     * needs an explicit vertical bridge: for each column, connect its
+     * height to its LEFT neighbor's with trace color, drawn in the
+     * current column's pixel stripe (a stepped/staircase join, same
+     * idea as a polyline plot). col 0 has no left neighbor, so its
+     * bridge collapses to the single dot as before.
+     */
+    if (s_style == SPECTRUM_STYLE_OUTLINE) {
+        for (col = 0; col < w; col++) {
+            uint16_t left = (col == 0U) ? s_bar_h[col] : s_bar_h[col - 1U];
+            uint16_t cur  = s_bar_h[col];
+            if (left < cur) {
+                s_bar_lo[col] = left;
+                s_bar_hi[col] = cur;
+            } else {
+                s_bar_lo[col] = cur;
+                s_bar_hi[col] = left;
+            }
+        }
+    }
+
+    /*
      * Pass 2 (per row, float - only ~h iterations): the vertical
      * gradient color of each row (HEATMAP), or a single flat fill
      * color for every row (LINE - see spectrum_set_style()'s comment
@@ -291,12 +324,15 @@ void spectrum_draw(const float *db, uint32_t n_bins,
      * bottom.
      */
     for (row = 0; row < h; row++) {
-        if (s_style == SPECTRUM_STYLE_LINE) {
-            s_row_color[row] = SPEC_LINE_FILL;
-        } else {
+        if (s_style == SPECTRUM_STYLE_HEATMAP) {
             uint32_t level = (uint32_t)(h - row);
             int32_t idx = (int32_t)((level * 255U) / h);
             s_row_color[row] = s_lut[idx];
+        } else {
+            /* LINE reads this as its flat fill color. OUTLINE never
+             * reads it (fill_enabled below is 0 for that style) - left
+             * assigned anyway so the two styles share this branch. */
+            s_row_color[row] = SPEC_LINE_FILL;
         }
         s_row_grid[row] = 0;
     }
@@ -324,10 +360,19 @@ void spectrum_draw(const float *db, uint32_t n_bins,
      * the base heat-vs-line aesthetic).
      */
     {
-        uint16_t bg_color    = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_BG    : GFX_COLOR_BLACK;
-        uint16_t grid_color  = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_GRID  : SPEC_COLOR_GRID;
-        uint16_t trace_color = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_TRACE : SPEC_COLOR_TRACE;
-        uint16_t band_color  = (s_style == SPECTRUM_STYLE_LINE) ? SPEC_LINE_BAND_TINT : SPEC_COLOR_BAND_TINT;
+        /* HEATMAP and LINE fill the bar interior; OUTLINE shares
+         * LINE's dark-navy palette but leaves fill_enabled clear -
+         * see the loop below, where bh > level_from_bottom then just
+         * falls through to peak/center/band/background instead of
+         * being painted solid. That's the whole "no fill, only the
+         * contour" difference; everything else about OUTLINE (trace
+         * color, background, gridlines, band tint) is identical to
+         * LINE. */
+        uint8_t  fill_enabled = (s_style == SPECTRUM_STYLE_OUTLINE) ? 0U : 1U;
+        uint16_t bg_color    = (s_style == SPECTRUM_STYLE_HEATMAP) ? GFX_COLOR_BLACK : SPEC_LINE_BG;
+        uint16_t grid_color  = (s_style == SPECTRUM_STYLE_HEATMAP) ? SPEC_COLOR_GRID : SPEC_LINE_GRID;
+        uint16_t trace_color = (s_style == SPECTRUM_STYLE_HEATMAP) ? SPEC_COLOR_TRACE : SPEC_LINE_TRACE;
+        uint16_t band_color  = (s_style == SPECTRUM_STYLE_HEATMAP) ? SPEC_COLOR_BAND_TINT : SPEC_LINE_BAND_TINT;
 
         for (row = 0; row < h; row++) {
             uint16_t level_from_bottom = (uint16_t)(h - row);
@@ -337,11 +382,25 @@ void spectrum_draw(const float *db, uint32_t n_bins,
             for (col = 0; col < w; col++) {
                 uint16_t bh = s_bar_h[col];
                 uint16_t px;
+                uint8_t  is_trace;
 
-                if (bh == level_from_bottom) {
+                /* OUTLINE: lit if this row falls anywhere in the
+                 * bridge to the left neighbor (see Pass 1.6) - not
+                 * just the exact bh row - so the contour has no gaps
+                 * on steep edges. HEATMAP/LINE: unchanged, exact-row
+                 * dot (the fill below it is what makes it read as
+                 * continuous). */
+                if (fill_enabled) {
+                    is_trace = (bh == level_from_bottom) ? 1U : 0U;
+                } else {
+                    is_trace = (level_from_bottom >= s_bar_lo[col] &&
+                                level_from_bottom <= s_bar_hi[col]) ? 1U : 0U;
+                }
+
+                if (is_trace) {
                     px = trace_color;                /* bar top: bright trace */
-                } else if (bh > level_from_bottom) {
-                    px = fill;                        /* inside the bar */
+                } else if (fill_enabled && bh > level_from_bottom) {
+                    px = fill;                        /* inside the bar (HEATMAP/LINE only) */
 #if SPECTRUM_PEAK_HOLD
                 } else if (s_peak_h[col] == level_from_bottom) {
                     px = SPEC_COLOR_PEAK;             /* floating peak dot */

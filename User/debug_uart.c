@@ -1,5 +1,10 @@
 #include "debug_uart.h"
 
+#if DEBUG_UART_ENABLED
+/* Whole file compiles to nothing when DEBUG_UART_ENABLED is 0 - see
+ * debug_uart.h's comment. Keeps PA9/USART0 untouched (no GPIO AF
+ * config, no clock enable) rather than just skipping the prints. */
+
 void debug_uart_init(void)
 {
     rcu_periph_clock_enable(RCU_GPIOA);
@@ -85,3 +90,5 @@ void debug_print_dec(const char *label, uint32_t val)
     debug_print(&buf[i]);
     debug_print("\n");
 }
+
+#endif /* DEBUG_UART_ENABLED */

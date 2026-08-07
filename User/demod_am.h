@@ -251,22 +251,37 @@ typedef enum {
  *
  * WHY NO DOWN-MIX AND NO CHANNEL FILTER (per the project owner's
  * request): AM/USB/LSB are narrowband, so it's worth spending the
- * complex baseband's full +/-96kHz just to reach one station, and the
- * CHF_COEFFS channel filter (-3dB ~4kHz) is what makes that possible.
- * A broadcast FM channel is ~200kHz wide with up to +/-75kHz peak
- * deviation - CHF_COEFFS would butcher it beyond recognition, and the
- * DEMOD_IF_OFFSET_HZ (48kHz) low-IF down-mix would shove a good chunk
- * of that 200kHz channel outside the +/-96kHz Nyquist window instead
- * of centering it. So WFM skips BOTH steps entirely (see the mode
- * check around 0b/0c in demod_am_process_raw()) and runs the
- * discriminator directly on the raw, full-bandwidth deinterleaved I/Q
- * - this only works because the station is tuned dead-center (LO
- * exactly on frequency, no offset). main.c's tune_encoder_poll() and
+ * complex baseband's full +/-24kHz (was +/-96kHz @ 192kHz before
+ * 04/08/2026 - see sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment) just to
+ * reach one station, and the CHF_COEFFS channel filter (-3dB ~4kHz)
+ * is what makes that possible. A broadcast FM channel is ~200kHz wide
+ * with up to +/-75kHz peak deviation - CHF_COEFFS would butcher it
+ * beyond recognition, and the DEMOD_IF_OFFSET_HZ (12kHz, was 48kHz)
+ * low-IF down-mix would shove a good chunk of that 200kHz channel
+ * outside the Nyquist window instead of centering it. So WFM skips
+ * BOTH steps entirely (see the mode check around 0b/0c in
+ * demod_am_process_raw()) and runs the discriminator directly on the
+ * raw, full-bandwidth deinterleaved I/Q - this only works because the
+ * station is tuned dead-center (LO exactly on frequency, no offset).
+ *
+ * *** 04/08/2026: this whole approach is now fundamentally
+ * insufficient for WFM, not just imperfect *** - a +/-24kHz Nyquist
+ * window (down from +/-96kHz) genuinely cannot contain a ~200kHz-wide
+ * broadcast FM channel AT ALL, centered or not; this isn't a filter
+ * or offset tuning problem anymore, it's a hard physical bandwidth
+ * limit. WFM stays wired up and selectable (per the project owner:
+ * accept the degradation for now rather than block today's 48kHz work
+ * on it, or hide the mode), but expect it to sound badly aliased/
+ * distorted, not just "a bit narrow", until a future dual-rate design
+ * gives WFM its own wider-bandwidth capture again (see this project's
+ * 48kHz migration notes for that deferred plan).
+ *
+ * main.c's tune_encoder_poll() and
  * the MODE button handler both need to know this: whenever the mode
  * is WFM, they must program the LO at the plain selected frequency
  * (not freq - DEMOD_IF_OFFSET_HZ) and call
  * demod_am_set_if_offset_active(0) - getting that out of sync would
- * center the discriminator on empty spectrum 48kHz off the actual
+ * center the discriminator on empty spectrum 12kHz off the actual
  * station. This board's tuning range (4.8-180MHz, see main.c's
  * TUNE_MIN_HZ/MAX_HZ) already covers the 88-108MHz broadcast band -
  * in fact the byte-exact captured boot tune (MS5351_CAPTURED_LO_HZ,
@@ -539,14 +554,26 @@ uint32_t demod_am_get_last_cycles(void);
  *             / SSB decimated Hilbert chain) - the one most likely to
  *             explain a USB/LSB-specific change.
  *   audio:    steps 2-3 (DC blocker, audio LPF or WFM de-emphasis+LPF)
+ *   nr:       Spectral Subtraction NR cost - added 03/08/2026, revised
+ *             04/08/2026 when SSB's path changed (see demod_am.c's NR
+ *             INTEGRATION comment): for AM it's step 3b's dedicated
+ *             decimate/nr_ss_process/interpolate; for USB/LSB it's
+ *             step 2d's cost instead, running NR inline on the SSB
+ *             chain's own already-12kHz buffer (cheaper - no separate
+ *             decimate/interpolate pair). Always 0 for WFM/NFM (the
+ *             stage is skipped entirely for those modes, not just
+ *             cheap) or whenever NR is switched off. THE number to
+ *             watch when checking whether this fits the ISR's
+ *             real-time budget - see nr_ss.c's header comment.
  *   agc_out:  steps 4-5 (AGC, clamp, I2S write)
- * Sum of the four should land close to demod_am_get_last_cycles()'s
+ * Sum of the five should land close to demod_am_get_last_cycles()'s
  * total (a few cycles off is normal - the reads themselves aren't
  * free). Safe to poll from the main loop, same as the total. */
 typedef struct {
     uint32_t frontend;
     uint32_t extract;
     uint32_t audio;
+    uint32_t nr;
     uint32_t agc_out;
 } demod_am_cycles_breakdown_t;
 
@@ -559,11 +586,13 @@ float demod_am_get_signal_peak(void);
 
 /* LO offset for low-IF tuning: actual LO = selected_freq -
  * DEMOD_IF_OFFSET_HZ (see the LOW-IF TUNING note above). Currently
- * Fs/4 (192000/4 = 48000) to match demod_am.c's zero-multiply
- * sign-flip rotation - if this ever changes, the rotation algorithm
- * in demod_am.c has to change with it (it is NOT a generic NCO, it
- * only works at exactly Fs/4). */
-#define DEMOD_IF_OFFSET_HZ 48000UL
+ * Fs/4 (96000/4 = 24000 - was 48000/4 = 12000 before AM/SSB/NFM moved
+ * from 48kHz to 96kHz, and 192000/4 = 48000 before that - see
+ * sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment) to match demod_am.c's
+ * zero-multiply sign-flip rotation - if this ever changes, the
+ * rotation algorithm in demod_am.c has to change with it (it is NOT a
+ * generic NCO, it only works at exactly Fs/4). */
+#define DEMOD_IF_OFFSET_HZ 24000UL
 
 /* Speaker enable pin: PB7, driven high to unmute the speaker amp. */
 
@@ -594,5 +623,41 @@ uint8_t demod_am_get_if_offset_active(void);
  * I2S TX stream (gd32_i2s_stream_write_half()). Intended as the
  * sdr_rx block hook - runs in DMA interrupt context. */
 void demod_am_process_raw(const int16_t *raw_interleaved);
+
+/*
+ * WFM's OWN, separate sdr_rx block hook (05/08/2026 - see its own
+ * header comment in demod_am.c) - SDR_RX_BLOCK_SAMPLES_WFM (512)
+ * interleaved L/R (I/Q) frames, at WFM's native 192kHz rate, entirely
+ * independent of demod_am_process_raw()'s 128-sample/48kHz state.
+ * main.c registers THIS (via sdr_rx_set_block_hook()) instead of
+ * demod_am_process_raw() while switching INTO WFM, and switches back
+ * on the way out - see the mode-switch sequence there. Also runs in
+ * DMA interrupt context, same as demod_am_process_raw().
+ */
+void demod_wfm_process_raw(const int16_t *raw_interleaved);
+
+/* Diagnostic-only: resets the call counter that gates
+ * demod_wfm_process_raw()'s per-block debug logging - call this
+ * right when switching INTO WFM (see main.c's apply_demod_mode()) so
+ * each WFM entry gets its own fresh set of logged calls, the same way
+ * gd32_i2s.c's write_half() diagnostic already does for its own
+ * counter. As of 05/08/2026 this ALSO (re-)arms the settle-mute
+ * window (WFM_SETTLE_MUTE_BLOCKS in demod_am.c) - both need to reset
+ * together on every WFM entry, so they share this one call rather
+ * than main.c needing to know about two separate counters. */
+void demod_wfm_reset_diag(void);
+
+/* Diagnostic-only: resets the call counter that gates
+ * demod_am_process_raw()'s per-block debug logging - call this right
+ * when switching OUT of WFM (into AM/USB/LSB/NFM), mirroring
+ * demod_wfm_reset_diag()'s own call on the way in. See
+ * am_should_log_diag()'s comment in demod_am.c for why this was
+ * added. */
+void demod_am_reset_diag(void);
+
+/* WFM's own ISR cycle counter, mirrors demod_am_get_last_cycles() -
+ * was missing from this header (implicit-declaration warning fixed
+ * 05/08/2026 alongside the R27/R30 clock-start reordering). */
+uint32_t demod_wfm_get_last_cycles(void);
 
 #endif /* DEMOD_AM_H */

@@ -191,11 +191,60 @@ void aic3204_scan_bus(void)
  * clocked from BCLK (not from a separate MCLK signal). Confirmed by
  * exact arithmetic against oscilloscope measurements: BCLK=6.144MHz,
  * PLL J=14 (D=0) -> PLL_CLK = 6.144MHz x 14 = 86.016MHz = CODEC_CLKIN.
- * Both divider chains reduce this to exactly Fs=192kHz:
- *   ADC: NADC(1) x MADC(7) x AOSR(64)  = 448 -> 86.016MHz/448 = 192kHz
- *   DAC: NDAC(2) x MDAC(7) x DOSR(32)  = 448 -> 86.016MHz/448 = 192kHz
  * This is why gd32_i2s.c no longer configures an MCLK pin at all - the
  * codec doesn't need one for this design.
+ *
+ * *** 04/08/2026: Fs 192kHz -> 48kHz *** (per the project owner, to
+ * fit the SSB/NR audio ISR back inside its real-time budget - see
+ * nr_ss.c's header comment). BCLK/MCLK/PLL above are ALL UNCHANGED -
+ * the GD32 is the I2S SLAVE here (see gd32_i2s.h), so WCLK simply
+ * BECOMES whatever Fs the codec's own divider chain below produces;
+ * nothing about how BCLK itself is generated needed to move. Only the
+ * divider chain downstream of the (unchanged) 86.016MHz CODEC_CLKIN
+ * changed, and by design as little of it as possible:
+ *
+ *   ADC: NADC(1) x MADC(28) x AOSR(64) = 1792 -> 86.016MHz/1792 = 48kHz
+ *        (was NADC(1) x MADC(7) x AOSR(64) = 448 -> 192kHz - only
+ *        MADC changed, x4, matching the x4 Fs drop. AOSR=64 stays
+ *        valid: PRB_R1 - the ADC processing block already selected,
+ *        unchanged below - supports AOSR 128 or 64 per the TLV320AIC3204
+ *        datasheet's Table 2-10 (ADC decimation Filter A), confirmed
+ *        against TI's own app-note guidance, not assumed.)
+ *
+ *   DAC: NDAC(2) x MDAC(7) x DOSR(128) = 1792 -> 86.016MHz/1792 = 48kHz
+ *        (was NDAC(2) x MDAC(7) x DOSR(32) = 448 -> 192kHz - NDAC/MDAC
+ *        UNCHANGED, only DOSR changed, x4. This ALSO required changing
+ *        the DAC processing block itself, from PRB_P17 to PRB_P1: the
+ *        old PRB_P17 is DAC "Filter Type C", which TI's own
+ *        documentation says is specifically for 192ksps operation
+ *        with DOSR=32 - not valid at 48kHz. PRB_P1 is "Filter Type A",
+ *        for which TI's guidance is DOSR=(48000/target_fs)*128, which
+ *        at target_fs=48000 works out to exactly DOSR=128 - the value
+ *        used here. *** PRB_P1 SPECIFICALLY (as opposed to another
+ *        Filter-A block, e.g. PRB_P2-P6) is the one part of this
+ *        change NOT taken from a real capture or a fully unambiguous
+ *        datasheet table read - it's this port's best-supported
+ *        inference (PRB_P17's role here is bare pass-through, no
+ *        on-chip biquads/AGC/etc - all filtering is done on the GD32
+ *        side - and PRB_P1 is Filter A's equivalent "no extra
+ *        processing" block). TI's own docs warn that a PRB/AOSR-DOSR
+ *        mismatch shows up as "noisy, gain reduced" audio - worth a
+ *        careful listen on first boot specifically for that failure
+ *        mode before trusting this value long-term.)
+ *
+ *   BCLK: R30 (page0, reg 0x1E) - "BCLK N Divider" - MISSED entirely in
+ *        the first pass of this migration, found by the project owner
+ *        via a real oscilloscope measurement: BCLK read 6.144MHz (the
+ *        OLD 192kHz-correct value, 192000*32) instead of the expected
+ *        1.536MHz (48000*32 for 16-bit stereo), even though WCLK
+ *        correctly read 48kHz. This divider runs off DAC_CLK
+ *        (=CODEC_CLKIN/NDAC=86.016MHz/2=43.008MHz, confirmed by
+ *        reverse-fitting the OLD captured N=7 against the OLD measured
+ *        6.144MHz: 43.008MHz/7=6.144MHz exactly) - a path independent
+ *        of the NADC/MADC/AOSR and NDAC/MDAC/DOSR dividers above, so
+ *        changing those never touched this one. Fixed the same way as
+ *        MADC: N=7 -> N=28 (same x4 as everywhere else), giving
+ *        43.008MHz/28=1.536MHz=32*48kHz exactly.
  *
  * The ADC input routing (P1_R52/54/55/57) and ADC power-up (R81/R82)
  * already matched this capture exactly even before this rewrite - so
@@ -214,13 +263,83 @@ static void wr(uint8_t page, uint8_t reg, uint8_t value, const char *what)
     }
 }
 
-void aic3204_phase2_init(void)
+/*
+ * *** 05/08/2026, split out from aic3204_run_full_sequence() below ***
+ * - see aic3204_configure_rate()'s comment for why this needed to
+ * become its own callable step: even with a genuine hardware nRESET
+ * pulse (this exact function) wrapped in the exact same full register
+ * sequence as cold boot, real hardware logs showed a live rate switch
+ * still produces continuous SPI_STAT_FERR (hundreds per check window)
+ * while cold boot with the identical codec-side sequence measures
+ * ZERO - meaning the codec itself now reaches an identical state
+ * either way, and whatever's still different has to be on the GD32
+ * side. The leading remaining theory: at cold boot, gd32_i2s_init_
+ * slave_192k() enables the GD32's I2S peripherals BEFORE the codec
+ * ever outputs real BCLK/WS (those don't exist until aic3204_phase2_
+ * init()'s PLL/divider writes land) - the GD32 slave is listening from
+ * the very first real clock edge. On a live switch, the OLD order was
+ * backwards: the codec's full reconfigure (BCLK/WS resuming partway
+ * through it, well before the sequence returns) happened BEFORE
+ * sdr_rx_start()/gd32_i2s_stream_start()'s disable/re-enable of the
+ * GD32 side - so the GD32 peripheral re-enables into an ALREADY-
+ * RUNNING clock at an arbitrary phase, not from a clean first edge.
+ * main.c's apply_demod_mode() now calls this reset (codec falls
+ * silent - no BCLK/WS) FIRST, then re-enables/arms the GD32 side
+ * WHILE the codec is still silent, and only THEN calls aic3204_
+ * configure_rate() below to bring BCLK/WS back - reproducing the cold
+ * boot ordering for every live switch too.
+ */
+void aic3204_rate_switch_reset(void)
 {
-    debug_print("\naic3204: phase 2 - full sequence ported from a real I2C capture\n");
+    aic3204_hw_reset();
+}
 
-    /* --- Software reset (page 0) --- */
-    wr(0, 0x00, 0x00, "select page 0");
-    wr(0, 0x01, 0x01, "software reset");
+/*
+ * *** 05/08/2026, refactored for the WFM FERR investigation *** -
+ * this used to be aic3204_phase2_init() alone, called ONCE at cold
+ * boot, hardcoded to whatever the default rate was at the time (48kHz
+ * then, 96kHz now). Live rate switches (aic3204_set_rate_
+ * registers()) used a much smaller, separate register set that only
+ * touched the divider chain (MADC/DOSR/PRB/BCLK-N) and power-cycled
+ * ADC/DAC - it never re-ran the software reset (R1=0x01) or anything
+ * upstream of the dividers (PLL config, page 1 analog bias/routing,
+ * MIC_PGA, the DRC/biquad coefficient banks). Real hardware logs
+ * showed a from-cold WFM boot (this same 192kHz register set, but via
+ * a full reset) runs with ZERO SPI_STAT_FERR for as long as no rate
+ * switch happens - the moment a LIVE switch occurs (in either
+ * direction), FERR starts firing continuously and, critically, NEVER
+ * clears again even switching back to a mode that was clean moments
+ * before, on either RX or TX (they always match exactly, since they
+ * share WS/CK). That rules out the PCB/signal-integrity theory
+ * entirely (same wiring, same rate, works perfectly from cold) and
+ * points at some persistent internal state the small register subset
+ * doesn't reset.
+ *
+ * *** Second finding, same investigation ***: even adding a genuine
+ * hardware nRESET pulse (aic3204_rate_switch_reset() above) - the
+ * exact same reset cold boot uses - to a live switch did NOT clear
+ * FERR either. That rules the codec itself back OUT again: it reaches
+ * an identical state on both paths now, so this function alone isn't
+ * the fix - see aic3204_rate_switch_reset()'s comment for where the
+ * remaining difference is believed to be (GD32-side enable ordering),
+ * which is why the reset call was pulled OUT of this function and
+ * into its own step, called separately, with the GD32 I2S resync
+ * sandwiched in between it and this one - see main.c's apply_demod_
+ * mode().
+ *
+ * This function is now just the register configuration itself
+ * (parameterized by rate), assuming the caller already reset the
+ * codec via aic3204_rate_switch_reset() (or, for cold boot, via
+ * aic3204_phase2_init() calling both in sequence below). Leaves
+ * ADC/DAC powered OFF at the end - aic3204_set_rate_power_up() turns
+ * them on, once the caller's DMA is armed and waiting.
+ */
+void aic3204_configure_rate(aic3204_rate_t rate)
+{
+    debug_print("\naic3204: register configuration (post-reset) ported from a real I2C "
+                "capture - now shared by cold boot AND every live rate switch\n");
+
+    wr(0, 0x00, 0x00, "select page 0 (after hardware nRESET)");
 
     /* --- Clock/PLL: CODEC_CLKIN sourced via PLL from BCLK, PLL ON,
      * J=14/D=0, giving CODEC_CLKIN=86.016MHz from BCLK=6.144MHz --- */
@@ -232,10 +351,16 @@ void aic3204_phase2_init(void)
     wr(0, 0x08, 0x00, "R8 PLL D lo (captured)");
     wr(0, 0x0B, 0x82, "R11 NDAC=2, power on (captured)");
     wr(0, 0x0C, 0x87, "R12 MDAC=7, power on (captured)");
-    wr(0, 0x0D, 0x00, "R13 DOSR hi (captured)");
-    wr(0, 0x0E, 0x20, "R14 DOSR=32 lo (captured)");
-    /* bit D5 (0x20) = Audio Bus Loopback, on top of the captured 0x11 */
-    wr(0, 0x3C, 0x11 | 0x20, "R60(pg0) captured value + AUDIO BUS LOOPBACK (TEST)");
+    if (rate == AIC3204_RATE_192K) {
+        wr(0, 0x0D, 0x00, "R13 DOSR hi (192kHz: DOSR=32)");
+        wr(0, 0x0E, 0x20, "R14 DOSR=32 lo (192kHz)");
+        wr(0, 0x3C, 0x11 | 0x20, "R60(pg0) PRB_P17 (192kHz) + AUDIO BUS LOOPBACK (TEST)");
+    } else {
+        wr(0, 0x0D, 0x00, "R13 DOSR hi (96kHz: DOSR=64)");
+        wr(0, 0x0E, 0x40, "R14 DOSR=64 lo (96kHz)");
+        /* bit D5 (0x20) = Audio Bus Loopback, on top of the PRB_P1 base (0x01) */
+        wr(0, 0x3C, 0x01 | 0x20, "R60(pg0) PRB_P1 (96kHz) + AUDIO BUS LOOPBACK (TEST)");
+    }
     debug_print("aic3204: *** LOOPBACK TEST MODE ENABLED - RX should mirror TX, ADC/DAC "
                 "bypassed. Remember to feed a real TX pattern, not silence, and to set "
                 "AIC3204_TEST_LOOPBACK back to 0 afterwards ***\n");
@@ -247,16 +372,64 @@ void aic3204_phase2_init(void)
     wr(0, 0x08, 0x00, "R8 PLL D lo (captured)");
     wr(0, 0x0B, 0x82, "R11 NDAC=2, power on (captured)");
     wr(0, 0x0C, 0x87, "R12 MDAC=7, power on (captured)");
-    wr(0, 0x0D, 0x00, "R13 DOSR hi (captured)");
-    wr(0, 0x0E, 0x20, "R14 DOSR=32 lo (captured)");
-    wr(0, 0x3C, 0x11, "R60(pg0) (captured)");
+    if (rate == AIC3204_RATE_192K) {
+        wr(0, 0x0D, 0x00, "R13 DOSR hi (192kHz: DOSR=32)");
+        wr(0, 0x0E, 0x20, "R14 DOSR=32 lo (192kHz)");
+        wr(0, 0x3C, 0x11, "R60(pg0) PRB_P17, Filter C (192kHz)");
+    } else {
+        wr(0, 0x0D, 0x00, "R13 DOSR hi (96kHz: DOSR=64)");
+        wr(0, 0x0E, 0x40, "R14 DOSR=64 lo (96kHz)");
+        wr(0, 0x3C, 0x01, "R60(pg0) PRB_P1, Filter A (96kHz) - same Filter-A block as "
+                           "48kHz used, DOSR=(48000/target_fs)*128=64 per the same TI "
+                           "formula, no reason to switch families for an intermediate rate");
+    }
 #endif
-    wr(0, 0x1B, 0x0C, "R27 I2S format (captured)");
-    wr(0, 0x1E, 0x87, "R30 (captured)");
+    /*
+     * *** 05/08/2026, R27/R30 MOVED OUT OF HERE - see
+     * aic3204_start_bclk_wclk() below ***: R27 (0x1B) is what actually
+     * puts BCLK/WCLK into OUTPUT/master mode on this codec (see this
+     * function's own long-standing comment on register 0x1B, bits
+     * D3:D2) - the moment this write completes, the codec starts
+     * driving BCLK/WCLK on the shared pins, REGARDLESS of whether the
+     * GD32 side has been resynced yet. Everything below this point in
+     * this function (R37, NADC/MADC/AOSR/PRB_R, page 1 analog, the
+     * page 8/9/46 biquad banks, the HP gain ramp) is roughly 75 more
+     * bit-banged I2C register writes at ~100kHz-ish - tens of
+     * milliseconds during which a live BCLK/WCLK is already toggling
+     * on the bus while sdr_rx_start()/gd32_i2s_stream_start() haven't
+     * run yet (they run AFTER this whole function returns, back in
+     * main.c's apply_demod_mode()). That's very likely the real source
+     * of the "needs several rx_lock retries, frequency varies session
+     * to session" pattern: the GD32 slave peripherals get resynced
+     * against an already-running clock at whatever phase tens of
+     * milliseconds of I2C traffic happened to land on, not against a
+     * fresh first edge the way the design intended.
+     *
+     * Fix: this function no longer starts the clock at all - it only
+     * gets the codec's clock tree READY (PLL locked, NDAC/MDAC/DOSR/
+     * NADC/MADC/AOSR dividers set) without ever driving BCLK/WCLK as
+     * outputs. aic3204_start_bclk_wclk() (new, see below) writes ONLY
+     * R30 then R27 (divider set BEFORE the pins go to output mode, so
+     * there's no brief burst of BCLK at the previous/default divider
+     * value before R30 corrects it - the old code did these in the
+     * OPPOSITE order) and is called separately, from apply_demod_mode()
+     * in main.c, AFTER sdr_rx_start()/gd32_i2s_stream_start() have
+     * already put the GD32 side into a resynced, listening state. That
+     * collapses the "resync happens against an already-running clock"
+     * window from tens of milliseconds down to whatever this one I2C
+     * register write itself takes (two bytes, comfortably under 1ms at
+     * this bit rate) - not a full elimination of the race, but a large
+     * reduction, and worth trying given everything else already ruled
+     * out.
+     */
     wr(0, 0x25, 0xEE, "R37 (captured)");
     wr(0, 0x12, 0x81, "R18 NADC=1, power on (captured)");
-    wr(0, 0x13, 0x87, "R19 MADC=7, power on (captured)");
-    wr(0, 0x14, 0x40, "R20 AOSR=64 (captured)");
+    if (rate == AIC3204_RATE_192K) {
+        wr(0, 0x13, 0x87, "R19 MADC=7 (192kHz)");
+    } else {
+        wr(0, 0x13, 0x8E, "R19 MADC=14 (96kHz)");
+    }
+    wr(0, 0x14, 0x40, "R20 AOSR=64 (unchanged - still valid for PRB_R1)");
     wr(0, 0x3D, 0x01, "R61 ADC processing block PRB_R1 (captured)");
 
     /* --- Page 1: analog power + HP/LO bias config --- */
@@ -312,13 +485,17 @@ void aic3204_phase2_init(void)
     wr(44, 0x00, 0x2C, "select page 44");
     wr(44, 0x01, 0x04, "P44R1 (captured)");
 
-    /* --- Page 0: DAC power/routing + ADC power-up --- */
+    /* --- Page 0: DAC power/routing + ADC registers - LEFT OFF here
+     * (0x16/0x00, "still down") on purpose - see this function's
+     * header comment for why. aic3204_set_rate_power_up() is what
+     * actually turns them on, once the caller has DMA armed and
+     * waiting. --- */
     wr(0, 0x00, 0x00, "select page 0");
-    wr(0, 0x3F, 0xD6, "R63 DAC power/routing (captured)");
+    wr(0, 0x3F, 0x16, "R63 DAC power/routing, DAC still DOWN (power-up deferred)");
     wr(0, 0x40, 0x00, "R64 (captured)");
-    wr(0, 0x41, 0x0C, "R65 DAC L volume (captured)");
-    wr(0, 0x42, 0x0C, "R66 DAC R volume (captured)");
-    wr(0, 0x51, 0xC0, "R81 power-up left+right ADC (captured, matches proven baseline)");
+    wr(0, 0x41, 0x0C, "R65 DAC L volume (captured baseline)");
+    wr(0, 0x42, 0x0C, "R66 DAC R volume (captured baseline)");
+    wr(0, 0x51, 0x00, "R81 ADC still DOWN (power-up deferred)");
     wr(0, 0x52, 0x00, "R82 ADC unmuted, 0dB fine gain (captured, matches proven baseline)");
     wr(0, 0x43, 0x93, "R67 (captured)");
 
@@ -414,16 +591,140 @@ void aic3204_phase2_init(void)
     wr(1, 0x3C, 0x28, "P1R60 (captured, final)");
     wr(0, 0x00, 0x00, "select page 0 (leave the codec on page 0)");
 
-    /*
-     * Confirm the ADC actually finished powering up, instead of just
-     * trusting that the R81 write got ACKed - Page 0 / Register 36
-     * (0x24, "ADC Flag Register") reports real power state: bit 6 =
-     * Left ADC powered up, bit 2 = Right ADC powered up. An ACKed I2C
-     * write only means the register accepted the command; it says
-     * nothing about whether the analog block actually finished
-     * starting up. Poll for up to ~200ms since power-up isn't
-     * instantaneous.
-     */
+    debug_print_dec("aic3204: full sequence done for rate (0=48K,1=192K) - clock "
+                     "tree ready but BCLK/WCLK NOT yet driven (see "
+                     "aic3204_start_bclk_wclk()), ADC/DAC still DOWN",
+                     (uint32_t)rate);
+}
+
+/*
+ * *** 05/08/2026, added alongside the WFM FERR/phase investigation ***
+ * - the other half of the R27/R30 split pulled out of
+ * aic3204_configure_rate() (see its own comment for the full
+ * reasoning). This is the ONLY thing that actually makes the codec
+ * start driving BCLK/WCLK as a master onto the shared pins - call it
+ * as late as possible, i.e. AFTER sdr_rx_start()/gd32_i2s_stream_
+ * start() have already put the GD32 side into a resynced, listening
+ * state (see main.c's apply_demod_mode()), so the gap between "clock
+ * goes live" and "GD32 is already waiting for it" is as small as this
+ * project can currently make it - one two-byte I2C register write,
+ * not the ~75-write, tens-of-milliseconds tail of
+ * aic3204_configure_rate().
+ *
+ * R30 (BCLK N divider) is written FIRST, R27 (I2S format/master
+ * enable) SECOND - the opposite order from before this split. This
+ * way the rate-correct divider is already in place the instant the
+ * pins go to output mode, instead of a brief moment of BCLK at
+ * whatever divider value was left over from before (either the
+ * previous rate, or 0 fresh out of aic3204_rate_switch_reset()'s
+ * hardware nRESET).
+ */
+void aic3204_start_bclk_wclk(aic3204_rate_t rate)
+{
+    wr(0, 0x00, 0x00, "select page 0 (aic3204_start_bclk_wclk)");
+    if (rate == AIC3204_RATE_192K) {
+        wr(0, 0x1E, 0x87, "R30 BCLK N Divider, N=7 (192kHz: DAC_CLK/N = "
+                           "43.008MHz/7 = 6.144MHz = 32*192kHz)");
+    } else {
+        wr(0, 0x1E, 0x8E, "R30 BCLK N Divider, N=14 (96kHz: DAC_CLK/N = "
+                           "43.008MHz/14 = 3.072MHz = 32*96kHz)");
+    }
+    wr(0, 0x1B, 0x0C, "R27 I2S format (captured) - BCLK/WCLK go live NOW");
+    debug_print("aic3204: BCLK/WCLK now driven (R30 then R27) - GD32 side should "
+                "already be resynced and listening at this point\n");
+}
+
+/*
+ * Cold-boot entry point - now just the 96kHz call into the shared
+ * sequence above, plus the power-up that used to be inlined at the
+ * end of this function. Kept as its own name/signature (no
+ * parameters) since main.c already calls it that way and there's no
+ * reason to disturb that call site.
+ */
+void aic3204_phase2_init(void)
+{
+    aic3204_rate_switch_reset();
+    aic3204_configure_rate(AIC3204_RATE_96K);
+    /* Cold boot's own GD32-side bring-up (gd32_i2s_init_slave()/
+     * sdr_rx_init(), both called earlier in main.c's boot sequence)
+     * already left SPI1/I2S1_ADD freshly enabled and listening before
+     * this function even starts - so, same as a live switch's
+     * apply_demod_mode() now, BCLK/WCLK only need to go live AFTER
+     * that, which is exactly what this call does. Cold boot and every
+     * live switch now go through this exact same two-call sequence, in
+     * the exact same order, with no separate code path to drift out of
+     * sync again. */
+    aic3204_start_bclk_wclk(AIC3204_RATE_96K);
+    aic3204_set_rate_power_up();
+    debug_print("aic3204: phase 2 complete - full sequence ported from a real I2C "
+                "capture of the original firmware. PLL sourced from BCLK (not MCLK), "
+                "J=14/D=0 -> CODEC_CLKIN=86.016MHz -> Fs=96kHz exact on both ADC and "
+                "DAC divider chains.\n");
+}
+
+
+/*
+ * --- Live rate switch (05/08/2026, for WFM's 192kHz reactivation;
+ * *** REWRITTEN 05/08/2026, THIRD pass *** - split into separately
+ * callable steps instead of one function, so main.c can sandwich the
+ * GD32 I2S resync in between the reset and the register configuration
+ * - see aic3204_rate_switch_reset()'s comment for the full reasoning
+ * on why the ORDER of codec-reset vs GD32-resync turned out to matter,
+ * not just whether the codec gets reset at all) ---
+ *
+ * HISTORY, briefly: the ORIGINAL live-switch code reprogrammed only
+ * the handful of registers that differ between rates, leaving the PLL
+ * and everything else untouched - measurably got the right sample
+ * rate (confirmed on scope) but left SPI_STAT_FERR firing continuously
+ * after every switch, on both RX and TX, forever. Wrapping the SAME
+ * full register sequence cold boot uses (software reset first) helped
+ * nothing. Upgrading that to a genuine hardware nRESET pulse - the
+ * literal same reset cold boot performs - ALSO helped nothing: real
+ * hardware logs showed FERR still firing at essentially the same rate
+ * (hundreds per check window) even though the codec now reaches an
+ * IDENTICAL state on both paths. That ruled the codec back out and
+ * pointed at the GD32 side's enable ORDER relative to the codec's
+ * clock output - see aic3204_rate_switch_reset()'s comment for the
+ * theory and the reordering this led to.
+ *
+ * There is no longer a single "aic3204_set_rate_registers()" call for
+ * this - main.c's apply_demod_mode() now calls, in order:
+ *   1. aic3204_rate_switch_reset()   - codec falls silent, no BCLK/WS
+ *   2. sdr_rx_reconfigure() / gd32_i2s_stream_reconfigure()
+ *   3. sdr_rx_start() / gd32_i2s_stream_start() - GD32 I2S resync +
+ *      DMA armed, all while the codec is STILL silent
+ *   4. aic3204_configure_rate(rate)  - NOW bring BCLK/WS back, with
+ *      the GD32 side already listening from the first real edge
+ *   5. aic3204_set_rate_power_up()   - ADC/DAC on, real samples flow
+ */
+
+/*
+ * Powers the DAC/ADC channels back UP - call this AFTER the RX/TX DMA
+ * is already armed for the new rate (see main.c's apply_demod_mode()),
+ * so real samples never arrive faster than they're drained.
+ *
+ * *** 05/08/2026, changed from a blind 50ms delay to the SAME ADC-
+ * ready polling loop aic3204_phase2_init() always used at boot ***:
+ * now that every live switch runs a genuine hardware reset on
+ * EVERY live switch (not just once at cold boot), every switch is a
+ * genuine fresh PLL lock, not a "re-lock from an already-running
+ * state" - the earlier "first switch needs 50ms, later ones don't"
+ * reasoning (see git history/transcript if this comment's prior
+ * version is needed) no longer applies cleanly, since there's no
+ * meaningful difference between "first" and "later" switches anymore
+ * - they're all effectively first switches now. Polling the real ADC
+ * Flag Register (0x24) instead of guessing a fixed delay is the more
+ * correct match for that: it waits exactly as long as the hardware
+ * actually needs, up to the same ~200ms ceiling phase2_init() already
+ * used at boot, rather than hoping 50ms is enough on every switch
+ * forever.
+ */
+void aic3204_set_rate_power_up(void)
+{
+    wr(0, 0x00, 0x00, "select page 0 (rate power-up)");
+    wr(0, 0x3F, 0xD6, "R63 DAC power back UP, same value as phase2_init");
+    wr(0, 0x51, 0xC0, "R81 ADC power back UP, same value as phase2_init");
+
     {
         uint8_t flag = 0x00;
         uint8_t left_up = 0, right_up = 0;
@@ -440,25 +741,14 @@ void aic3204_phase2_init(void)
             delay_ms(10);
         }
 
-        debug_print_hex32("aic3204: R36 ADC Flag Register raw", flag);
-        if (!left_up) {
-            debug_print("aic3204: *** Left ADC reports POWERED DOWN (bit6=0) despite "
-                        "the R81 power-up write - the ADC never actually started ***\n");
-        }
-        if (!right_up) {
-            debug_print("aic3204: *** Right ADC reports POWERED DOWN (bit2=0) despite "
-                        "the R81 power-up write - the ADC never actually started ***\n");
-        }
-        if (left_up && right_up) {
-            debug_print("aic3204: both ADC channels confirm POWERED UP (R36 bits 6 "
-                        "and 2 both set) - power-up genuinely completed\n");
+        debug_print_hex32("aic3204: R36 ADC Flag Register raw (rate switch power-up)", flag);
+        if (!left_up || !right_up) {
+            debug_print("aic3204: *** rate-switch power-up: ADC did NOT confirm fully "
+                        "powered up within ~200ms ***\n");
         }
     }
 
-    debug_print("aic3204: phase 2 complete - full sequence ported from a real I2C "
-                "capture of the original firmware. PLL sourced from BCLK (not MCLK), "
-                "J=14/D=0 -> CODEC_CLKIN=86.016MHz -> Fs=192kHz exact on both ADC and "
-                "DAC divider chains.\n");
+    debug_print("aic3204: ADC/DAC powered back up at the new rate\n");
 }
 
 /*

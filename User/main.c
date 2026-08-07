@@ -17,6 +17,7 @@
 #include "sdr_rx.h"
 #include "fft.h"
 #include "spectrum.h"
+#include "nr_ss.h" /* NR strength control (RADIO page tile) - see ENCODER_TARGET_NR */
 #include "splash_screen.h"
 #include "splash_screen.h"
 
@@ -271,24 +272,55 @@ int main(void)
             debug_print_dec("waterfall ticks", g_fill_count);
             /* ISR timing check (see demod_am.h's comment above
              * demod_am_get_last_cycles()): one block's real-time
-             * budget is SDR_RX_BLOCK_SAMPLES samples at 192kHz. If
-             * "demod ISR cycles" gets close to or over "block budget
-             * cycles", the demod ISR doesn't fit in real time -
-             * exactly the situation suspected in the USB/LSB hang
-             * report. */
-            debug_print_dec("demod ISR cycles (last block)", demod_am_get_last_cycles());
-            debug_print_dec("block budget cycles (192kHz, for reference)",
-                             (SystemCoreClock / 192000UL) * SDR_RX_BLOCK_SAMPLES);
-            {
-                /* Per-stage breakdown (31/07/2026, see
-                 * demod_am_get_last_cycles_breakdown()'s comment) -
-                 * pins down which stage a total-cycles jump actually
-                 * comes from, instead of guessing. */
-                demod_am_cycles_breakdown_t bd = demod_am_get_last_cycles_breakdown();
-                debug_print_dec("  frontend (deinterleave/down-mix/CHF)", bd.frontend);
-                debug_print_dec("  extract  (mode-specific: AM/WFM/SSB)", bd.extract);
-                debug_print_dec("  audio    (DC block + audio LPF)", bd.audio);
-                debug_print_dec("  agc_out  (AGC + I2S write)", bd.agc_out);
+             * budget is SDR_RX_BLOCK_SAMPLES samples at 96kHz (was
+             * 48kHz, and 192kHz before that - see sdr_rx.h's
+             * SDR_RX_BLOCK_SAMPLES comment; SAME ~2.667ms/block either
+             * way, by design). If "demod ISR cycles" gets close to or
+             * over "block budget cycles", the demod ISR doesn't fit in
+             * real time - exactly the situation suspected in the
+             * USB/LSB hang report.
+             *
+             * *** 05/08/2026 fix ***: this used to call
+             * demod_am_get_last_cycles() UNCONDITIONALLY, even while
+             * WFM (which runs an entirely separate ISR,
+             * demod_wfm_process_raw(), at 192kHz/512 samples per
+             * block) was the active mode - meaning WFM's own ISR
+             * timing has never actually been checked, not once, since
+             * the dual-rate split was introduced. demod_am_get_last_
+             * cycles() just kept reporting whatever AM/SSB/LSB/NFM's
+             * ISR last measured (stale, from before the switch into
+             * WFM, since demod_am_process_raw() stops being called at
+             * all while WFM is active). Branch on the live mode so
+             * each path's real ISR gets checked against its own real
+             * budget - suspected relevant to the "ruido de fondo"
+             * WFM report: atan2f() runs once per sample (512x/block)
+             * in the WFM discriminator, far more expensive than AM's
+             * plain envelope detection, making an occasional real-time
+             * overrun plausible and previously invisible. */
+            if (demod_am_get_mode() == DEMOD_MODE_WFM) {
+                debug_print_dec("WFM ISR cycles (last block)", demod_wfm_get_last_cycles());
+                debug_print_dec("block budget cycles (192kHz, for reference)",
+                                 (SystemCoreClock / 192000UL) * SDR_RX_BLOCK_SAMPLES_WFM);
+            } else {
+                debug_print_dec("demod ISR cycles (last block)", demod_am_get_last_cycles());
+                debug_print_dec("block budget cycles (96kHz, for reference)",
+                                 (SystemCoreClock / 96000UL) * SDR_RX_BLOCK_SAMPLES);
+                {
+                    /* Per-stage breakdown (31/07/2026, see
+                     * demod_am_get_last_cycles_breakdown()'s comment) -
+                     * pins down which stage a total-cycles jump actually
+                     * comes from, instead of guessing. WFM has no
+                     * equivalent breakdown getter yet (only the AM/SSB/
+                     * LSB/NFM path had per-stage instrumentation added) -
+                     * if the total above points at a WFM overrun, that's
+                     * the next thing worth adding, not assumed here. */
+                    demod_am_cycles_breakdown_t bd = demod_am_get_last_cycles_breakdown();
+                    debug_print_dec("  frontend (deinterleave/down-mix/CHF)", bd.frontend);
+                    debug_print_dec("  extract  (mode-specific: AM/WFM/SSB)", bd.extract);
+                    debug_print_dec("  audio    (DC block + audio LPF)", bd.audio);
+                    debug_print_dec("  nr       (Spectral Subtraction, AM/SSB only, 0 otherwise)", bd.nr);
+                    debug_print_dec("  agc_out  (AGC + I2S write)", bd.agc_out);
+                }
             }
         }
     }
@@ -435,7 +467,8 @@ typedef enum {
     ENCODER_TARGET_SCALE,
     ENCODER_TARGET_SQUELCH,
     ENCODER_TARGET_SMOOTH,
-    ENCODER_TARGET_PGA
+    ENCODER_TARGET_PGA,
+    ENCODER_TARGET_NR
 } encoder_target_t;
 
 /*
@@ -553,6 +586,7 @@ static ui_button_t s_menu_tile_spec_style; /* spectrum trace style toggle, added
 static ui_button_t s_menu_tile_zoom; /* spectrum/waterfall zoom, see spec_zoom_t below */
 static ui_button_t s_menu_tile_bw; /* AM/SSB audio filter width selector (4K0/2K3/1K8) - repurposed 02/08/2026 from the grid's BANDS tile, see menu_tile_bw_callback()'s comment */
 static ui_button_t s_menu_tile_pga; /* AIC3204 MIC_PGA analog input gain - fills the grid's last spare slot */
+static ui_button_t s_menu_tile_nr; /* NR (Spectral Subtraction) strength, AM/USB/LSB only - see nr_ss.h, fills RADIO page slot 5 */
 static ui_button_t s_menu_tile_speaker_pa; /* speaker PA enable/mute (PB7) - HW page, see its own comment */
 /* s_speaker_pa_enabled: backs BOTH the tile's label (menu_tile_speaker_pa_refresh())
  * and the actual GPIO level (speaker_pa_set_enabled(), defined down
@@ -563,7 +597,7 @@ static uint8_t s_speaker_pa_enabled = 1U; /* speaker on by default at boot */
 static ui_button_t s_menu_tile_exit;
 static ui_button_t s_menu_detail_back; /* the DETAIL view's only widget besides the value text itself */
 /* Backing buffers for the tiles whose label needs to show a live value
- * (AGC/SQUELCH/BACKLIGHT/VOLUME/SPT/SMOOTH/SPEC/ZOOM/PGA) - ui_button_t.label
+ * (AGC/SQUELCH/BACKLIGHT/VOLUME/SPT/SMOOTH/SPEC/ZOOM/PGA/NR) - ui_button_t.label
  * is just a const char*, so whatever it points at must outlive the
  * button. SCALE and EXIT use plain string literals instead (SCALE
  * still shows no live value on its GRID tile - see menu_grid_show()'s
@@ -575,19 +609,21 @@ static char s_menu_tile_squelch_buf[16];
 static char s_menu_tile_backlight_buf[16];
 static char s_menu_tile_volume_buf[16];
 static char s_menu_tile_pga_buf[16];
+static char s_menu_tile_nr_buf[16];
 static char s_menu_tile_nb_buf[16];
 static char s_menu_tile_smooth_buf[16];
 static char s_menu_tile_spec_style_buf[16];
 static char s_menu_tile_bw_buf[16];
 static char s_menu_tile_zoom_buf[16];
 
-/* s_nr_on is now VESTIGIAL - s_btn_nr was repurposed to cycle the AGC
- * profile instead (see agc_profile_cycle()'s comment and
- * demo_button_callback()'s NR branch), a quick stopgap ahead of a
- * proper settings-menu redesign. Nothing sets s_nr_on anymore, so its
- * row0 badge (see badges_draw()) just sits permanently off - left in
- * place rather than ripped out, since the whole badge grid is due for
- * a rework anyway and there's no point doing that cleanup twice. */
+/* NR master on/off (Spectral Subtraction - see nr_ss.h), mirrored into
+ * nr_ss_set_enabled() on every change - toggled by the bottom bar's NR
+ * button (s_btn_nr's callback) and shown live on the row0 badge (see
+ * badges_draw()). Was VESTIGIAL from 31/07/2026 to 03/08/2026 (see
+ * this file's git history if you need the old comment) while s_btn_nr
+ * was temporarily repurposed to cycle the AGC profile instead, ahead
+ * of the actual NR DSP existing - restored to its real job now that
+ * nr_ss.h does. */
 static uint8_t s_nr_on = 0U;
 
 /* Spatial line-smoothing pass count (0-3), fed straight into
@@ -814,6 +850,19 @@ static int16_t s_pga_gain_db_x2 = 40;
 #define PGA_STEP_X2 2   /* 2 * 0.5dB = 1.0dB per encoder detent */
 #define PGA_MIN_X2  0   /* 0.0dB */
 #define PGA_MAX_X2  95  /* 47.5dB - see aic3204_set_pga_gain_db()'s field-range note */
+/* NR strength (Spectral Subtraction, AM/USB/LSB only - see nr_ss.h and
+ * demod_am.c's NR INTEGRATION comment). RAW 0-4095, same native units
+ * as nr_ss_set_strength() itself (was 0-100% mapped internally until
+ * 03/08/2026 - the project owner asked for the raw range directly,
+ * once the on/off switch moved to its own separate control (s_nr_on)
+ * and this value no longer needed to double as an implicit bypass at
+ * its minimum). Starts at 0 - matches nr_ss_init()'s own default. */
+static uint16_t s_nr_strength = 0U;
+#define NR_STRENGTH_STEP 10U /* per encoder detent - ~32 detents edge
+                                 * to edge across the full 0-4095 range,
+                                 * similar turn-count feel to PGA/VOLUME's
+                                 * own step sizes over their own ranges */
+#define NR_STRENGTH_MAX 4095U
 /* Backlight step per encoder detent - 5% keeps the full 0-100% range
  * reachable in ~20 detents, coarse enough to actually SEE each step
  * change on the panel while turning the knob (unlike volume's finer
@@ -846,11 +895,11 @@ static int16_t s_pga_gain_db_x2 = 40;
  * stops the two bounds from crossing or collapsing the visible range
  * to something degenerate.
  */
-static float s_db_min = 30.0f; /* same starting point as the old SDR_DB_MIN */
+static float s_db_min = 0.0f; /* same starting point as the old SDR_DB_MIN */
 static float s_db_max = 90.0f;  /* same starting point as the old SDR_DB_MAX */
 static uint8_t s_scale_adjust_max = 0U; /* 0 = knob moves db_min, 1 = moves db_max */
 #define SPECTRUM_DB_STEP     2.0f   /* dB per encoder detent */
-#define SPECTRUM_DB_FLOOR  (30.0f) /* db_min can't go below this */
+#define SPECTRUM_DB_FLOOR  (-30.0f) /* db_min can't go below this */
 #define SPECTRUM_DB_CEIL    120.0f  /* db_max can't go above this */
 #define SPECTRUM_DB_MIN_GAP  10.0f  /* db_max - db_min never allowed below this -
                                       * keeps spectrum_draw()'s scale_t = 1/(max-min)
@@ -1181,6 +1230,31 @@ static void aux_row_display_draw(void)
         gfx_text((uint16_t)VOL_X, VOL_Y, "PGA ", fg, bg, 2);
         for (i = 0; buf[i] == ' ' && i < (FREQ_FIELD_CHARS - 7U); i++) { }
         gfx_text((uint16_t)(VOL_X + 4 * 6 * 2), VOL_Y, &buf[i], fg, bg, 2);
+    } else if (s_encoder_target == ENCODER_TARGET_NR) {
+        /* Raw 0-4095 field, no unit suffix (this is nr_ss_process()'s
+         * native threshold units, not a calibrated quantity - same
+         * "uncalibrated but useful" spirit as this project's spectrum
+         * dB scale). Without its own branch here this would silently
+         * fall into the VOLUME else-branch below and show the wrong
+         * value/label entirely. */
+        char buf[8]; /* up to 4 digits, space-padded to a fixed 7-char field */
+        uint8_t pos = 7U;
+        uint16_t v = s_nr_strength;
+
+        fg = GFX_COLOR_BLACK;
+        bg = GFX_COLOR_CYAN;
+
+        buf[pos] = '\0';
+        do {
+            buf[--pos] = (char)('0' + (v % 10U));
+            v /= 10U;
+        } while (v > 0U && pos > 0U);
+        while (pos > 0U) {
+            buf[--pos] = ' ';
+        }
+
+        gfx_text((uint16_t)VOL_X, VOL_Y, "NR  ", fg, bg, 2);
+        gfx_text((uint16_t)(VOL_X + 4 * 6 * 2), VOL_Y, buf, fg, bg, 2);
     } else {
         char buf[FREQ_FIELD_CHARS + 1];
         uint8_t i;
@@ -1387,13 +1461,17 @@ static uint8_t smeter_segments_from_peak(float peak)
 /*
  * STATUS BADGES: up to 6, in a 2x3 grid under the S-meter. Each shows
  * a radio state at a glance:
- *   NR / SPT  - NR is now VESTIGIAL (permanently off, see s_nr_on's
- *               comment - its button was repurposed to the AGC
- *               profile, see agc_profile_cycle()). SPT lights up
- *               whenever the spectrum's spatial line smoothing is
- *               active (passes > 0) - see s_spec_smooth_passes'
- *               comment; it used to be the NB (noise blanker) badge,
- *               which never drove any real DSP.
+ *   NR / SPT  - NR (03/08/2026) is real again: lit whenever the
+ *               bottom bar's NR button has Spectral Subtraction
+ *               switched on (s_nr_on/nr_ss_get_enabled() - see
+ *               nr_ss.h). Whether it's actually DOING anything right
+ *               now also depends on demod mode (AM/USB/LSB only, see
+ *               demod_am.c's NR INTEGRATION comment) - this badge
+ *               only reflects the on/off switch, not that mode check.
+ *               SPT lights up whenever the spectrum's spatial line
+ *               smoothing is active (passes > 0) - see
+ *               s_spec_smooth_passes' comment; it used to be the NB
+ *               (noise blanker) badge, which never drove any real DSP.
  *   AGC       - lit: the demod AGC really is always active (even in
  *               MANUAL profile the loop still runs, it just skips the
  *               peak-tracking math - see agc_profile_t's MANUAL note
@@ -1599,7 +1677,8 @@ static void badges_draw(void)
  *
  * Per-page option assignment (all pre-existing tiles, just
  * relocated - no settings were dropped):
- *   RADIO (slots 0-4): AGC, SQL (squelch), VOL, BW, PGA.
+ *   RADIO (slots 0-5): AGC, SQL (squelch), VOL, BW, PGA, NR (Spectral
+ *                       Subtraction strength, AM/USB/LSB only).
  *   UI    (slots 0-5): BL (backlight), SCALE, SPT, SMH (smooth),
  *                       SPC (spectrum trace style, HEATMAP<->LINE),
  *                       ZOOM.
@@ -1656,7 +1735,11 @@ static void badges_draw(void)
  * change (see the earlier discussion on why that's both risky, with
  * no reference capture to replay, and not actually what was needed).
  * This is a purely DIGITAL zoom: the codec/ADC/I2S keep running at
- * 192kHz exactly as always, untouched.
+ * 48kHz exactly as always, untouched (was 192kHz before 04/08/2026 -
+ * see sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment for THAT separate,
+ * actual sample-rate change - this zoom mechanism itself needed no
+ * code changes at all for it, being generic decimate-by-2 regardless
+ * of what Fs it's fed; only the absolute Hz spans below moved).
  *
  * How it works: cascade 1-3 stages of a generic decimate-by-2 FIR
  * (ZOOM_DECIM2_COEFFS, see its own comment) on a COPY of the raw I/Q,
@@ -1664,19 +1747,19 @@ static void badges_draw(void)
  * sign-flip rotation demod_am.c's low-IF down-mix uses, applied here
  * only when demod_am_get_if_offset_active() is set - see
  * zoom_process_block()). Enough decimated samples accumulate across
- * however many raw 192kHz blocks it takes to fill one FFT_SIZE window,
+ * however many raw 96kHz blocks it takes to fill one FFT_SIZE window,
  * then that window feeds the SAME fft_compute_db_iq() the unzoomed
  * view already uses - no change to the FFT itself, just what feeds it.
  *
  *   SPEC_ZOOM_1X - unchanged existing behavior: FFT runs directly on
- *                  the raw 192kHz block, every block, +/-96kHz span.
+ *                  the raw 96kHz block, every block, +/-48kHz span.
  *                  ZERO extra cost - the whole zoom pipeline below is
  *                  skipped entirely at this setting.
- *   SPEC_ZOOM_2X - one decimate-by-2 stage, +/-48kHz span. Needs 2 raw
+ *   SPEC_ZOOM_2X - one decimate-by-2 stage, +/-12kHz span. Needs 2 raw
  *                  blocks (~5.3ms) per FFT window.
- *   SPEC_ZOOM_4X - two cascaded stages, +/-24kHz span, 4 raw blocks
+ *   SPEC_ZOOM_4X - two cascaded stages, +/-6kHz span, 4 raw blocks
  *                  (~10.7ms) per window.
- *   SPEC_ZOOM_8X - three cascaded stages, +/-12kHz span, 8 raw blocks
+ *   SPEC_ZOOM_8X - three cascaded stages, +/-3kHz span, 8 raw blocks
  *                  (~21.3ms) per window.
  *
  * REFRESH RATE TRADEOFF, inherent to any zoom-FFT (not a bug to fix):
@@ -1722,7 +1805,7 @@ static spec_zoom_t s_spec_zoom = SPEC_ZOOM_1X;
  * center_mark_offset_px uses - so this scale, the red center marker,
  * and the demodulated-bandwidth tint all agree on which frequency
  * sits at which pixel. Getting this wrong would silently mislabel
- * every non-WFM reading by 48kHz at 1X zoom - worth the extra
+ * every non-WFM reading by 48kHz (the whole 1X span) at 1X zoom - worth the extra
  * conditional to avoid.
  *
  * The two edges are the exact +/-half_span_hz boundary of whatever
@@ -1759,19 +1842,21 @@ static void spec_span_labels_draw(void)
     uint8_t i;
 
     switch (s_spec_zoom) {
-    case SPEC_ZOOM_2X: full_span_hz = 96000UL;  break;
-    case SPEC_ZOOM_4X: full_span_hz = 48000UL;  break;
-    case SPEC_ZOOM_8X: full_span_hz = 24000UL;  break;
+    case SPEC_ZOOM_2X: full_span_hz = 48000UL;  break;
+    case SPEC_ZOOM_4X: full_span_hz = 24000UL;  break;
+    case SPEC_ZOOM_8X: full_span_hz = 12000UL;  break;
     case SPEC_ZOOM_1X:
-    default:           full_span_hz = 192000UL; break;
+    default:           full_span_hz = 96000UL;  break;
     }
     half_span_hz = (int32_t)(full_span_hz / 2U);
 
     /* See this function's PANEL-CENTER FREQUENCY comment above - same
      * condition sdr_spectrum_waterfall_tick() uses for
      * center_mark_offset_px. s_tune_hz > DEMOD_IF_OFFSET_HZ always
-     * holds here (TUNE_MIN_HZ=100kHz > DEMOD_IF_OFFSET_HZ=48kHz), so
-     * the subtraction below never underflows. */
+     * holds here (TUNE_MIN_HZ=100kHz > DEMOD_IF_OFFSET_HZ=24kHz, was
+     * 12kHz before AM/SSB/NFM moved from 48kHz to 96kHz - see
+     * sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment), so the subtraction
+     * below never underflows. */
     panel_center_hz = s_tune_hz;
     if (s_spec_zoom == SPEC_ZOOM_1X && demod_am_get_if_offset_active()) {
         panel_center_hz = s_tune_hz - DEMOD_IF_OFFSET_HZ;
@@ -1791,8 +1876,10 @@ static void spec_span_labels_draw(void)
          * edge, left-quarter, center, right-quarter, right edge -
          * evenly spaced in Hz (and therefore in pixels too, since the
          * Hz->px mapping is linear). half_span_hz/2 is always exact
-         * for every full_span_hz above (96000/48000/24000/12000 all
-         * divide cleanly by 4 total), so no rounding to worry about. */
+         * for every full_span_hz above (96000/48000/24000/12000, was
+         * 48000/24000/12000/6000 before AM/SSB/NFM moved to 96kHz, and
+         * 192000/96000/48000/24000 before that - all divide cleanly by
+         * 4 total either way), so no rounding to worry about. */
         int32_t k = (int32_t)i - 2;
         int32_t off_hz = k * (half_span_hz / 2);
         int32_t px = (int32_t)(((int64_t)SPEC_TRACE_W * off_hz) / (int64_t)full_span_hz);
@@ -1933,6 +2020,40 @@ static void menu_tile_pga_refresh(void)
     ui_button_draw(&s_menu_tile_pga);
 }
 
+/* NR (Spectral Subtraction strength, AM/USB/LSB only - see nr_ss.h and
+ * demod_am.c's NR INTEGRATION comment). Raw 0-4095 label, no unit
+ * suffix - see aux_row_display_draw()'s NR branch for why. Shows the
+ * STORED value regardless of the current demod mode - same "harmless
+ * to pre-set outside the mode it applies to" philosophy as BW (see
+ * menu_tile_bw_callback()'s comment) - it just won't audibly do
+ * anything until you're in AM/USB/LSB, and even then only while the
+ * bottom bar's NR button (s_nr_on) has it switched on. */
+static void menu_tile_nr_refresh(void)
+{
+    uint16_t v = s_nr_strength;
+    char digits[5]; /* up to 4 digits (0-4095) + NUL */
+    uint8_t dpos = 4U;
+    uint8_t i, j;
+
+    digits[dpos] = '\0';
+    do {
+        digits[--dpos] = (char)('0' + (v % 10U));
+        v /= 10U;
+    } while (v > 0U && dpos > 0U);
+
+    s_menu_tile_nr_buf[0] = 'N';
+    s_menu_tile_nr_buf[1] = 'R';
+    s_menu_tile_nr_buf[2] = ' ';
+    j = 3U;
+    for (i = dpos; digits[i] != '\0'; i++) {
+        s_menu_tile_nr_buf[j++] = digits[i];
+    }
+    s_menu_tile_nr_buf[j] = '\0';
+
+    s_menu_tile_nr.label = s_menu_tile_nr_buf;
+    ui_button_draw(&s_menu_tile_nr);
+}
+
 static void menu_tile_nb_refresh(void)
 {
     /* "SPT n" - n is s_spec_smooth_passes, always a single digit
@@ -1974,9 +2095,16 @@ static void menu_tile_smooth_refresh(void)
 
 static void menu_tile_spec_style_refresh(void)
 {
-    const char *v = (spectrum_get_style() == SPECTRUM_STYLE_LINE) ? "LINE" : "HEAT";
+    const char *v;
     uint8_t j = 4U;
     uint8_t i;
+
+    switch (spectrum_get_style()) {
+    case SPECTRUM_STYLE_LINE:    v = "LINE"; break;
+    case SPECTRUM_STYLE_OUTLINE: v = "OUTL"; break;
+    case SPECTRUM_STYLE_HEATMAP:
+    default:                     v = "HEAT"; break;
+    }
 
     s_menu_tile_spec_style_buf[0] = 'S'; s_menu_tile_spec_style_buf[1] = 'P';
     s_menu_tile_spec_style_buf[2] = 'C'; s_menu_tile_spec_style_buf[3] = ' ';
@@ -2012,19 +2140,28 @@ static void menu_tile_nb_callback(void *widget, ui_event_t event, void *user_dat
 }
 
 /* SPEC (trace style) behaves like AGC/SPT above, not like the DETAIL-
- * view group below - it's a 2-way toggle (HEATMAP<->LINE, see
- * spectrum_set_style()'s comment in spectrum.h), so cycling it
- * directly on tap and staying on the grid is simpler and just as
- * clear as a dedicated detail view would be for only two states. */
+ * view group below - it's a 3-way cycle (HEATMAP->LINE->OUTLINE->
+ * HEATMAP, see spectrum_set_style()'s comment in spectrum.h), so
+ * cycling it directly on tap and staying on the grid is simpler and
+ * just as clear as a dedicated detail view would be for only three
+ * states. */
 static void menu_tile_spec_style_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
     (void)user_data;
     if (event == UI_EVENT_RELEASE) {
-        spectrum_set_style((spectrum_get_style() == SPECTRUM_STYLE_LINE)
-                            ? SPECTRUM_STYLE_HEATMAP : SPECTRUM_STYLE_LINE);
+        spectrum_style_t next;
+        const char *name;
+
+        switch (spectrum_get_style()) {
+        case SPECTRUM_STYLE_HEATMAP: next = SPECTRUM_STYLE_LINE;    name = "LINE\n";    break;
+        case SPECTRUM_STYLE_LINE:    next = SPECTRUM_STYLE_OUTLINE; name = "OUTLINE\n"; break;
+        case SPECTRUM_STYLE_OUTLINE:
+        default:                     next = SPECTRUM_STYLE_HEATMAP; name = "HEATMAP\n"; break;
+        }
+        spectrum_set_style(next);
         debug_print("spectrum: style now ");
-        debug_print((spectrum_get_style() == SPECTRUM_STYLE_LINE) ? "LINE\n" : "HEATMAP\n");
+        debug_print(name);
         menu_tile_spec_style_refresh();
     }
 }
@@ -2193,6 +2330,292 @@ static void menu_tile_zoom_callback(void *widget, ui_event_t event, void *user_d
  * nothing left to adjust afterward (unlike those, a band preset is a
  * one-shot jump, not an ongoing knob target).
  */
+/*
+ * Applies a demod mode change, including the WFM<->96kHz rate switch
+ * when the change crosses that boundary (05/08/2026, WFM's 192kHz
+ * reactivation - see demod_am.c's demod_wfm_process_raw() comment for
+ * why WFM alone needs a different rate, and aic3204_rate_switch_
+ * reset()'s comment in aic3204.c for exactly what the codec side does
+ * and why the order below matters). BOTH places that change mode
+ * (band presets, the MODE picker) call this instead of demod_am_set_
+ * mode() directly - a mode change from either one can cross the WFM
+ * boundary just as easily as the other.
+ *
+ * SEQUENCE (order matters throughout - see aic3204_rate_switch_reset()'s
+ * comment in aic3204.c for the full story of why this exact order was
+ * needed, found via real hardware testing across several earlier
+ * attempts that each glitched a different way):
+ *   1. Stop BOTH DMA channels (capture + TX stream) - reprogramming
+ *      codec clock dividers while the I2S bus is actively clocking
+ *      risks exactly the bus-contention/RXORERR history this project
+ *      already fought once (see gd32_i2s.h's architecture comment).
+ *   2. Reset the codec (aic3204_rate_switch_reset(), a real hardware
+ *      nRESET pulse) - the codec falls completely silent, no BCLK/WS
+ *      at all, until step 4 below.
+ *   3. Resize both DMA channels' transfer counts for the NEW rate and
+ *      swap which function receives each captured block
+ *      (demod_am_process_raw <-> demod_wfm_process_raw) - these have
+ *      entirely separate buffers/state (see demod_wfm_process_raw()'s
+ *      comment on the "ruta separada" decision), so this swap alone
+ *      is what actually routes audio through the right pipeline.
+ *   4. Re-arm both DMA channels (sdr_rx_start()/gd32_i2s_stream_
+ *      start()) - the GD32's own I2S peripherals resync here too,
+ *      and critically, this happens WHILE the codec is STILL SILENT
+ *      from step 2 - the GD32 side is listening and ready before the
+ *      codec ever produces a single real clock edge, matching how
+ *      cold boot naturally orders things. Getting this ordering
+ *      backwards (codec clocking again before the GD32 side resyncs)
+ *      is what caused a persistent SPI_STAT_FERR that neither a full
+ *      register reset NOR a genuine hardware reset alone could fix -
+ *      see aic3204_rate_switch_reset()'s comment for that whole story.
+ *   5. NOW reconfigure the codec's registers for the new rate
+ *      (aic3204_configure_rate()) - BCLK/WS start coming back partway
+ *      through this call, straight into a GD32 side that's already
+ *      armed and listening from the first real edge.
+ *   6. Power the codec's ADC/DAC back UP
+ *      (aic3204_set_rate_power_up()) - only NOW does real audio data
+ *      start flowing, straight into an already-armed DMA path. Doing
+ *      this any earlier left a window where real samples arrived with
+ *      nothing draining them - a continuous receive overrun that read
+ *      as "sounds like NFM"/bandwidth-limited, not a DSP bug, and
+ *      never recovered on its own even after the DMA was eventually
+ *      armed.
+ *
+ * A brief audio/spectrum dropout during this sequence is EXPECTED,
+ * not a bug - see the project owner's own acknowledgment of this
+ * tradeoff when the dual-rate approach was first discussed.
+ *
+ * KNOWN GAP as of 05/08/2026: the panadapter's own FFT/spectrum
+ * pipeline (fft.c, main.c's spectrum buffers) is NOT YET resized for
+ * WFM's 512-sample blocks by this function - it stays fixed at
+ * FFT_SIZE=128 regardless of which rate is active. The AUDIO path
+ * above is fully correct either way; the SPECTRUM DISPLAY while in
+ * WFM is the remaining piece, tracked separately, not blocking this
+ * audio-path change from being useful on its own.
+ */
+/*
+ * *** 05/08/2026, added after raw I/Q sample dumps proved the real
+ * root cause *** - the AGC/mute work above turned out to be treating
+ * a symptom, not the disease. Raw sample dumps (added to
+ * demod_wfm_process_raw()/demod_am_process_raw() for one round of
+ * testing) showed that on some rate-switches the incoming I/Q looks
+ * exactly like real signal (small, smoothly-varying values, matching
+ * the known-good boot capture) - and on OTHERS, from the very first
+ * sample, it's wild alternating near-full-scale swings that don't
+ * look like RF content at all (e.g. one pair +21516/+21502 followed
+ * two samples later by an almost exact negation, -21503/-20482) -
+ * the classic signature of an I2S slave locking onto the WS (word
+ * select / frame sync) line at the WRONG bit-phase when the
+ * peripheral is disabled and re-enabled. Which phase it lands on
+ * depends on the exact clock edge at the moment of re-enable, so it's
+ * genuinely a coin-flip per switch - explaining why no amount of
+ * settle-muting or AGC tuning ever fixed the reported "ruido/pitido
+ * fuerte, sin voz reconocible", since real numbers were being
+ * computed from corrupted samples the whole session through, not
+ * just for the first few blocks.
+ *
+ * Fix: after arming and powering up, capture one real block and check
+ * it for that corruption signature - if found, redo the disable/
+ * re-enable/rearm sequence and check again, up to
+ * RX_LOCK_MAX_ATTEMPTS times. This can't fix WHICH phase the hardware
+ * locks onto, but re-rolling the coin flip a few times in a row is
+ * cheap and, empirically, very unlikely to land on the bad phase
+ * every single time.
+ */
+/*
+ * *** 05/08/2026, RX_LOCK RETRY LOOP REMOVED - see apply_demod_mode()
+ * below *** - this whole mechanism existed to paper over the
+ * nondeterminism of the OLD live-switch approach (partial resync of
+ * already-configured peripherals): since which WS bit-phase the
+ * hardware happened to lock onto on any given disable/re-enable was a
+ * coin flip, retrying up to RX_LOCK_MAX_ATTEMPTS times was a cheap way
+ * to avoid landing on a bad one. The rewritten apply_demod_mode() now
+ * does a FULL teardown/rebuild of the I2S peripherals AND the codec on
+ * every switch - the same sequence cold boot always used, which real
+ * hardware testing has never once caught landing on a bad phase. No
+ * coin flip left to retry. rx_capture_looks_corrupted() below is kept
+ * as a single post-switch sanity check/log line (informational only,
+ * no retry) rather than removed outright - still useful evidence if
+ * this rewrite ever needs revisiting.
+ */
+#define RX_LOCK_JUMP_THRESHOLD 16000  /* ~half full-scale int16 */
+#define RX_LOCK_BAD_FRACTION_NUM 1U   /* flag corrupted if more than */
+#define RX_LOCK_BAD_FRACTION_DEN 4U   /* 1/4 of samples show a wild jump */
+#define RX_LOCK_WAIT_TIMEOUT_MS 20U
+
+/* Own buffers, sized like main.c's later s_rx_i/s_rx_q (declared much
+ * further down in this file, near the spectrum polling code, so not
+ * yet visible up here) - kept separate rather than reordering
+ * existing declarations, to keep this change minimal and self-
+ * contained. */
+static int16_t s_rx_lock_check_i[SDR_RX_BLOCK_SAMPLES_MAX];
+static int16_t s_rx_lock_check_q[SDR_RX_BLOCK_SAMPLES_MAX];
+
+/* Waits for one fresh captured block (via the same poll the
+ * spectrum/panadapter uses) and checks it for the wild-swing
+ * corruption signature described above. Returns 1 if the capture
+ * looks corrupted (or never arrived within the timeout - treated the
+ * same as corrupted, since either way this lock attempt isn't
+ * trustworthy), 0 if it looks like plausible real signal. */
+static uint8_t rx_capture_looks_corrupted(void)
+{
+    uint32_t start_ms = g_msticks;
+    uint32_t n;
+    uint32_t total;
+    uint32_t bad_count = 0U;
+
+    while (sdr_rx_poll_block_iq(s_rx_lock_check_i, s_rx_lock_check_q) == 0U) {
+        if ((g_msticks - start_ms) >= RX_LOCK_WAIT_TIMEOUT_MS) {
+            debug_print("rx_lock: no capture arrived within timeout - treating as bad\n");
+            return 1U;
+        }
+    }
+
+    total = sdr_rx_get_block_samples();
+    for (n = 1U; n < total; n++) {
+        int32_t di = (int32_t)s_rx_lock_check_i[n] - (int32_t)s_rx_lock_check_i[n - 1U];
+        int32_t dq = (int32_t)s_rx_lock_check_q[n] - (int32_t)s_rx_lock_check_q[n - 1U];
+        if (di < 0) { di = -di; }
+        if (dq < 0) { dq = -dq; }
+        if (di > RX_LOCK_JUMP_THRESHOLD || dq > RX_LOCK_JUMP_THRESHOLD) {
+            bad_count++;
+        }
+    }
+
+    if (bad_count * RX_LOCK_BAD_FRACTION_DEN > total * RX_LOCK_BAD_FRACTION_NUM) {
+        debug_print_dec("rx_lock: capture looks corrupted, wild-jump samples", bad_count);
+        return 1U;
+    }
+    return 0U;
+}
+
+/*
+ * *** 05/08/2026, REWRITTEN - "full reinit instead of live resync" ***
+ *
+ * Every earlier version of this function tried to keep the I2S
+ * peripherals' and codec's EXISTING configuration and nudge them back
+ * into sync for the new rate - a disable/re-enable of I2SEN, a partial
+ * codec register rewrite, then (after that was proven insufficient) a
+ * full codec register replay via a genuine nRESET - while the GD32
+ * side only ever got the lighter disable/re-enable treatment. Real
+ * hardware logs kept finding the same result regardless of exactly
+ * which combination was tried: FERR fires after a live switch and
+ * NEVER clears again, while running a rate from a genuine COLD BOOT
+ * (gd32_i2s_init_slave()+aic3204_phase2_init(), once, before the main
+ * loop starts) is rock solid, FERR always 0, indefinitely - confirmed
+ * directly by testing a build that boots straight into 192kHz and
+ * never switches at all: perfect audio, no FERR, for the entire
+ * session.
+ *
+ * That gap (cold boot always clean, ANY live switch never fully
+ * clean) means the difference isn't which registers get rewritten -
+ * it's that a live switch was never actually doing the SAME thing cold
+ * boot does. This version fixes that literally: every switch that
+ * crosses the 96kHz/192kHz boundary now runs gd32_i2s_init_slave(rate)
+ * (gd32_i2s.c) - a FULL spi_i2s_deinit()/PLLI2S reconfigure/i2s_init()/
+ * GPIO-AF replay, not just re-enabling what was already configured -
+ * immediately followed by the exact same codec bring-up cold boot
+ * uses (aic3204_rate_switch_reset() + aic3204_configure_rate() +
+ * aic3204_start_bclk_wclk() + aic3204_set_rate_power_up()) and the
+ * exact same DMA bring-up (sdr_rx_bringup()/gd32_i2s_stream_arm(),
+ * which sdr_rx_init()/gd32_i2s_dma_start_stream() now also call under
+ * the hood for cold boot, so there is only ONE bring-up path left,
+ * not a separate "lighter" one for live switches to drift out of sync
+ * with).
+ */
+static void apply_demod_mode(demod_mode_t mode)
+{
+    uint8_t was_wfm    = (demod_am_get_mode() == DEMOD_MODE_WFM) ? 1U : 0U;
+    uint8_t will_be_wfm = (mode == DEMOD_MODE_WFM) ? 1U : 0U;
+
+    /* See this function's own comment history: setting s_mode BEFORE
+     * anything touches the DMA avoids a real race where the ISR could
+     * read a stale mode for the first several blocks after a switch. */
+    demod_am_set_mode(mode);
+
+    if (was_wfm != will_be_wfm) {
+        aic3204_rate_t rate = will_be_wfm ? AIC3204_RATE_192K : AIC3204_RATE_96K;
+        uint32_t block_samples = will_be_wfm ? SDR_RX_BLOCK_SAMPLES_WFM : SDR_RX_BLOCK_SAMPLES;
+
+        /* Only the CLEAN result of this bring-up should ever reach the
+         * real demodulator - keep the block hook detached throughout
+         * (sdr_rx.c's ISR already skips calling a NULL hook safely). */
+        sdr_rx_set_block_hook(0);
+
+        /* 1. Stop both DMA channels cleanly before tearing down the
+         *    peripherals underneath them. */
+        sdr_rx_stop();
+        gd32_i2s_stream_stop();
+
+        /* 2. Codec falls fully silent - genuine hardware nRESET, no
+         *    BCLK/WCLK at all. */
+        aic3204_rate_switch_reset();
+
+        /* 3. FULL teardown/rebuild of SPI1/I2S1_ADD for the new rate -
+         *    the actual fix (see this function's header comment).
+         *    Also re-arms DMA0/CH4 with silence, same as cold boot. */
+        gd32_i2s_init_slave(rate);
+
+        /* 4. Codec clock tree configured for the new rate (PLL,
+         *    NDAC/MDAC/DOSR, NADC/MADC/AOSR) - BCLK/WCLK still NOT
+         *    driven yet (see aic3204_start_bclk_wclk()'s own comment).
+         *    ADC/DAC left powered down. */
+        aic3204_configure_rate(rate);
+
+        /* 5. Both DMA channels armed and both I2S peripherals already
+         *    freshly enabled (from step 3) and listening - fresh,
+         *    matching cold boot's own ordering exactly. */
+        sdr_rx_bringup(block_samples);
+        gd32_i2s_stream_arm(block_samples);
+
+        /* 6. NOW the codec starts driving BCLK/WCLK - the GD32 side is
+         *    already listening, so this is the first real edge it
+         *    sees. */
+        aic3204_start_bclk_wclk(rate);
+
+        /* 7. ADC/DAC power up - both DMA channels already armed and
+         *    waiting, so nothing overruns. */
+        aic3204_set_rate_power_up();
+
+        /* Informational only now (see this section's header comment) -
+         * no retry, just a log line confirming whether this bring-up
+         * looks clean, the same way cold boot's own diagnostics do. */
+        debug_print(rx_capture_looks_corrupted()
+                        ? "rx_lock: *** capture looks corrupted after full reinit - "
+                          "this should not happen; treat as a real regression, not a "
+                          "coin flip to retry ***\n"
+                        : "rx_lock: capture looks clean after full reinit\n");
+
+        if (will_be_wfm) {
+            sdr_rx_set_block_hook(demod_wfm_process_raw);
+            demod_wfm_reset_diag(); /* fresh diagnostic log for this WFM entry - see its own comment */
+        } else {
+            sdr_rx_set_block_hook(demod_am_process_raw);
+            demod_am_reset_diag(); /* fresh diagnostic log for this AM/SSB/LSB/NFM entry - see its own comment */
+        }
+
+        debug_print(will_be_wfm ? "mode: switched INTO WFM - codec/DMA now at 192kHz (full reinit)\n"
+                                  : "mode: switched OUT OF WFM - codec/DMA now at 96kHz (full reinit)\n");
+
+        /*
+         * *** 05/08/2026, added alongside the FULL-RESET rate-switch
+         * fix in aic3204.c *** - aic3204_set_rate_registers() now runs
+         * a genuine software reset every time (see its own comment for
+         * why: fixes the persistent FERR that the old partial register
+         * rewrite left behind), which resets DAC volume and MIC_PGA
+         * gain back to aic3204_phase2_init()'s captured baseline
+         * (0dB / 20dB) along with everything else. Without this, any
+         * volume/PGA adjustment the person made would silently get
+         * wiped on the very next mode change that crosses the WFM
+         * boundary - re-apply whatever they actually have dialed in
+         * (s_volume_db_x2/s_pga_gain_db_x2 are already the live,
+         * current values regardless of how they got there) now that
+         * the codec is back up and listening. */
+        aic3204_set_volume_db((float)s_volume_db_x2 * 0.5f);
+        aic3204_set_pga_gain_db((float)s_pga_gain_db_x2 * 0.5f);
+    }
+}
+
 static void menu_band_preset_callback(void *widget, ui_event_t event, void *user_data)
 {
     uintptr_t idx = (uintptr_t)user_data;
@@ -2203,7 +2626,7 @@ static void menu_band_preset_callback(void *widget, ui_event_t event, void *user
 
         s_tune_hz = p->freq_hz;
         s_tune_step_idx = p->step_idx;
-        demod_am_set_mode(p->mode);
+        apply_demod_mode(p->mode);
         apply_lo_tune(s_tune_hz);
 
         debug_print("bands: preset applied -> ");
@@ -2270,6 +2693,13 @@ static void menu_tile_pga_callback(void *widget, ui_event_t event, void *user_da
     (void)widget;
     (void)user_data;
     if (event == UI_EVENT_RELEASE) { menu_detail_show(ENCODER_TARGET_PGA); }
+}
+
+static void menu_tile_nr_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) { menu_detail_show(ENCODER_TARGET_NR); }
 }
 
 /*
@@ -2432,7 +2862,7 @@ static void menu_mode_preset_callback(void *widget, ui_event_t event, void *user
     if (event == UI_EVENT_RELEASE && idx < DEMOD_MODE_ENTRY_COUNT) {
         demod_mode_t mode = k_demod_modes[idx].mode;
 
-        demod_am_set_mode(mode);
+        apply_demod_mode(mode);
         /* Re-tune at the (unchanged) selected frequency so the LO
          * offset behavior matches the NEW mode immediately - same
          * WFM/NFM reasoning as the old cycling MODE button, see
@@ -2633,6 +3063,22 @@ static void menu_detail_value_redraw(void)
         gfx_text((uint16_t)((MENU_AREA_W - vw) / 2), MENU_DETAIL_VALUE_Y, buf, GFX_COLOR_CYAN, GFX_COLOR_BLACK, 6);
         break;
     }
+    case ENCODER_TARGET_NR: {
+        /* Raw 0-4095 field, no unit suffix - see aux_row_display_draw()'s
+         * NR branch for why. Up to 4 digits, space-padded left same as
+         * every other detail-view field here. */
+        char buf[8];
+        uint8_t pos = 7U;
+        uint16_t v = s_nr_strength;
+        uint16_t vw;
+
+        buf[pos] = '\0';
+        do { buf[--pos] = (char)('0' + (v % 10U)); v /= 10U; } while (v > 0U && pos > 0U);
+        while (pos > 0U) { buf[--pos] = ' '; }
+        vw = gfx_text_width(buf, 6);
+        gfx_text((uint16_t)((MENU_AREA_W - vw) / 2), MENU_DETAIL_VALUE_Y, buf, GFX_COLOR_CYAN, GFX_COLOR_BLACK, 6);
+        break;
+    }
     case ENCODER_TARGET_SCALE: {
         char lo[FREQ_FIELD_CHARS + 1];
         char hi[FREQ_FIELD_CHARS + 1];
@@ -2672,6 +3118,7 @@ static void menu_detail_show(encoder_target_t target)
     case ENCODER_TARGET_BACKLIGHT: title = "BACKLIGHT"; hint = "TURN KNOB TO ADJUST";  break;
     case ENCODER_TARGET_VOLUME:    title = "VOLUME";    hint = "TURN KNOB TO ADJUST";  break;
     case ENCODER_TARGET_PGA:       title = "PGA GAIN";  hint = "TURN KNOB TO ADJUST";  break;
+    case ENCODER_TARGET_NR:        title = "NOISE RED"; hint = "TURN KNOB TO ADJUST";  break;
     case ENCODER_TARGET_SMOOTH:    title = "SMOOTH";    hint = "TURN KNOB TO ADJUST";  break;
     case ENCODER_TARGET_SCALE:     title = "SCALE";     hint = "PRESS KNOB: LO OR HI"; break;
     default:                        title = "";          hint = "";                     break;
@@ -2826,13 +3273,21 @@ static void menu_grid_show(void)
             MENU_OPT_COL(4), MENU_OPT_ROW(4), MENU_TILE_W, MENU_TILE_H,
             "PGA", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
             2, 0, 1, menu_tile_pga_callback, NULL};
-        /* Slots 5-7 intentionally empty - room to grow RADIO further. */
+        /* NR: Spectral Subtraction noise reduction strength (0-100%),
+         * AM/USB/LSB only - see nr_ss.h and demod_am.c's NR
+         * INTEGRATION comment. Fills slot 5 - 2 slots (6-7) still free. */
+        s_menu_tile_nr = (ui_button_t){
+            MENU_OPT_COL(5), MENU_OPT_ROW(5), MENU_TILE_W, MENU_TILE_H,
+            "NR", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_nr_callback, NULL};
+        /* Slots 6-7 intentionally empty - room to grow RADIO further. */
 
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_agc);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_squelch);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_volume);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_bw);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_pga);
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_nr);
 
         ui_screen_draw(&s_menu_screen);
         /* ui_screen_draw() just painted each tile with its STATIC
@@ -2844,6 +3299,7 @@ static void menu_grid_show(void)
         menu_tile_volume_refresh();
         menu_tile_bw_refresh();
         menu_tile_pga_refresh();
+        menu_tile_nr_refresh();
         break;
 
     case MENU_PAGE_UI:
@@ -2867,8 +3323,9 @@ static void menu_grid_show(void)
             MENU_OPT_COL(3), MENU_OPT_ROW(3), MENU_TILE_W, MENU_TILE_H,
             "SMOOTH", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
             2, 0, 1, menu_tile_smooth_callback, NULL};
-        /* SPC: the spectrum trace style toggle (HEATMAP<->LINE) - see
-         * spectrum_set_style()'s comment in spectrum.h. */
+        /* SPC: the spectrum trace style cycle (HEATMAP->LINE->
+         * OUTLINE) - see spectrum_set_style()'s comment in
+         * spectrum.h. */
         s_menu_tile_spec_style = (ui_button_t){
             MENU_OPT_COL(4), MENU_OPT_ROW(4), MENU_TILE_W, MENU_TILE_H,
             "SPC", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
@@ -3204,6 +3661,29 @@ static void tune_encoder_poll(void)
         return;
     }
 
+    if (s_encoder_target == ENCODER_TARGET_NR) {
+
+        /* Same "button still cycles tune step" courtesy as every other
+         * target above. */
+        if (press) {
+            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            if (!s_menu_open) { step_display_draw(); }
+        }
+
+        if (detents != 0) {
+            int32_t v = (int32_t)s_nr_strength + detents * (int32_t)NR_STRENGTH_STEP;
+
+            if (v < 0) { v = 0; }
+            if (v > (int32_t)NR_STRENGTH_MAX) { v = (int32_t)NR_STRENGTH_MAX; }
+            if ((uint16_t)v != s_nr_strength) {
+                s_nr_strength = (uint16_t)v;
+                nr_ss_set_strength(s_nr_strength);
+                settings_value_redraw();
+            }
+        }
+        return;
+    }
+
     if (press) {
         s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
         debug_print_dec("tune: step now Hz", k_tune_steps[s_tune_step_idx]);
@@ -3227,9 +3707,26 @@ static void tune_encoder_poll(void)
     }
 
     if (changed) {
-        freq_display_draw();
-        spec_span_labels_draw(); /* "esta escala tiene que variar con
-                                   * la frecuencia" - see its comment */
+        freq_display_draw(); /* top bar - never covered by the menu
+                               * overlay (see menu_screen_close()'s
+                               * comment), so this stays unconditional. */
+        if (!s_menu_open) {
+            /* spec_span_labels_draw() paints INSIDE the spectrum
+             * panel, which the menu grid overlays (MENU_AREA starts
+             * at SPEC_Y - see its #define above). Retuning while the
+             * menu is open must still update s_tune_hz/the LO (above,
+             * unconditional), but painting the label row here would
+             * scribble frequency text over whatever menu tile/detail
+             * view is currently showing. menu_screen_close() already
+             * calls spec_span_labels_draw() once on the way out to
+             * catch up on any change made while the menu masked it -
+             * same "skip the paint, not the state change" pattern as
+             * step_display_draw() above (see the !s_menu_open checks
+             * throughout this function). */
+            spec_span_labels_draw(); /* "esta escala tiene que variar
+                                       * con la frecuencia" - see its
+                                       * comment */
+        }
     }
 }
 
@@ -3245,9 +3742,11 @@ static void tune_encoder_poll(void)
  *           comment alongside menu_mode_list_show()'s above. Pressing
  *           the encoder (not this button) still cycles the step the
  *           old way - see tune_encoder_poll()'s per-target branches.
- *   NR   - cycles the AGC profile (MAN/SLW/MED/FST) - repurposed
- *           31/07/2026, see agc_profile_cycle()'s comment and
- *           s_nr_on's comment for why.
+ *   NR   - toggles Spectral Subtraction noise reduction on/off - see
+ *           s_nr_on's comment and nr_ss.h. Restored to this real job
+ *           03/08/2026 (was briefly repurposed to cycle the AGC
+ *           profile from 31/07 while the actual NR DSP didn't exist
+ *           yet).
  *   BANDS - opens the BANDS preset list (menu_bands_show()) directly,
  *           without detouring through the settings grid - repurposed
  *           02/08/2026 from the SPT spatial-line-smoothing shortcut
@@ -3280,17 +3779,24 @@ static void demo_button_callback(void *widget, ui_event_t event, void *user_data
              * there closes the menu itself; nothing else to do here. */
             menu_step_list_show();
         } else if (widget == &s_btn_nr) {
-            /* Repurposed 31/07/2026 - see agc_profile_cycle()'s
-             * comment: NR's noise-reduction toggle was never wired to
-             * real DSP anyway (s_nr_on is now dead - nothing sets it
-             * anymore, and its row0 badge just stays permanently off,
-             * see badges_draw()), so the button does something real
-             * instead: a second, physically-separate way to cycle the
-             * AGC profile, alongside tapping s_btn_agc_profile
-             * directly. Deliberately a quick stopgap, not a redesign -
-             * a proper settings menu is coming later today once the
-             * badge grid's out of room for more controls. */
-            agc_profile_cycle();
+            /* Restored to its real job 03/08/2026, now that Spectral
+             * Subtraction NR actually exists (nr_ss.h) - the
+             * "repurposed to cycle AGC" stopgap from 31/07/2026 is
+             * gone (AGC has its own proper home now: the AGC tile in
+             * the settings menu, plus s_btn_agc_profile - see
+             * agc_profile_cycle()'s comment). Toggles s_nr_on and
+             * mirrors it into nr_ss_set_enabled(), which demod_am.c
+             * actually checks (see its NR INTEGRATION comment) - a
+             * genuine master switch, independent of the strength
+             * tile's value (RADIO page's NR tile - see
+             * ENCODER_TARGET_NR), and independent of demod mode too
+             * (harmless to leave ON while in WFM/NFM, same "pre-set
+             * for later" philosophy as BW - demod_am.c's own mode
+             * check is what actually gates whether it does anything). */
+            s_nr_on = s_nr_on ? 0U : 1U;
+            nr_ss_set_enabled(s_nr_on);
+            debug_print(s_nr_on ? "NR: on\n" : "NR: off\n");
+            badges_draw();
         } else if (widget == &s_btn_bands) {
             /* Repurposed 02/08/2026 from the SPT smoothing-cycle
              * shortcut (see s_spec_smooth_passes' comment) to open the
@@ -3478,11 +3984,11 @@ static void spec_drag_tune_apply(uint16_t x, uint16_t prev_x, float *hz_accum)
     }
 
     switch (s_spec_zoom) {
-    case SPEC_ZOOM_2X: hz_per_px = 96000.0f  / (float)SPEC_TRACE_W; break;
-    case SPEC_ZOOM_4X: hz_per_px = 48000.0f  / (float)SPEC_TRACE_W; break;
-    case SPEC_ZOOM_8X: hz_per_px = 24000.0f  / (float)SPEC_TRACE_W; break;
+    case SPEC_ZOOM_2X: hz_per_px = 48000.0f / (float)SPEC_TRACE_W; break;
+    case SPEC_ZOOM_4X: hz_per_px = 24000.0f / (float)SPEC_TRACE_W; break;
+    case SPEC_ZOOM_8X: hz_per_px = 12000.0f  / (float)SPEC_TRACE_W; break;
     case SPEC_ZOOM_1X:
-    default:            hz_per_px = 192000.0f / (float)SPEC_TRACE_W; break;
+    default:            hz_per_px = 96000.0f / (float)SPEC_TRACE_W; break;
     }
 
     /* Drag right (dx_px > 0) -> frequency DOWN, so subtract - see this
@@ -3634,8 +4140,39 @@ static void demo_touch_poll(void)
 #error "SDR_RX_BLOCK_SAMPLES (sdr_rx.h) and FFT_SIZE (fft.h) must match"
 #endif
 
-static int16_t s_rx_i[SDR_RX_BLOCK_SAMPLES];
-static int16_t s_rx_q[SDR_RX_BLOCK_SAMPLES];
+/*
+ * *** CRITICAL FIX 05/08/2026 - was sized at plain SDR_RX_BLOCK_SAMPLES
+ * (128), but sdr_rx_poll_block_iq() below (line ~4169) writes
+ * sdr_rx_get_block_samples() samples - which is
+ * SDR_RX_BLOCK_SAMPLES_WFM (512) while WFM is active. That was a
+ * silent ~768-byte WRITE overrun past the end of EACH of these two
+ * arrays on every single spectrum poll while in WFM - textbook memory
+ * corruption of whatever static variables happen to sit next in the
+ * linker layout, which is almost certainly what the project owner
+ * saw as "el espectro se ralentiza, el volumen se sube solo, se
+ * activan otros menus solos, y al volver a AM se cuelga" - all
+ * classic symptoms of a buffer overrun clobbering unrelated state
+ * (gain variables, UI state, whatever else the linker happened to
+ * place right after these two arrays), not four separate bugs.
+ *
+ * Sized at SDR_RX_BLOCK_SAMPLES_MAX now so it can never overflow
+ * regardless of which rate is active - same fix pattern as
+ * s_stream_buf/s_raw_buf already got today for the exact same class
+ * of bug (see gd32_i2s.c's STREAM_FRAMES_PER_HALF comment and
+ * sdr_rx.c's own header comment).
+ *
+ * NOTE - this fixes the CRASH/CORRUPTION, not yet the DISPLAY: the
+ * FFT/spectrum pipeline below this point still processes a fixed
+ * FFT_SIZE (256) samples regardless of how many sdr_rx actually
+ * delivered, so the panadapter in WFM will show only the FIRST 256 of
+ * the 512 samples per block (a real picture, just not WFM's full
+ * span) until that's resized too - see this project's WFM migration
+ * notes for that remaining, separately-tracked piece. Nothing below
+ * reads past what it currently reads, so this is now safe, just
+ * incomplete for WFM specifically.
+ */
+static int16_t s_rx_i[SDR_RX_BLOCK_SAMPLES_MAX];
+static int16_t s_rx_q[SDR_RX_BLOCK_SAMPLES_MAX];
 static float   s_db[FFT_BINS_IQ]; /* fftshifted: VFO at the center index */
 
 /*
@@ -3905,7 +4442,10 @@ static void sdr_spectrum_waterfall_tick(void)
     /*
      * RESTRUCTURED (30/07/2026) - display decoupled from block rate.
      *
-     * Blocks arrive at 192kHz/512 = 375/s; redrawing the whole
+     * Blocks arrive at 96000Hz/256 = 375/s (was 48000Hz/128 before
+     * AM/SSB/NFM moved to 96kHz, and 192000Hz/512 before that - see
+     * sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment; SAME 375/s in every
+     * case, by design); redrawing the whole
      * spectrum + waterfall (~128k EXMC pixel writes) for EVERY block
      * was the main reason the display felt slow AND the trace looked
      * nervous. Now:
@@ -4121,9 +4661,16 @@ static void sdr_spectrum_waterfall_tick(void)
      * center_mark_offset_px: when low-IF tuning is active (see
      * demod_am.h's LOW-IF TUNING note), the demodulated signal sits
      * DEMOD_IF_OFFSET_HZ away from the true LO/center bin, not on it
-     * - shift the marker line to match. Full span is +/-96kHz (192kHz
-     * I/Q rate), so pixels-per-Hz = SPEC_TRACE_W/192000; at exactly
-     * Fs/4 that's SPEC_TRACE_W/4 = 168, exact. POSITIVE (right,
+     * - shift the marker line to match. Full span is +/-48kHz (96kHz
+     * I/Q rate - was +/-24kHz @ 48kHz, and +/-96kHz @ 192kHz before
+     * that, see sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment), so
+     * pixels-per-Hz = SPEC_TRACE_W/96000; at exactly Fs/4 that's
+     * SPEC_TRACE_W/4 = 168, exact - UNCHANGED by any Fs move, since
+     * DEMOD_IF_OFFSET_HZ is
+     * ALWAYS defined as exactly Fs/4 (see its own comment in
+     * demod_am.h), so this pixel offset was always really
+     * SPEC_TRACE_W/4 algebraically, independent of whatever Fs
+     * happens to be. POSITIVE (right,
      * higher frequency): bench-confirmed 31/07/2026 (flipped from an
      * earlier NEGATIVE assumption, which had it backwards) - the
      * wanted signal lands at +SR/4 relative to the LO. This is a
@@ -4146,7 +4693,7 @@ static void sdr_spectrum_waterfall_tick(void)
         int16_t band_hi_offset_px = 0;
 
         if (s_spec_zoom == SPEC_ZOOM_1X && demod_am_get_if_offset_active()) {
-            center_mark_offset_px = (int16_t)((uint32_t)SPEC_TRACE_W * DEMOD_IF_OFFSET_HZ / 192000UL);
+            center_mark_offset_px = (int16_t)((uint32_t)SPEC_TRACE_W * DEMOD_IF_OFFSET_HZ / 96000UL);
         }
 
         /*
@@ -4169,8 +4716,10 @@ static void sdr_spectrum_waterfall_tick(void)
          * muestra").
          *
          * full_span_hz: the SAME halving-per-zoom-step span
-         * spec_span_labels_draw() uses for its tick ruler (192000 at
-         * 1X, matching DEMOD_IF_OFFSET_HZ's own scale above) - needed
+         * spec_span_labels_draw() uses for its tick ruler (96000 at
+         * 1X, matching DEMOD_IF_OFFSET_HZ's own scale above - was
+         * 48000 before AM/SSB/NFM moved to 96kHz, and 192000 before
+         * that, see sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment) - needed
          * here too since the tint's WIDTH in pixels must shrink/grow
          * the same way the ruler's tick spacing (and the marker's
          * position) does when ZOOM changes what one pixel is worth in
@@ -4192,11 +4741,11 @@ static void sdr_spectrum_waterfall_tick(void)
                 int16_t bw_px;
 
                 switch (s_spec_zoom) {
-                case SPEC_ZOOM_2X: full_span_hz = 96000UL; break;
-                case SPEC_ZOOM_4X: full_span_hz = 48000UL; break;
-                case SPEC_ZOOM_8X: full_span_hz = 24000UL; break;
+                case SPEC_ZOOM_2X: full_span_hz = 48000UL; break;
+                case SPEC_ZOOM_4X: full_span_hz = 24000UL; break;
+                case SPEC_ZOOM_8X: full_span_hz = 12000UL;  break;
                 case SPEC_ZOOM_1X:
-                default:           full_span_hz = 192000UL; break;
+                default:           full_span_hz = 96000UL; break;
                 }
                 bw_px = (int16_t)((uint32_t)SPEC_TRACE_W * bw_hz / full_span_hz);
 
@@ -4257,13 +4806,140 @@ static void sdr_spectrum_waterfall_tick(void)
         debug_print_dec_signed("sdr_tick: Q(right) min", q_min);
         debug_print_dec_signed("sdr_tick: Q(right) max", q_max);
         {
-            uint32_t stat = SPI_STAT(I2S1_ADD);
-            if ((stat & SPI_STAT_FERR) != 0U) {
-                debug_print("sdr_tick: *** SPI_STAT_FERR (format error) SET on I2S1_ADD ***\n");
-            }
-            if ((stat & SPI_STAT_RXORERR) != 0U) {
-                debug_print("sdr_tick: *** SPI_STAT_RXORERR (receive overrun) SET on "
-                            "I2S1_ADD ***\n");
+            /*
+             * *** 05/08/2026, replaced with real counts *** - the
+             * previous version here sampled SPI_STAT once per check
+             * (~every 1.5s) and could only say "set" or "clear" - not
+             * enough to tell "one glitch since the last check" from
+             * "hundreds per second", and the person's own report
+             * (continuous background noise, not occasional clicks)
+             * needed that distinction. sdr_rx.c's DMA0_Channel3_
+             * IRQHandler() and gd32_i2s.c's gd32_i2s_stream_write_
+             * half() now count every real FERR occurrence cheaply,
+             * once per audio block on each side, with no UART cost in
+             * the ISR itself - this just reads and resets those
+             * accumulators. A high count here (relative to how many
+             * blocks ran in this window - roughly window_ms/2.667 at
+             * either rate) means genuinely frequent frame errors, not
+             * a rare fluke; a low or zero count despite what was seen
+             * before means the earlier once-per-check sampling was
+             * catching something closer to intermittent.
+             */
+            uint32_t rx_ferr_n = sdr_rx_get_ferr_count();
+            uint32_t tx_ferr_n = gd32_i2s_get_tx_ferr_count();
+            sdr_rx_reset_ferr_count();
+            gd32_i2s_reset_tx_ferr_count();
+            debug_print_dec("sdr_tick: RX (SPI1) FERR count since last check", rx_ferr_n);
+            debug_print_dec("sdr_tick: TX (I2S1_ADD) FERR count since last check", tx_ferr_n);
+
+            /*
+             * *** 05/08/2026, added to test the "I/Q misalignment, not
+             * missing data" theory *** - see sdr_rx.c's
+             * sdr_rx_get_ferr_snapshot() comment for what this snapshot
+             * is and why. Cross-correlates I[n] against Q[n+shift] for
+             * a handful of small integer shifts over the captured
+             * window - if the peak correlation sits at a NONZERO shift,
+             * that's direct evidence I and Q are being read from
+             * different sample instants (a channel/word slip), not
+             * just noisy or missing data, which is what the panadapter
+             * spectrum being fine despite audible corruption already
+             * suggested but couldn't confirm on its own. Runs here in
+             * the slow main loop (UART-affordable), not the ISR -
+             * plain integer multiply/accumulate, no floating point
+             * needed for a comparative peak-shift readout.
+             *
+             * *** 05/08/2026, FIXED after the first real capture ***:
+             * the first version correlated the raw samples directly,
+             * with no DC removal - real hardware logs showed values
+             * dominated by a huge, nearly shift-independent DC term
+             * (blocks with a big negative mean gave ~10^8-magnitude
+             * "correlation" at EVERY shift, changing by only a few %
+             * across the whole -3..+3 range - a flat offset artifact,
+             * not a lag-dependent peak), and the "best shift" jumped
+             * around inconsistently between captures (-2, +1, -3, +1)
+             * with no repeating winner - exactly what pure DC/noise
+             * would produce, and the opposite of what a real, fixed
+             * hardware misalignment should look like (the same shift
+             * winning every time). Now removes each window's own mean
+             * from I and Q before correlating (a real covariance, not
+             * a raw dot product), and only calls a shift "meaningful"
+             * if it beats the runner-up by a clear margin (>2x) -
+             * otherwise this reports "inconclusive" rather than
+             * pointing at a shift that's really just noise dressed up
+             * as a number. Needs several REPEATED captures showing the
+             * SAME winning shift before trusting it as a real,
+             * physical misalignment - one capture proves nothing
+             * either way.
+             */
+            {
+                static int16_t s_snap_i[64];
+                static int16_t s_snap_q[64];
+                const uint32_t n = 64U;
+
+                if (sdr_rx_get_ferr_snapshot(s_snap_i, s_snap_q, n)) {
+                    int32_t shift;
+                    int32_t best_shift = 0;
+                    int64_t best_mag = 0;
+                    int64_t second_mag = 0;
+                    int32_t i_n;
+                    int32_t mean_i = 0;
+                    int32_t mean_q = 0;
+
+                    for (i_n = 0; i_n < (int32_t)n; i_n++) {
+                        mean_i += s_snap_i[i_n];
+                        mean_q += s_snap_q[i_n];
+                    }
+                    mean_i /= (int32_t)n;
+                    mean_q /= (int32_t)n;
+
+                    debug_print("sdr_tick: --- FERR snapshot captured, I/Q cross-"
+                                "correlation vs shift (DC removed) ---\n");
+                    for (shift = -3; shift <= 3; shift++) {
+                        int64_t acc = 0;
+                        uint32_t count = 0;
+                        int32_t n_i;
+                        for (n_i = 0; n_i < (int32_t)n; n_i++) {
+                            int32_t q_i = n_i + shift;
+                            int32_t iv, qv;
+                            if (q_i < 0 || q_i >= (int32_t)n) {
+                                continue;
+                            }
+                            iv = (int32_t)s_snap_i[n_i] - mean_i;
+                            qv = (int32_t)s_snap_q[q_i] - mean_q;
+                            acc += (int64_t)iv * (int64_t)qv;
+                            count++;
+                        }
+                        if (count > 0U) {
+                            acc /= (int64_t)count; /* normalize so different
+                                                     * overlap lengths at the
+                                                     * edges are comparable */
+                        }
+                        debug_print_dec_signed("sdr_tick:   shift", shift);
+                        debug_print_dec_signed("sdr_tick:   cov(I[n], Q[n+shift])", (int32_t)acc);
+                        {
+                            int64_t mag = (acc < 0) ? -acc : acc;
+                            if (mag > best_mag) {
+                                second_mag = best_mag;
+                                best_mag = mag;
+                                best_shift = shift;
+                            } else if (mag > second_mag) {
+                                second_mag = mag;
+                            }
+                        }
+                    }
+                    if (best_shift == 0) {
+                        debug_print("sdr_tick: peak covariance at shift=0 - no evidence "
+                                    "of I/Q sample misalignment in this snapshot\n");
+                    } else if (best_mag < (2 * second_mag)) {
+                        debug_print("sdr_tick: peak covariance is NOT a clear outlier vs "
+                                    "the runner-up shift - inconclusive, treat as noise "
+                                    "unless the SAME shift keeps winning repeatedly\n");
+                    } else {
+                        debug_print_dec_signed("sdr_tick: *** clear peak covariance at "
+                                                "NONZERO shift - possible I/Q misalignment, "
+                                                "shift", best_shift);
+                    }
+                }
             }
         }
     }

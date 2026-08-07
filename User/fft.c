@@ -1,10 +1,13 @@
 #include "fft.h"
 
 /*
- * RAM BUDGET: re/im (512*4*2=4096B) + cos/sin twiddles (256*4*2=2048B)
- * + Hann window (512*4=2048B) + bit-reversal table (512*2=1024B) =
- * ~9.2KB static. Combined with the waterfall's own buffer and sdr_rx's
- * raw buffer, this still leaves margin within the main SRAM budget.
+ * RAM BUDGET: re/im (256*4*2=2048B) + cos/sin twiddles (128*4*2=1024B)
+ * + Hann window (256*4=1024B) + bit-reversal table (256*2=512B) =
+ * ~4.6KB static (was ~2.3KB @ FFT_SIZE=128/48kHz, ~9.2KB @
+ * FFT_SIZE=512/192kHz before that - see sdr_rx.h's
+ * SDR_RX_BLOCK_SAMPLES comment). Combined with the waterfall's own
+ * buffer and sdr_rx's raw buffer, this still leaves margin within the
+ * main SRAM budget.
  */
 
 static float s_re[FFT_SIZE];

@@ -66,21 +66,25 @@
 void spectrum_init(void);
 
 /*
- * Two trace styles - added 31/07/2026 per the project owner, who
- * wanted the option to switch to a plain continuous-line look (single
- * flat fill color + bright outline on a dark navy background, like a
- * classic panadapter) as an alternative to the existing palette-
- * gradient "heat map" bars. Toggled live via spectrum_set_style() -
- * the NEXT spectrum_draw() call picks it up, no re-init needed. Only
- * affects the SPECTRUM panel's own fill/background/trace colors -
- * the waterfall keeps using spectrum_colormap() (the palette LUT)
- * regardless of this setting, since a flat-color waterfall would be
- * useless (it's the palette gradient that makes a waterfall readable
- * at a glance).
+ * Three trace styles - HEATMAP and LINE added 31/07/2026, OUTLINE
+ * added 07/08/2026, all per the project owner. HEATMAP is the
+ * original palette-gradient bars; LINE is a plain continuous-line
+ * look (flat fill + bright outline on a dark navy background, like a
+ * classic panadapter); OUTLINE is LINE with the fill removed - just
+ * the 1px contour on the dark navy background, so gridlines/band
+ * tint/center mark show straight through underneath the trace
+ * instead of being covered by a filled bar. Toggled live via
+ * spectrum_set_style() - the NEXT spectrum_draw() call picks it up,
+ * no re-init needed. Only affects the SPECTRUM panel's own
+ * fill/background/trace colors - the waterfall keeps using
+ * spectrum_colormap() (the palette LUT) regardless of this setting,
+ * since a flat-color waterfall would be useless (it's the palette
+ * gradient that makes a waterfall readable at a glance).
  */
 typedef enum {
     SPECTRUM_STYLE_HEATMAP = 0, /* existing palette-gradient bars (default, unchanged) */
-    SPECTRUM_STYLE_LINE = 1     /* flat fill + bright outline on a dark navy background */
+    SPECTRUM_STYLE_LINE    = 1, /* flat fill + bright outline on a dark navy background */
+    SPECTRUM_STYLE_OUTLINE = 2  /* same navy background as LINE, but no fill - contour only */
 } spectrum_style_t;
 
 void spectrum_set_style(spectrum_style_t style);

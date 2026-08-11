@@ -164,6 +164,31 @@ uint8_t aic3204_set_volume_db(float db);
 uint8_t aic3204_set_pga_gain_db(float db);
 
 /*
+ * Input impedance / Rin selector for the MIC_PGA differential inputs
+ * (Page 1, R52/R54/R55/R57) - see aic3204_set_input_impedance()'s
+ * comment in aic3204.c for the full story, including the
+ * *** IMPORTANT UNVERIFIED ASSUMPTION *** about the 20k/40k byte
+ * values (inferred from the datasheet's standard field encoding, not
+ * from a captured trace like everything else in this driver).
+ *
+ * 10k is the widest-gain option (0..47.5dB) and matches
+ * aic3204_phase2_init()'s captured baseline - stay there for weak
+ * signals. 20k/40k trade PGA gain range for extra fixed attenuation
+ * (-6dB/-12dB), useful once aic3204_set_pga_gain_db(0.0f) alone still
+ * isn't enough backoff for a very strong local signal. NOT
+ * soft-stepped like the gain register - callers should mute around a
+ * call to this (demod_am_reset_diag()/demod_wfm_reset_diag()) to
+ * avoid an audible pop. Returns 1 if all four writes were ACKed.
+ */
+typedef enum {
+    AIC3204_RIN_10K = 0,
+    AIC3204_RIN_20K = 1,
+    AIC3204_RIN_40K = 2
+} aic3204_rin_t;
+
+uint8_t aic3204_set_input_impedance(aic3204_rin_t level);
+
+/*
  * TEMPORARY DIAGNOSTIC (28/07/2026): TI documents a digital "Audio Bus
  * Loopback" mode (Page 0 / Register 29, bit D5) that reflects
  * whatever comes in on DIN straight back out on DOUT, entirely

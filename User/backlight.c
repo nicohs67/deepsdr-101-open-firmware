@@ -125,3 +125,26 @@ uint8_t backlight_get_percent(void)
 {
     return s_backlight_percent;
 }
+
+/*
+ * See backlight.h's comment. Straight CCR=0 (same value
+ * backlight_set_percent()'s formula would give for percent=0, minus
+ * the floor clamp) - TIMER_OC_POLARITY_LOW is already configured in
+ * backlight_init(), so this reproduces exactly the "pin LOW the whole
+ * period" case backlight_init()'s comment confirms is REAL darkness on
+ * this hardware, not the floor-enforced dim glow. s_backlight_percent
+ * is deliberately left untouched here - it still reflects the
+ * brightness the person actually chose, for backlight_wake() to
+ * restore and for any UI readout in the meantime.
+ */
+void backlight_sleep(void)
+{
+    timer_channel_output_pulse_value_config(TIMER1, TIMER_CH_3, 0U);
+    debug_print("backlight: sleep (forced off, bypassing the floor)\n");
+}
+
+void backlight_wake(void)
+{
+    backlight_set_percent(s_backlight_percent); /* restores the CCR for the percent that was already stored - a harmless no-op if never put to sleep */
+    debug_print("backlight: wake\n");
+}

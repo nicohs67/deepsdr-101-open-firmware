@@ -1,4 +1,5 @@
 #include "demod_am.h"
+#include "config.h"
 #include "sdr_rx.h"
 #include "gd32_i2s.h"
 #include "gd32f4xx.h"
@@ -7,6 +8,12 @@
 #include "nr_ss.h" /* Spectral Subtraction NR, AM/USB/LSB only - see
                      * this file's NR INTEGRATION comment above the
                      * decimate/interpolate instances it reuses. */
+#include "rtty.h" /* RTTY decoder, USB/LSB only - see this file's
+                    * RTTY INTEGRATION comment. */
+#include "rtty_scope.h" /* dedicated audio-domain tuning scope for RTTY,
+                           * see this file's RTTY INTEGRATION comment
+                           * and rtty_scope.h's own "why a separate FFT"
+                           * story. */
 #include <math.h> /* atan2f() for the WFM discriminator - see demod_am.h's
                     * WFM note on why this uses libm instead of
                     * arm_atan2_f32() (not present in this project's
@@ -929,7 +936,7 @@ static float32_t s_i_delayed[HILBERT_GROUP_DELAY_DEC + DEC_BLOCK_SAMPLES];
  * critical section: main.c writes it from the main loop, the ISR
  * reads it once per block: worst case a mode change lands one block
  * late, which is inaudible and not worth stalling the ISR over. */
-static uint8_t s_mode = (uint8_t)DEMOD_MODE_AM; /* was DEMOD_MODE_WFM - changed
+static uint8_t s_mode = (uint8_t)CONFIG_START_MODE; /* see config.h - was DEMOD_MODE_WFM - changed
                                     * 05/08/2026: harmless before WFM got its own
                                     * separate 192kHz path (demod_wfm_process_raw()),
                                     * since demod_am_process_raw() used to handle WFM
@@ -1129,6 +1136,55 @@ float demod_am_get_signal_peak(void)
     return s_agc_peak;
 }
 
+/*
+ * RF front-end clipping detection - see its getter's comment in
+ * demod_am.h for the full "why". s_rf_clip_flag is only ever SET from
+ * inside an ISR (rf_clip_scan(), called from both
+ * demod_am_process_raw() and demod_wfm_process_raw()) and only ever
+ * CLEARED from the main loop (the getter below) - a one-directional
+ * flag, not a counter, so there's no lost-update risk worth guarding
+ * further.
+ *
+ * Threshold/count reasoning: RF_CLIP_THRESHOLD (32000) sits close to
+ * the ADC's real full scale (+/-32768) without demanding an exact
+ * railed value - a genuinely clipped waveform sits flat at or near
+ * the rail for MULTIPLE consecutive samples, not just one. Requiring
+ * RF_CLIP_MIN_COUNT (3) samples over that threshold in the same block
+ * (out of 256-512) filters out a single legitimate near-full-scale
+ * peak (a strong-but-not-clipping signal can absolutely touch high
+ * values for one sample without being clipped) while still catching
+ * real clipping fast - a genuinely overloaded front end will have
+ * FAR more than 3 railed samples per block, so this threshold errs
+ * toward triggering readily rather than missing real clipping.
+ */
+#define RF_CLIP_THRESHOLD  CONFIG_RF_CLIP_THRESHOLD /* see config.h */
+#define RF_CLIP_MIN_COUNT  CONFIG_RF_CLIP_MIN_COUNT /* see config.h */
+static volatile uint8_t s_rf_clip_flag = 0U;
+
+static void rf_clip_scan(const int16_t *raw_interleaved, uint32_t n_samples)
+{
+    uint32_t i;
+    uint32_t hits = 0U;
+
+    for (i = 0; i < 2U * n_samples; i++) {
+        int16_t v = raw_interleaved[i];
+        if (v >= RF_CLIP_THRESHOLD || v <= -RF_CLIP_THRESHOLD) {
+            hits++;
+            if (hits >= RF_CLIP_MIN_COUNT) {
+                s_rf_clip_flag = 1U;
+                break; /* already confirmed for this block, no need to keep scanning */
+            }
+        }
+    }
+}
+
+uint8_t demod_am_get_and_clear_rf_clip_flag(void)
+{
+    uint8_t v = s_rf_clip_flag;
+    s_rf_clip_flag = 0U;
+    return v;
+}
+
 /* Low-IF down-mix on/off, kept in sync with the actual LO by whoever
  * tunes it (see demod_am.h) - same safety pattern as the earlier
  * Fs/8 attempt: default OFF, so demod_am_init() running before the
@@ -1235,6 +1291,8 @@ void demod_am_init(void)
         debug_print("demod_am: *** NR interpolator init FAILED (numTaps %% L != 0?) ***\n");
     }
     nr_ss_init();
+    rtty_init();
+    rtty_scope_init();
     {
         uint32_t k;
         for (k = 0; k < HILBERT_GROUP_DELAY_DEC; k++) {
@@ -1335,6 +1393,12 @@ void demod_wfm_process_raw(const int16_t *raw_interleaved)
     if (sdr_rx_last_block_corrupted()) {
         return;
     }
+
+    /* Clipping scan on the RAW block, before anything reinterprets
+     * these samples - see rf_clip_scan()'s comment. After the
+     * corrupted-block guard on purpose: a FERR block's samples may be
+     * channel-misassigned garbage, not a meaningful clipping read. */
+    rf_clip_scan(raw_interleaved, SDR_RX_BLOCK_SAMPLES_WFM);
 
     muted = (s_wfm_mute_remaining > 0U) ? 1U : 0U;
     do_log = wfm_should_log_diag(); /* decide BEFORE incrementing below */
@@ -1547,6 +1611,12 @@ void demod_am_process_raw(const int16_t *raw_interleaved)
         return;
     }
 
+    /* Clipping scan on the RAW block, before anything reinterprets
+     * these samples - see rf_clip_scan()'s comment. After the
+     * corrupted-block guard on purpose: a FERR block's samples may be
+     * channel-misassigned garbage, not a meaningful clipping read. */
+    rf_clip_scan(raw_interleaved, SDR_RX_BLOCK_SAMPLES);
+
     dcb_x1 = s_dcb_x1;
     dcb_y1 = s_dcb_y1;
     peak = s_agc_peak;
@@ -1707,6 +1777,42 @@ void demod_am_process_raw(const int16_t *raw_interleaved)
         /* 2c. Combine: one sideband adds, the other cancels. */
         for (k = 0; k < DEC_BLOCK_SAMPLES; k++) {
             s_ssb_dec[k] = s_i_delayed[k] + sign * s_q_hilbert_out[k];
+        }
+
+        /*
+         * --- RTTY INTEGRATION (added 08/08/2026, first draft) ---
+         *
+         * USB/LSB only, per the project owner - RTTY is two audio
+         * tones inside an SSB passband, there's no meaning to it in
+         * AM/NFM/WFM. Reads s_ssb_dec BEFORE NR (2d, right below)
+         * touches it - deliberately RAW SSB audio, not NR'd: spectral
+         * subtraction is tuned for voice intelligibility, and could
+         * smear or distort two narrow FSK tones in ways that hurt
+         * Goertzel tone detection (rtty.c's whole decode depends on
+         * accurately telling two specific frequencies apart) more
+         * than it helps. Same "s_ssb_dec is ALREADY at the rate this
+         * wants, no extra decimation needed" reuse as NR just above -
+         * see nr_ss_get_enabled()'s comment for that reasoning, it
+         * applies here identically. Gated on rtty_get_enabled() the
+         * same way NR is: skipped entirely while off, not just a
+         * transparent no-op - zero extra ISR cycles (see rtty.h's
+         * RTTY_ENABLED comment for how this defaults to on/off).
+         *
+         * READ-ONLY - rtty_process() never modifies s_ssb_dec, unlike
+         * nr_ss_process() right below, so call order relative to NR
+         * only matters for what RTTY sees, not for correctness of
+         * what NR sees afterward.
+         */
+        if (rtty_get_enabled()) {
+            rtty_process(s_ssb_dec, DEC_BLOCK_SAMPLES);
+            /* Same buffer, same reasoning as rtty_process() just above
+             * (raw pre-NR audio) - feeds the tuning scope's own
+             * accumulator. See rtty_scope.h for why this is a
+             * SEPARATE FFT from both fft.c's real-time one and
+             * rtty.c's own Goertzel detectors. Cheap: just an
+             * accumulate-into-a-ring, the actual FFT runs later from
+             * the main loop (rtty_scope_poll()), never here. */
+            rtty_scope_feed(s_ssb_dec, DEC_BLOCK_SAMPLES);
         }
 
         /* 2d. NR (Spectral Subtraction), USB/LSB - IN PLACE on

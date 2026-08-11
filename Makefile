@@ -23,6 +23,15 @@ DEFS = -DGD32F450 -DUSE_STDPERIPH_DRIVER -DHXTAL_VALUE=12288000U
 # needed).
 DEBUG_UART_ENABLED ?= 0
 DEFS += -DDEBUG_UART_ENABLED=$(DEBUG_UART_ENABLED)
+# RTTY_ENABLED build flag REMOVED 08/08/2026: RTTY (User/rtty.c,
+# rtty_scope.c) graduated from a debug-build-only tool to a real
+# selectable mode (RTTY-L/RTTY-U in main.c's k_demod_modes[]) once
+# validated against a real signal - both files are always compiled in
+# and reachable from the normal mode picker now, no special build
+# needed. For a debug session with the verbose per-character bit-level
+# dump, flip CONFIG_RTTY_DIAG_ENABLED in User/config.h instead of a
+# Makefile flag (still want `make DEBUG_UART_ENABLED=1` too, to
+# actually see any of rtty.c's own debug_print*() output).
 # ARM_MATH_DSP: the GD32F450 (Cortex-M4F) really does have the DSP
 # extension, so let CMSIS-DSP call the real __QADD8/__SSAT/... it
 # needs instead of pulling in its dsp/none.h software-emulation

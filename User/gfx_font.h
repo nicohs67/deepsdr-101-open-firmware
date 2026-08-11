@@ -1,8 +1,30 @@
 /*
  * Fuente monoespaciada 5x7 (glcdfont-style, columna-mayor, bit0=fila
- * superior). Cubre: espacio, digitos, mayusculas y puntuacion basica
- * util para UI de SDR (frecuencias, dB, unidades, menus). Generada
- * localmente para este proyecto, sin minusculas (ampliar bajo demanda).
+ * superior). Cubre: espacio, digitos, mayusculas, minusculas y
+ * puntuacion basica util para UI de SDR (frecuencias, dB, unidades,
+ * menus). Generada localmente para este proyecto.
+ *
+ * Minusculas añadidas 07/08/2026, per the project owner ("queda fea
+ * sin ellas"): rasterizadas con PIL a partir de DejaVu Sans Mono Bold
+ * y reducidas a 5x7 por bloques (Image.BOX), no a mano - mas fiable
+ * que transcribir bytes de memoria a este tamaño. SIN descendentes
+ * propiamente dichas (g/j/p/q/y) - la rejilla solo tiene 7 filas de
+ * alto (GFX_FONT_HEIGHT) y gfx_char() solo lee los bits 0-6 de cada
+ * columna, así que una "cola" de descendente real necesitaría una 8ª
+ * fila que este formato no tiene. Lo que se ve en su lugar es una
+ * pequeña marca en la fila inferior (p.ej. la 'g' termina en un
+ * bloque, no en un gancho) - suficiente para distinguirlas a simple
+ * vista, no una tipografia con descendentes de verdad. Para eso hace
+ * falta una celda mas alta (8x12 o similar) y tocar gfx_char() -
+ * pendiente, discutido con el project owner como la opcion "completa"
+ * frente a esta ("rapida").
+ *
+ * 'a' y 'e' salieron IDENTICAS del rasterizado automatico a este
+ * tamaño (ambas colapsan a la misma forma de "caja cerrada" al
+ * reducir tanto) - la 'e' esta corregida a mano para que se lea
+ * distinta (bucle abierto por abajo a la derecha en vez de cerrado).
+ * Si alguna otra letra resulta dificil de leer en pantalla real,
+ * este es el sitio a tocar (no gfx_char(), que no cambia).
  */
 #ifndef GFX_FONT_H
 #define GFX_FONT_H
@@ -12,11 +34,11 @@
 #define GFX_FONT_WIDTH  5
 #define GFX_FONT_HEIGHT 7
 #define GFX_FONT_FIRST_CHAR 0x20  /* espacio */
-#define GFX_FONT_LAST_CHAR  0x5A  /* 'Z' */
+#define GFX_FONT_LAST_CHAR  0x7A  /* 'z' */
 
 /* Indexado como gfx_font5x7[c - GFX_FONT_FIRST_CHAR][columna].
- * Caracteres no cubiertos (minusculas, etc.) devuelven espacio en blanco.
- * Ver gfx_char() en gfx.c. */
+ * Caracteres no cubiertos (0x5B-0x60: [\]^_` y cualquier cosa fuera
+ * de 0x20-0x7A) devuelven espacio en blanco. Ver gfx_char() en gfx.c. */
 static const uint8_t gfx_font5x7[][5] = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, /* ' ' */
     {0x0E, 0x51, 0x0E, 0x00, 0x00}, /* '!' */
@@ -77,6 +99,38 @@ static const uint8_t gfx_font5x7[][5] = {
     {0x63, 0x14, 0x08, 0x14, 0x63}, /* 'X' */
     {0x03, 0x04, 0x78, 0x04, 0x03}, /* 'Y' */
     {0x61, 0x51, 0x49, 0x45, 0x43}, /* 'Z' */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* sin definir '[' */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* sin definir '\' */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* sin definir ']' */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* sin definir '^' */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* sin definir '_' */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* sin definir '`' */
+    {0x00, 0x3C, 0x2C, 0x3C, 0x00}, /* 'a' */
+    {0x00, 0x3E, 0x24, 0x3C, 0x00}, /* 'b' */
+    {0x00, 0x3C, 0x24, 0x24, 0x00}, /* 'c' */
+    {0x00, 0x3C, 0x24, 0x3E, 0x00}, /* 'd' */
+    {0x00, 0x3C, 0x14, 0x04, 0x00}, /* 'e' - corregida a mano, ver comentario de cabecera */
+    {0x00, 0x04, 0x3E, 0x06, 0x00}, /* 'f' */
+    {0x00, 0x7C, 0x64, 0x7C, 0x00}, /* 'g' - sin gancho de descendente real, ver comentario de cabecera */
+    {0x00, 0x3E, 0x04, 0x3C, 0x00}, /* 'h' */
+    {0x00, 0x24, 0x3F, 0x20, 0x00}, /* 'i' */
+    {0x00, 0x44, 0x7F, 0x00, 0x00}, /* 'j' - sin gancho de descendente real */
+    {0x00, 0x3E, 0x18, 0x34, 0x00}, /* 'k' */
+    {0x00, 0x02, 0x3E, 0x20, 0x00}, /* 'l' */
+    {0x00, 0x3C, 0x3C, 0x3C, 0x00}, /* 'm' */
+    {0x00, 0x3C, 0x04, 0x3C, 0x00}, /* 'n' */
+    {0x00, 0x3C, 0x24, 0x3C, 0x00}, /* 'o' */
+    {0x00, 0x7C, 0x24, 0x3C, 0x00}, /* 'p' - sin gancho de descendente real */
+    {0x00, 0x3C, 0x24, 0x7C, 0x00}, /* 'q' - sin gancho de descendente real */
+    {0x00, 0x3C, 0x1C, 0x04, 0x00}, /* 'r' */
+    {0x00, 0x2C, 0x3C, 0x34, 0x00}, /* 's' */
+    {0x00, 0x04, 0x3E, 0x24, 0x00}, /* 't' */
+    {0x00, 0x3C, 0x20, 0x3C, 0x00}, /* 'u' */
+    {0x00, 0x1C, 0x30, 0x1C, 0x00}, /* 'v' */
+    {0x04, 0x38, 0x18, 0x3C, 0x00}, /* 'w' */
+    {0x00, 0x3C, 0x18, 0x34, 0x00}, /* 'x' */
+    {0x00, 0x5C, 0x78, 0x1C, 0x00}, /* 'y' - sin gancho de descendente real */
+    {0x00, 0x34, 0x3C, 0x2C, 0x00}, /* 'z' */
 };
 
 #endif /* GFX_FONT_H */

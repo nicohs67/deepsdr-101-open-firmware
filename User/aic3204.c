@@ -469,7 +469,7 @@ void aic3204_configure_rate(aic3204_rate_t rate)
     0x33 = 0x60 → El bias de micrófono está activo a 2.0 V, alimentado desde AVdd (no desde LDOIN) 
     */
 
-    wr(1, 0x34, 0x10, "P1R52 IN2L -> LADC_P, 40k (captured)");
+    wr(1, 0x34, 0x10, "P1R52 IN2L -> LADC_P, 10k (captured)");
     wr(1, 0x36, 0x10, "P1R54 (captured)");
     wr(1, 0x37, 0x04, "P1R55 (captured)");
     wr(1, 0x39, 0x04, "P1R57 (captured)");
@@ -838,3 +838,71 @@ uint8_t aic3204_set_pga_gain_db(float db)
     }
     return ok;
 }
+
+/*
+ * Input impedance / Rin selector (Page 1, R52/R54/R55/R57) - added
+ * 07/08/2026, per the project owner, after the datasheet's "Analog
+ * PGA versus Input Configuration" table (2.3.2.1) turned up something
+ * useful for the RF-level auto-AGC (see main.c's rf_agc_poll()):
+ * choosing Rin=20k or 40k instead of the captured baseline's 10k
+ * shifts the WHOLE PGA gain range down by 6dB/12dB respectively
+ * (10k: 0..47.5dB, 20k: -6..41.5dB, 40k: -12..35.5dB, single-ended) -
+ * a coarse attenuation option that reaches BELOW what the PGA's own
+ * 0dB floor can do alone, for when even that isn't enough backoff on
+ * a genuinely blowtorch-strong local signal.
+ *
+ * *** IMPORTANT UNVERIFIED ASSUMPTION *** - aic3204_phase2_init()'s
+ * captured 10k values (P1R52/P1R54 = 0x10, P1R55/P1R57 = 0x04) are
+ * real, sniffed-from-hardware bytes (see the comment right above
+ * those wr() calls for the full field decode). The 20k/40k values
+ * THIS function writes are NOT captured - they're inferred from the
+ * datasheet's standard 2-bit field encoding (00=off, 01=10k, 10=20k,
+ * 11=40k), applied to the SAME field position the captured 10k byte
+ * already uses in each register (bits[5:4] for P1R52/P1R54, bits[3:2]
+ * for P1R55/P1R57 - matching how 0x10 decodes to "bits[5:4]=01" and
+ * 0x04 decodes to "bits[3:2]=01" respectively). This is a reasonable,
+ * standard-encoding inference, not a guess pulled from nowhere - but
+ * it has NOT been confirmed against a real I2C capture the way
+ * everything else in this file has. Test on real hardware before
+ * trusting it blind: tune to a known strong signal, step through
+ * AIC3204_RIN_10K/20K/40K, and confirm both channels stay balanced
+ * (equal I/Q amplitude - see the WFM gain-chain investigation for how
+ * to check that from the raw min/max debug prints) and the effective
+ * attenuation roughly matches the datasheet's 6dB/12dB steps. If a
+ * real capture ever turns up different bytes for 20k/40k, THAT'S the
+ * ground truth - fix this function's field values to match, not the
+ * other way around.
+ *
+ * Left/right (I/Q) channels are ALWAYS switched together, same
+ * atomic call - see the WFM gain-chain investigation for why an
+ * asymmetric change here would introduce a real I/Q balance problem
+ * (degraded SSB image rejection), not just a level mismatch.
+ *
+ * Unlike aic3204_set_pga_gain_db()'s soft-stepped gain register, this
+ * reconnects the input MUX itself - the datasheet doesn't document
+ * soft-stepping for these registers, so treat this as an abrupt,
+ * audible-if-unmuted transition, NOT something to call on every fine
+ * adjustment. Callers should mute (demod_am_reset_diag() or
+ * demod_wfm_reset_diag(), whichever matches the active mode) around
+ * any call to this - see rf_agc_poll()'s rin escalation for the
+ * pattern.
+ */
+uint8_t aic3204_set_input_impedance(aic3204_rin_t level)
+{
+    uint8_t field = (uint8_t)((uint8_t)level + 1U); /* 01/10/11 = 10k/20k/40k */
+    uint8_t left  = (uint8_t)(field << 4);  /* P1R52/P1R54 field is bits[5:4] */
+    uint8_t right = (uint8_t)(field << 2);  /* P1R55/P1R57 field is bits[3:2] */
+    uint8_t ok;
+
+    ok  = aic3204_write_reg(1, 0x34U, left);  /* P1R52 IN2L -> LADC_P */
+    ok &= aic3204_write_reg(1, 0x36U, left);  /* P1R54 IN2R -> LADC_M */
+    ok &= aic3204_write_reg(1, 0x37U, right); /* P1R55 IN3R -> RADC_P */
+    ok &= aic3204_write_reg(1, 0x39U, right); /* P1R57 IN3R -> RADC_M */
+
+    debug_print_dec("aic3204: Rin set, level (0=10k/1=20k/2=40k)", (uint32_t)level);
+    if (!ok) {
+        debug_print("aic3204: *** Rin write with NO ACK ***\n");
+    }
+    return ok;
+}
+

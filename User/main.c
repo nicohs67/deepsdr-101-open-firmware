@@ -6,6 +6,9 @@
 #include "waterfall.h"
 #include "touch.h"
 #include "aic3204.h"
+#include "config.h"
+#include "rtty.h"
+#include "rtty_scope.h"
 #include "ms5351.h"
 #include "rf_lpf.h"
 #include "encoder.h"
@@ -40,11 +43,23 @@ static uint8_t smeter_segments_from_peak(float peak);
 static void tune_encoder_poll(void);
 static void menu_screen_open(void);
 static void menu_screen_close(void);
+static void screen_sleep_enter(void);
+static void screen_wake(void);
 static void zoom_decimators_init(void);
 static void menu_grid_show(void);
 static void menu_bands_show(void);
 static void menu_step_list_show(void);
 static void menu_mode_list_show(void);
+static void menu_freq_keypad_show(void);
+static void menu_tile_rfagc_refresh(void);
+static void rf_agc_apply_pga(void);
+static void rf_agc_poll(void);
+static void rtty_poll(void);
+static uint8_t rtty_scope_active(void);
+static void rtty_scope_panel_reset(void);
+static void rtty_text_panel_reset(void);
+static void rtty_text_force_redraw(void);
+static void rtty_scope_draw(void);
 static void apply_lo_tune(uint32_t freq_hz);
 static void menu_detail_value_redraw(void);
 static void settings_value_redraw(void);
@@ -54,6 +69,37 @@ static void settings_value_redraw(void);
 #if CALIB_HEIGHT_TEST
 static void calib_height_ruler_draw(void);
 #endif
+
+/*
+ * TUNE_START_HZ moved to config.h (CONFIG_TUNE_START_HZ) 07/08/2026,
+ * per the project owner - kept as a local alias so the many
+ * TUNE_START_HZ references below don't all need renaming. Still a
+ * #define, not just s_tune_hz's initializer, for the same ordering
+ * reason as before: main() needs this BEFORE s_tune_hz's own
+ * declaration (much further down this file) is visible - see main()'s
+ * apply_lo_tune() call right after ms5351_tune_captured() for why.
+ */
+#define TUNE_START_HZ CONFIG_TUNE_START_HZ
+
+/* Moved up from its old spot alongside s_menu_screen (much further
+ * down this file) - 08/08/2026, same reasoning as TUNE_START_HZ just
+ * above: main()'s own loop now reads this directly (the RTTY-scope
+ * menu-open guard, see main()'s comment there), and C needs the real
+ * declaration, not just a prototype, visible before that first use. */
+static uint8_t s_menu_open = 0U;
+
+/*
+ * Screen SLEEP (HW page's SLEEP tile) - added 10/08/2026, per the
+ * project owner, for long unattended listening sessions: kills the
+ * backlight and stops every bit of display-side work (spectrum/
+ * waterfall redraw, the RTTY scope, touch polling) to save battery
+ * and cut the EXMC bus traffic next to the RF front-end - see
+ * screen_sleep_enter()'s comment for the full reasoning and main()'s
+ * loop for exactly what does/doesn't keep running while this is set.
+ * Same "moved up, main() reads it directly" reasoning as s_menu_open
+ * just above.
+ */
+static uint8_t s_screen_asleep = 0U;
 
 volatile uint32_t g_msticks = 0; /* incremented in SysTick_Handler, 1 tick = 1ms real time */
 volatile uint16_t g_last_rddpm  = 0; /* last value read from RDDPM (0x0A00) */
@@ -250,6 +296,24 @@ int main(void)
     debug_print("\n--- MS5351: quadrature LO tune ---\n");
     ms5351_tune_captured();
 
+    /*
+     * ms5351_tune_captured() above ALWAYS replays the hardware-proven
+     * 90.8MHz capture, unconditionally - that's the whole point of a
+     * byte-exact smoke test, and it stays that way. But it means the
+     * LO is now sitting at 90.8MHz regardless of what s_tune_hz
+     * actually starts at (7.150.000MHz as of 07/08/2026 - see its
+     * declaration comment) - the two used to always match by
+     * construction (s_tune_hz's initializer WAS
+     * MS5351_CAPTURED_LO_HZ), but now that they're different values,
+     * something has to actually move the LO the rest of the way.
+     * That's this call: the normal computed-tuning path
+     * (ms5351_set_lo_freq(), same as every retune from the encoder/
+     * BANDS/keypad), run once here so the radio boots up actually
+     * listening where the frequency readout says it is, not just
+     * displaying the right number over a still-90.8MHz LO.
+     */
+    apply_lo_tune(TUNE_START_HZ);
+
 #if CALIB_HEIGHT_TEST
     calib_height_ruler_draw();
 #else
@@ -261,14 +325,131 @@ int main(void)
 
     while (1) {
 #if !CALIB_HEIGHT_TEST
-        sdr_spectrum_waterfall_tick();
-        demo_touch_poll();
-        tune_encoder_poll();
+        if (s_screen_asleep) {
+            /*
+             * Screen asleep (see screen_sleep_enter()'s and
+             * s_screen_asleep's comments) - deliberately does NOT call
+             * rtty_scope_poll()/rtty_scope_draw()/sdr_spectrum_
+             * waterfall_tick()/demo_touch_poll()/tune_encoder_poll()
+             * at all while this is set: that's exactly the EXMC
+             * display traffic and touch polling this mode exists to
+             * stop. rf_agc_poll()/rtty_poll() below still run every
+             * pass regardless (neither touches the display - see
+             * their own comments), same as the radio's actual
+             * demodulation/audio, which runs straight off the DMA ISR
+             * and was never routed through this loop to begin with -
+             * listening continues uninterrupted with the screen dark.
+             *
+             * Rotation and long-press are explicitly DISCARDED (read
+             * and thrown away, not left to accumulate) rather than
+             * simply not read - encoder_tick() keeps sampling at 1kHz
+             * from SysTick regardless of what this loop does, so an
+             * un-drained rotation would otherwise pile up sub-detent
+             * counts while asleep and suddenly apply as one big jump
+             * the instant tune_encoder_poll() resumes after waking.
+             * Only a SHORT press (encoder_take_press()) wakes - a
+             * long press does nothing here (not even the button's
+             * usual "reset from wherever it was" trick, since a
+             * long-press-while-asleep has no accumulated menu/detail
+             * state to reset in the first place).
+             */
+            (void)encoder_take_delta();
+            (void)encoder_take_long_press();
+            if (encoder_take_press()) {
+                screen_wake();
+            }
+        } else
+        {
+            static uint8_t s_rtty_scope_was_active = 0U;
+            static uint8_t s_rtty_mode_was_active = 0U; /* tracks active_now, NOT drawing_now - see below */
+            uint8_t active_now = rtty_scope_active();
+            /* Only actually DRAW the scope when the settings menu
+             * isn't covering the panel - added 08/08/2026, per the
+             * project owner: the scope never checked s_menu_open at
+             * all, so opening MENU/MODE while in RTTY-L/RTTY-U kept
+             * painting scope bars right over the menu underneath.
+             * sdr_spectrum_waterfall_tick() already has this exact
+             * same guard internally (see its own "Settings menu
+             * covers the spectrum+waterfall panel while open"
+             * comment) - this mirrors it for the scope's panel,
+             * which occupies the identical screen region. */
+            uint8_t drawing_now = (uint8_t)(active_now && !s_menu_open);
+
+            rtty_scope_poll(); /* keep the FFT data fresh regardless - cheap, and matches
+                                 * sdr_spectrum_waterfall_tick()'s own "accumulate even while
+                                 * hidden" behavior, so there's no stale-data jolt on reopen. */
+            if (drawing_now && !s_rtty_scope_was_active) {
+                /* Fires on EITHER transition into showing the scope:
+                 * switching into RTTY-L/RTTY-U from elsewhere, OR the
+                 * menu just closing while RTTY was already the active
+                 * mode the whole time it was open (active_now stayed
+                 * true throughout, only drawing_now flips) - the TRACE
+                 * always gets a fresh paint either way, since whatever
+                 * was on screen right now isn't a valid diff baseline
+                 * for the bars/markers. */
+                rtty_scope_panel_reset();
+                if (active_now && !s_rtty_mode_was_active) {
+                    /* Genuinely JUST switched into RTTY-L/RTTY-U from
+                     * a different mode - actually clear the text
+                     * grid's CONTENT, a fresh decode session starting
+                     * from nothing (see rtty_text_panel_reset()'s
+                     * comment), and discard any partial multi-window
+                     * average left over from before the switch (see
+                     * rtty_scope_avg_reset()'s comment) so the first
+                     * displayed trace is a clean average, not a blend
+                     * that includes windows from whatever was tuned
+                     * in before. */
+                    rtty_text_panel_reset();
+                    rtty_scope_avg_reset();
+                } else {
+                    /* Was already in RTTY mode the whole time the menu
+                     * was open (active_now never flipped) - the
+                     * SCROLLBACK TEXT is still exactly right, only the
+                     * physical pixels under the menu went stale.
+                     * rtty_text_panel_reset() would wrongly wipe every
+                     * decoded line just because the person checked
+                     * MODE/SHIFT/BAUD - repaint only, via
+                     * rtty_text_force_redraw() (added 10/08/2026, per
+                     * the project owner, fixing exactly this). */
+                    rtty_text_force_redraw();
+                }
+            }
+            s_rtty_scope_was_active = drawing_now;
+            s_rtty_mode_was_active = active_now;
+
+            if (drawing_now) {
+                rtty_scope_draw();
+            } else {
+                /* Covers BOTH "not in RTTY mode" and "menu is open" -
+                 * sdr_spectrum_waterfall_tick() already skips its own
+                 * drawing internally while s_menu_open, so it's always
+                 * safe to call here regardless of which of those two
+                 * reasons drawing_now was false for. */
+                sdr_spectrum_waterfall_tick();
+            }
+            demo_touch_poll();
+            tune_encoder_poll();
+        }
+        rf_agc_poll(); /* RF-level (analog PGA) auto-AGC - see its own comment */
+        rtty_poll(); /* drains rtty.c's decoded text to debug UART - see its own comment */
 #endif
 
         g_fill_count++;
 
-        if ((g_fill_count % 50) == 0) {
+        if ((g_fill_count % 50) == 0
+            /* Suppressed while the RTTY scope is showing - added
+             * 08/08/2026, per the project owner: this ISR/waterfall
+             * timing dump fires every ~50 loop passes REGARDLESS of
+             * what's being tested, and during an RTTY session it
+             * drowns out the sparse "rtty: <decoded text>" lines
+             * (rtty_poll()'s output) that actually matter right now.
+             * Not gated on DEBUG_UART_ENABLED alone because this
+             * block's own content (ISR cycle counts, block budget)
+             * is irrelevant to an RTTY tuning session either way -
+             * this isn't about reducing UART traffic, it's about
+             * signal-to-noise in the log. */
+            && !rtty_scope_active()
+           ) {
             debug_print_dec("waterfall ticks", g_fill_count);
             /* ISR timing check (see demod_am.h's comment above
              * demod_am_get_last_cycles()): one block's real-time
@@ -468,7 +649,8 @@ typedef enum {
     ENCODER_TARGET_SQUELCH,
     ENCODER_TARGET_SMOOTH,
     ENCODER_TARGET_PGA,
-    ENCODER_TARGET_NR
+    ENCODER_TARGET_NR,
+    ENCODER_TARGET_RTTY_SHIFT
 } encoder_target_t;
 
 /*
@@ -522,7 +704,6 @@ typedef enum {
  *     at most - imperceptible.
  */
 static ui_screen_t s_menu_screen;
-static uint8_t s_menu_open = 0U;
 /* s_menu_detail_active: 0 = grid showing, 1 = a detail view showing.
  * s_menu_detail_target: WHICH detail view, when active - reuses
  * encoder_target_t rather than inventing a parallel enum, since the
@@ -546,6 +727,31 @@ static uint8_t s_menu_bands_active = 0U;
  * even though nothing branches on them today beyond set/reset. */
 static uint8_t s_menu_step_active = 0U;
 static uint8_t s_menu_mode_active = 0U;
+/* s_menu_freq_active: same bookkeeping idea as s_menu_step_active/
+ * s_menu_mode_active above, for the frequency-entry keypad (added
+ * 07/08/2026, per the project owner: tap the frequency readout in the
+ * top bar to type a new one instead of only being able to spin the
+ * encoder or use a band preset). Opened straight from
+ * demo_touch_poll()'s top-bar tap check, not from the settings grid -
+ * same "no parent grid" situation as STEP/MODE. */
+static uint8_t s_menu_freq_active = 0U;
+/*
+ * s_freq_entry_value/s_freq_entry_digits: the digits typed so far on
+ * the keypad, plain integer accumulation (value = value*10 + digit),
+ * no decimal point - see menu_freq_keypad_show()'s comment for why:
+ * the kHz/MHz accept buttons already cover fractional MHz entry (type
+ * "146520" + kHz = 146.520MHz) without needing float parsing on a
+ * bare-metal target. Capped at FREQ_ENTRY_MAX_DIGITS so the value
+ * itself never risks overflowing uint32_t (999,999,999 fits easily);
+ * the SEPARATE overflow risk - value*1000000 for the MHz button -
+ * is handled in the accept callback via a uint64_t intermediate, not
+ * here. Reset to 0/0 every time the keypad opens (menu_freq_keypad_
+ * show()), never pre-filled with the current frequency - typing a
+ * fresh number is the whole point, and starting blank avoids any
+ * "do I need to clear this first" confusion. */
+#define FREQ_ENTRY_MAX_DIGITS 9U
+static uint32_t s_freq_entry_value = 0U;
+static uint8_t  s_freq_entry_digits = 0U;
 /*
  * --- Settings grid PAGES (RADIO / UI / HW) -------------------------------
  *
@@ -558,23 +764,33 @@ static uint8_t s_menu_mode_active = 0U;
  * WHAT the grid shows), so there's no separate "is a page open"
  * boolean, just which page.
  *
- * menu_page_select_callback() is the page tiles' shared callback -
- * switches s_menu_page and re-runs menu_grid_show() to repaint both
- * the (now differently-highlighted) page column and the new page's
- * options in one go. See menu_grid_show()'s own comment for the slot
- * layout of the options side.
+ * menu_page_step_callback() is column 0's shared PREV/NEXT callback -
+ * steps s_menu_page (wrapping) and re-runs menu_grid_show() to repaint
+ * both the pager (new current-page name) and the new page's options in
+ * one go - see this file's "Settings grid PAGES" / PAGINATION comment
+ * for the full column-0 layout this replaced menu_page_select_callback()
+ * with on 09/08/2026.
  */
 typedef enum {
     MENU_PAGE_RADIO = 0,
     MENU_PAGE_UI,
     MENU_PAGE_HW,
+    MENU_PAGE_DIG, /* digital-mode (RTTY) params - added 09/08/2026, see this file's PAGINATION comment */
     MENU_PAGE_COUNT
 } menu_page_t;
 
+/* Display name for each page - the pager's row-1 label (see
+ * menu_grid_show()) just indexes this by s_menu_page, so adding a
+ * future page never needs a new switch/if chain there, only a new
+ * entry here (kept in the same MENU_PAGE_* order by construction). */
+static const char *const k_menu_page_names[MENU_PAGE_COUNT] = {
+    "RADIO", "UI", "HW", "DIG"
+};
+
 static menu_page_t s_menu_page = MENU_PAGE_RADIO;
-static ui_button_t s_menu_page_radio;
-static ui_button_t s_menu_page_ui;
-static ui_button_t s_menu_page_hw;
+static ui_button_t s_menu_page_prev;
+static ui_button_t s_menu_page_label; /* row 1 - informational only, enabled=0 (see ui_screen_add_button()'s comment in ui.c) */
+static ui_button_t s_menu_page_next;
 static ui_button_t s_menu_tile_agc;
 static ui_button_t s_menu_tile_squelch;
 static ui_button_t s_menu_tile_backlight;
@@ -586,8 +802,13 @@ static ui_button_t s_menu_tile_spec_style; /* spectrum trace style toggle, added
 static ui_button_t s_menu_tile_zoom; /* spectrum/waterfall zoom, see spec_zoom_t below */
 static ui_button_t s_menu_tile_bw; /* AM/SSB audio filter width selector (4K0/2K3/1K8) - repurposed 02/08/2026 from the grid's BANDS tile, see menu_tile_bw_callback()'s comment */
 static ui_button_t s_menu_tile_pga; /* AIC3204 MIC_PGA analog input gain - fills the grid's last spare slot */
+static ui_button_t s_menu_tile_rfagc; /* RF-level auto-AGC (PGA backoff) toggle, added 07/08/2026 - fills RADIO slot 6 */
+static ui_button_t s_menu_tile_rtty_shift; /* RTTY mark/space separation, added 08/08/2026 - fills DIG slot 0 (moved off RADIO 09/08/2026, see the "Settings grid PAGES" comment) */
+static ui_button_t s_menu_tile_rtty_baud;  /* RTTY bit rate, added 09/08/2026 - DIG slot 1, see rtty_set_baud()'s comment */
+static ui_button_t s_menu_tile_rtty_inv;   /* RTTY station NORMAL/REVERSE convention, added 09/08/2026 - DIG slot 2, see rtty_set_station_inverted()'s comment */
 static ui_button_t s_menu_tile_nr; /* NR (Spectral Subtraction) strength, AM/USB/LSB only - see nr_ss.h, fills RADIO page slot 5 */
 static ui_button_t s_menu_tile_speaker_pa; /* speaker PA enable/mute (PB7) - HW page, see its own comment */
+static ui_button_t s_menu_tile_sleep; /* screen SLEEP one-shot action - HW page, added 10/08/2026, see screen_sleep_enter()'s comment */
 /* s_speaker_pa_enabled: backs BOTH the tile's label (menu_tile_speaker_pa_refresh())
  * and the actual GPIO level (speaker_pa_set_enabled(), defined down
  * with the rest of the GPIO drivers near led_gpio_init() - declared
@@ -610,6 +831,11 @@ static char s_menu_tile_backlight_buf[16];
 static char s_menu_tile_volume_buf[16];
 static char s_menu_tile_pga_buf[16];
 static char s_menu_tile_nr_buf[16];
+static char s_menu_tile_rtty_shift_buf[16];
+static char s_menu_tile_rtty_baud_buf[16];
+/* s_menu_tile_rtty_inv needs no buffer - only two possible strings
+ * ("INV NORM"/"INV REV"), same "point straight at a literal" shape as
+ * s_menu_tile_speaker_pa's SPK ON/OFF. */
 static char s_menu_tile_nb_buf[16];
 static char s_menu_tile_smooth_buf[16];
 static char s_menu_tile_spec_style_buf[16];
@@ -648,10 +874,15 @@ static uint8_t s_spec_smooth_passes = 0U;
 /*
  * --- Encoder-driven tuning state -----------------------------------
  *
- * s_tune_hz starts at the captured LO (90.800MHz, set by
- * ms5351_tune_captured() during startup); the first encoder movement
- * switches over to ms5351_set_lo_freq(), which for that exact
- * frequency emits the same registers, so the transition is seamless.
+ * s_tune_hz starts at 7.150.000MHz (40m band, AM/general-coverage
+ * starting point) - CHANGED 07/08/2026 from MS5351_CAPTURED_LO_HZ
+ * (90.8MHz), per the project owner: the radio boots into AM mode
+ * (see demod_am.c's s_mode initializer), and 90.8MHz - deep in FM
+ * broadcast - made no sense to land on with AM selected. See
+ * main()'s call to apply_lo_tune(s_tune_hz) right after
+ * ms5351_tune_captured() for how the LO actually gets moved off the
+ * captured-replay frequency to this one at boot - the two are
+ * decoupled on purpose now, see that comment.
  *
  * The button cycles the tuning step. Limits: 100kHz is
  * ms5351_set_lo_freq()'s own LOWF_FLOOR_HZ (see ms5351.c) - lowered
@@ -663,7 +894,7 @@ static uint8_t s_spec_smooth_passes = 0U;
 #define TUNE_MIN_HZ 100000UL
 #define TUNE_MAX_HZ 180000000UL
 
-static uint32_t s_tune_hz = MS5351_CAPTURED_LO_HZ;
+static uint32_t s_tune_hz = TUNE_START_HZ;
 /* Extended 31/07/2026 (100/1K/10K/100K/1M -> 8 steps) to cover the
  * channel spacings real bands actually use, needed for the BANDS
  * presets below (each preset picks an INDEX into this array, see
@@ -696,7 +927,11 @@ static const char *k_tune_step_labels[] = {
     "100 ", "1K  ", "5K  ", "10K ", "12K5", "25K ", "100K", "1M  "
 };
 #define TUNE_STEP_COUNT (sizeof(k_tune_steps) / sizeof(k_tune_steps[0]))
-static uint8_t s_tune_step_idx = 6; /* start at 100kHz (index shifted by the 31/07/2026 table extension - was index 3 in the old 5-entry table) - handy in the FM band the capture left us in */
+static uint8_t s_tune_step_idx = CONFIG_TUNE_START_STEP_IDX; /* see config.h -
+    was BAND_STEP_100K (100kHz, fine for the old FM-broadcast startup
+    frequency, useless for HF voice tuning - a single click would jump
+    clean past a QSO). Changed 07/08/2026 alongside CONFIG_TUNE_START_HZ -
+    if you change one, check whether the other still makes sense too. */
 
 /* STEP picker list - added 01/08/2026, replaces the old "STEP button
  * just cycles to the next entry" behavior with a real pick-from-a-list
@@ -713,21 +948,67 @@ static ui_button_t s_menu_step_tiles[TUNE_STEP_COUNT];
  * a pick screen (see menu_mode_list_show()). label+demod_mode_t pairs
  * in that same order, purely so the grid fills left-to-right/top-to-
  * bottom in the order people expect from the old cycle.
+ *
+ * RTTY-L/RTTY-U added 08/08/2026, per the project owner, once the
+ * RTTY decoder + tuning scope were validated against a real signal
+ * and graduated from a debug-build-only tool to a real mode. Both map
+ * to a REAL underlying demod_mode_t (LSB/USB respectively) - RTTY
+ * isn't its own demodulator, it's two audio tones inside an SSB
+ * passband, so the actual RF demod stays plain LSB/USB; what these
+ * two entries ADD on top is switching rtty_get_enabled() on and
+ * setting mark/space for the correct polarity (see
+ * menu_mode_preset_callback()'s rtty_variant handling right below).
+ *
+ * The polarity difference is real, not a firmware quirk: USB and LSB
+ * are mirror images of each other in frequency for the same pair of
+ * RF tones, so whichever audio tone is "mark" in one becomes "space"
+ * in the other at the same nominal Hz - confirmed by the project
+ * owner needing to flip the transmitter's own inversion setting to
+ * get a clean decode in USB after LSB worked normally. RTTY_VARIANT_
+ * INVERTED swaps CONFIG_RTTY_MARK_HZ/SPACE_HZ's roles for exactly
+ * this reason, so the person doesn't have to remember to touch their
+ * transmitter (or config.h) when switching which sideband they're
+ * listening on.
  */
+typedef enum {
+    RTTY_VARIANT_NONE = 0,     /* plain mode - selecting this turns RTTY OFF if it was on */
+    RTTY_VARIANT_NORMAL,       /* RTTY on, mark/space as config.h's CONFIG_RTTY_MARK_HZ/SPACE_HZ */
+    RTTY_VARIANT_INVERTED      /* RTTY on, mark/space SWAPPED - see this block's comment above */
+} rtty_variant_t;
+
 typedef struct {
     const char *label;
     demod_mode_t mode;
+    rtty_variant_t rtty_variant;
 } demod_mode_entry_t;
 
 static const demod_mode_entry_t k_demod_modes[] = {
-    { "AM",  DEMOD_MODE_AM  },
-    { "USB", DEMOD_MODE_USB },
-    { "LSB", DEMOD_MODE_LSB },
-    { "NFM", DEMOD_MODE_NFM },
-    { "WFM", DEMOD_MODE_WFM }
+    { "AM",     DEMOD_MODE_AM,  RTTY_VARIANT_NONE },
+    { "USB",    DEMOD_MODE_USB, RTTY_VARIANT_NONE },
+    { "LSB",    DEMOD_MODE_LSB, RTTY_VARIANT_NONE },
+    { "NFM",    DEMOD_MODE_NFM, RTTY_VARIANT_NONE },
+    { "WFM",    DEMOD_MODE_WFM, RTTY_VARIANT_NONE },
+    { "RTTY-L", DEMOD_MODE_LSB, RTTY_VARIANT_NORMAL   }, /* confirmed correct polarity on LSB, 08/08/2026 */
+    { "RTTY-U", DEMOD_MODE_USB, RTTY_VARIANT_INVERTED }  /* USB mirrors LSB - see this block's comment */
 };
 #define DEMOD_MODE_ENTRY_COUNT (sizeof(k_demod_modes) / sizeof(k_demod_modes[0]))
 static ui_button_t s_menu_mode_tiles[DEMOD_MODE_ENTRY_COUNT];
+
+/*
+ * --- Frequency-entry keypad ----------------------------------------------
+ *
+ * 15 of the 16 grid cells (see FREQ_KEYPAD_* geometry above) - the
+ * 16th (BACK) reuses the shared s_menu_detail_back widget/callback,
+ * same as STEP/MODE's picker lists do, rather than allocating a
+ * second BACK button that would do the exact same thing.
+ * Index layout, 4 cols x 4 rows, row-major (matches
+ * menu_freq_keypad_show()'s loop):
+ *   row0: 1 2 3 DEL
+ *   row1: 4 5 6 CLR
+ *   row2: 7 8 9 (BACK lives here, col 3 - shared widget, not in this array)
+ *   row3: Hz 0 kHz MHz
+ */
+static ui_button_t s_menu_freq_tiles[15];
 
 /*
  * --- BANDS presets -------------------------------------------------------
@@ -846,10 +1127,91 @@ static int16_t s_volume_db_x2 = 0;
  * direction). Starts at 40 (20.0dB) - the byte-exact captured
  * baseline aic3204_phase2_init() leaves the chip at (0x28), so
  * turning the encoder for the first time doesn't jump the gain. */
-static int16_t s_pga_gain_db_x2 = 40;
+static int16_t s_pga_gain_db_x2 = CONFIG_PGA_START_DB_X2; /* see config.h */
 #define PGA_STEP_X2 2   /* 2 * 0.5dB = 1.0dB per encoder detent */
 #define PGA_MIN_X2  0   /* 0.0dB */
 #define PGA_MAX_X2  95  /* 47.5dB - see aic3204_set_pga_gain_db()'s field-range note */
+
+/*
+ * --- RF-level (analog PGA) auto-AGC -------------------------------------
+ *
+ * Added 07/08/2026, per the project owner, after ruling out the
+ * digital AM/SSB AGC's own math as the cause of "señales muy fuertes
+ * saturan la radio del todo" (see demod_am.c's AGC comment - instant
+ * attack, no lower gain clamp, mathematically fine for any input
+ * short of the ADC itself having already clipped). If the front end
+ * clips before ANY of that digital chain runs, no amount of correct
+ * downstream gain math can undo it - the fix has to happen at the
+ * PGA, upstream of the ADC, which is what this does automatically
+ * instead of requiring a manual PGA tweak every time a strong station
+ * shows up.
+ *
+ * s_pga_gain_db_x2 above KEEPS its existing meaning unchanged: it's
+ * the user's manual setting via the encoder/PGA menu tile - now
+ * treated as a CEILING this auto-AGC never exceeds, not the literal
+ * applied gain anymore. The actual applied gain is always
+ * (s_pga_gain_db_x2 - s_rf_agc_backoff_x2), computed and pushed to
+ * the codec by rf_agc_apply_pga() - the ONLY place that's allowed to
+ * call aic3204_set_pga_gain_db() now (see that function's other two
+ * former call sites, both switched over to it below).
+ *
+ * s_rf_agc_enabled is a genuine master on/off switch, independent of
+ * the backoff amount - same "toggle separate from the value" shape as
+ * s_nr_on/nr_ss_get_enabled(), per the project owner ("como el botón
+ * NR"). Defaults OFF: this changes what gets written to the codec
+ * autonomously, based on a heuristic (rf_clip_scan()'s threshold/
+ * count in demod_am.c) - opt-in like every other automatic-behavior
+ * feature in this codebase (NR, NB historically), not a surprise for
+ * someone who hasn't asked for it. While off, rf_agc_apply_pga()
+ * still runs (from the two "settings changed" call sites) but always
+ * computes effective gain = ceiling - 0 = ceiling, i.e. plain manual
+ * PGA exactly as before this feature existed.
+ *
+ * Backoff/recovery ballistics mirror the digital AGC's own philosophy
+ * (fast to protect against clipping, slow to back off from that
+ * protection) but on a MUCH coarser timescale, because unlike the
+ * digital AGC's per-sample math this drives a bit-banged I2C
+ * transaction - RF_AGC_ATTACK_COOLDOWN_MS keeps repeated clip
+ * detections from spamming the I2C bus faster than the codec/bus can
+ * sanely keep up with, and RF_AGC_RELEASE_COOLDOWN_MS is deliberately
+ * many seconds (not milliseconds) so recovery only happens once the
+ * signal has ACTUALLY dropped for a while, not during the natural
+ * peaks/troughs of a single strong signal's own modulation - a fast
+ * release here would just pump the gain up and down audibly in sync
+ * with the strong station's own audio envelope, the same "release too
+ * fast" pumping problem the digital AGC's profile choices already
+ * exist to avoid, just one level up the chain.
+ *
+ * Rin escalation - added same day, per the datasheet's "Analog PGA
+ * versus Input Configuration" table (2.3.2.1): PGA backoff alone tops
+ * out at RF_AGC_BACKOFF_MAX_X2 (the PGA register's own 0dB floor,
+ * relative to whatever Rin is active). If a signal is STILL clipping
+ * once backoff is maxed, there's no more PGA-register room - the next
+ * escalation step instead switches aic3204_set_input_impedance() up
+ * one level (10k->20k->40k), which shifts the WHOLE gain range down
+ * another 6dB, and simultaneously gives back RF_AGC_RIN_STEP_X2 of
+ * PGA backoff (since the Rin step itself just provided that same 6dB
+ * of attenuation) so the transition is a smooth net 6dB step down,
+ * not an abrupt 12dB jump, and so there's PGA-register headroom again
+ * to keep fine-tuning within the new range. De-escalation mirrors
+ * this in reverse once backoff would go negative at the current Rin
+ * level. See rf_agc_escalate_rin()/rf_agc_deescalate_rin() and
+ * aic3204_set_input_impedance()'s own comment for the
+ * *** IMPORTANT UNVERIFIED ASSUMPTION *** about the 20k/40k register
+ * values - worth confirming on real hardware before trusting this
+ * escalation path blindly.
+ */
+static uint8_t  s_rf_agc_enabled = 0U;
+static int16_t  s_rf_agc_backoff_x2 = 0;      /* 0..RF_AGC_BACKOFF_MAX_X2, in 0.5dB units */
+static uint8_t  s_rf_agc_rin_level = 0U;      /* aic3204_rin_t - 0=10k/1=20k/2=40k, see rf_agc_escalate_rin() */
+static uint32_t s_rf_agc_last_action_ms = 0U; /* g_msticks at the last backoff/recovery/Rin step */
+static uint32_t s_rf_agc_last_clip_ms = 0U;   /* g_msticks at the last DETECTED clip - the release timer's reference point */
+#define RF_AGC_STEP_X2              CONFIG_RF_AGC_STEP_X2             /* see config.h */
+#define RF_AGC_BACKOFF_MAX_X2       CONFIG_RF_AGC_BACKOFF_MAX_X2      /* see config.h */
+#define RF_AGC_RIN_STEP_X2          CONFIG_RF_AGC_RIN_STEP_X2         /* see config.h */
+#define RF_AGC_ATTACK_COOLDOWN_MS   CONFIG_RF_AGC_ATTACK_COOLDOWN_MS  /* see config.h */
+#define RF_AGC_RELEASE_COOLDOWN_MS  CONFIG_RF_AGC_RELEASE_COOLDOWN_MS /* see config.h */
+
 /* NR strength (Spectral Subtraction, AM/USB/LSB only - see nr_ss.h and
  * demod_am.c's NR INTEGRATION comment). RAW 0-4095, same native units
  * as nr_ss_set_strength() itself (was 0-100% mapped internally until
@@ -1104,6 +1466,16 @@ static void mode_display_draw(void)
     gfx_text((uint16_t)MODE_X, MODE_Y, label, color, GFX_COLOR_DARKGRAY, 3);
 }
 
+/*
+ * Not a ui_button_t on purpose, even though it's tappable (see
+ * demo_touch_poll()'s s_freq_tap_active) - ui_button_draw() always
+ * fills its whole rect with btn->bg on every press/release, which
+ * would blank these digits on every touch and need patching right
+ * back in the callback. Easier and glitch-free to keep this a plain
+ * gfx_text() readout and do the hit-test as a raw coordinate check
+ * outside the ui_screen framework instead, same treatment the
+ * spectrum drag-to-tune zone already gets.
+ */
 static void freq_display_draw(void)
 {
     char buf[FREQ_FIELD_CHARS + 1];
@@ -1494,12 +1866,34 @@ static uint8_t smeter_segments_from_peak(float peak)
  *               it does nothing - those modes have their own fixed
  *               filters, unrelated to this selector, see
  *               audio_bw_button_callback()'s comment.
- *   PRE       - preamp: no such hardware control has been identified
- *               on this board, shown dark (off) as a placeholder for
- *               the layout. ATT (attenuator, same story) was dropped
- *               from this grid to make room for BW's move - if a real
- *               attenuator control ever gets added, it'll need a new
- *               home rather than reclaiming this exact slot.
+ *   OVR       - RF-level auto-AGC overload indicator (added
+ *               07/08/2026), reusing this exact slot - was PRE
+ *               (preamp: no such hardware control was ever identified
+ *               on this board, shown dark as a placeholder). Lit RED
+ *               whenever s_rf_agc_backoff_x2 > 0, i.e. the RF-AGC
+ *               (main.c's rf_agc_poll()/s_rf_agc_enabled) is actively
+ *               holding the PGA below the user's manual ceiling right
+ *               now because it detected front-end clipping - see that
+ *               feature's own declaration comment. Deliberately a
+ *               BADGE, not the RFAGC grid tile's own label (which
+ *               only shows plain ON/OFF now) - a badge lives in the
+ *               always-visible right column, outside MENU_AREA, so
+ *               rf_agc_poll() can safely redraw it from the
+ *               background at any time, no matter what's showing in
+ *               the menu. The grid tile used to show the live backoff
+ *               amount directly on itself; that redraw fired from the
+ *               same background poll and could land while some OTHER
+ *               MENU_AREA sub-screen (e.g. the PGA detail view) was
+ *               on screen, painting stale tile graphics over live
+ *               content - exactly the corruption class
+ *               menu_tile_bw_callback()'s own guard comment already
+ *               warned about, just triggered from a background timer
+ *               instead of a one-off user action. ATT (attenuator,
+ *               same "no real placeholder" story as the old PRE) was
+ *               dropped from this grid earlier to make room for BW's
+ *               move - if a real attenuator control ever gets added,
+ *               it'll need a new home rather than reclaiming this
+ *               slot too.
  */
 #define BADGE_W 55
 #define BADGE_H 26
@@ -1516,6 +1910,20 @@ static const char *k_agc_profile_labels[4] = { "MAN", "SLW", "MED", "FST" };
 /* Indexed directly by audio_bw_t (demod_am.h) - AUDIO_BW_4K0,
  * AUDIO_BW_2K3, AUDIO_BW_1K8 in that order. */
 static const char *k_audio_bw_labels[3] = { "4K0", "2K3", "1K8" };
+
+/* RTTY BAUD tile table (DIG page) - added 09/08/2026, per the project
+ * owner. Cycles the bit rate through the common ham/commercial rates,
+ * same "index into a table, don't try to read the float back and
+ * match it" shape as k_audio_bw_labels/agc_profile_t already use for
+ * their own cycles (float equality after a round-trip through
+ * rtty_get_baud() would be fragile - the index is the source of
+ * truth here, rtty_set_baud() just gets told the resulting value).
+ * Starts at index 1 (50 baud) to match config.h's CONFIG_RTTY_BAUD
+ * default - see menu_tile_rtty_baud_callback()'s comment. */
+static const float       k_rtty_baud_values[4] = { 45.45f, 50.0f, 75.0f, 100.0f };
+static const char *const k_rtty_baud_labels[4] = { "45.45", "50", "75", "100" };
+#define RTTY_BAUD_COUNT 4U
+static uint8_t s_rtty_baud_idx = 1U;
 /* Same indexing, in Hz - the nominal -3dB corner each ALPF_*_COEFFS
  * table was designed for (see their comments in demod_am.c). Added
  * 03/08/2026 for the spectrum panadapter's demodulated-bandwidth tint
@@ -1526,27 +1934,43 @@ static const char *k_audio_bw_labels[3] = { "4K0", "2K3", "1K8" };
 static const uint32_t k_audio_bw_hz[3] = { 4000UL, 2300UL, 1800UL };
 
 /*
- * Cycles MANUAL -> SLOW -> MEDIUM -> FAST -> MANUAL and redraws
- * s_btn_agc_profile - shared by BOTH ways to trigger this now:
- * tapping the badge/button itself (agc_profile_button_callback()
- * below) and the NR bottom-bar button (see demo_button_callback()'s
- * NR branch, repurposed 31/07/2026 - a quick, deliberately temporary
- * stopgap since NR's noise-reduction toggle was never wired to real
- * DSP anyway, ahead of a proper settings-menu redesign the project
- * owner is planning for later the same day, once the badge grid ran
- * out of comfortable room for more controls). Factored out so both
- * entry points can't drift out of sync with each other.
+ * Cycles SLOW -> MEDIUM -> FAST -> SLOW and redraws s_btn_agc_profile
+ * - shared by BOTH ways to trigger this now: tapping the badge/button
+ * itself (agc_profile_button_callback() below) and the NR bottom-bar
+ * button (see demo_button_callback()'s NR branch, repurposed
+ * 31/07/2026 - a quick, deliberately temporary stopgap since NR's
+ * noise-reduction toggle was never wired to real DSP anyway, ahead of
+ * a proper settings-menu redesign the project owner is planning for
+ * later the same day, once the badge grid ran out of comfortable room
+ * for more controls). Factored out so both entry points can't drift
+ * out of sync with each other.
+ *
+ * MANUAL removed from the cycle 07/08/2026, per the project owner
+ * ("no tiene sentido por ahora") - the enum value, the demod_am.c
+ * MANUAL branch (fixed unity gain, peak-tracking bypassed), and
+ * k_agc_profile_labels[0]="MAN" are all left exactly as they were on
+ * purpose: nothing reachable from the UI can ever land on MANUAL
+ * again (s_agc_profile starts at MEDIUM and this cycle no longer
+ * mentions it), but the underlying support isn't ripped out, in case
+ * it's worth reviving later. If MANUAL is ever wanted back, this is
+ * the only place that needs a case re-added.
  */
 static void agc_profile_cycle(void)
 {
     agc_profile_t p = demod_am_get_agc_profile();
 
     switch (p) {
-    case AGC_PROFILE_MANUAL: p = AGC_PROFILE_SLOW;   break;
     case AGC_PROFILE_SLOW:   p = AGC_PROFILE_MEDIUM; break;
     case AGC_PROFILE_MEDIUM: p = AGC_PROFILE_FAST;   break;
+    case AGC_PROFILE_MANUAL: /* unreachable now - see this function's
+                               * comment - but if it's ever seen here
+                               * anyway, fall through to the same
+                               * "start the real cycle over" recovery
+                               * as FAST rather than a 4th distinct
+                               * case, so a leftover/persisted MANUAL
+                               * value can't get stuck forever. */
     case AGC_PROFILE_FAST:
-    default:                  p = AGC_PROFILE_MANUAL; break;
+    default:                  p = AGC_PROFILE_SLOW;   break;
     }
     demod_am_set_agc_profile(p);
     debug_print("agc: profile now ");
@@ -1635,7 +2059,7 @@ static void badges_draw(void)
     s_btn_audio_bw.bg = bw_interactive ? GFX_COLOR_CYAN : GFX_COLOR_DARKGRAY;
     s_btn_audio_bw.fg = bw_interactive ? GFX_COLOR_BLACK : GFX_COLOR_GRAY;
     ui_button_draw(&s_btn_audio_bw);
-    badge_draw(BADGE_X1, (uint16_t)(BADGE_Y0 + 2 * BADGE_ROW_STEP), "PRE", 0U, GFX_COLOR_GREEN);
+    badge_draw(BADGE_X1, (uint16_t)(BADGE_Y0 + 2 * BADGE_ROW_STEP), "OVR", (uint8_t)(s_rf_agc_backoff_x2 > 0), GFX_COLOR_RED);
 }
 
 /*
@@ -1656,24 +2080,47 @@ static void badges_draw(void)
  * REDESIGNED 03/08/2026, per the project owner, from one flat 4x3
  * grid of 12 interchangeable tiles into a PAGED layout:
  *
- *   - Column 0 (all 3 rows): a fixed PAGE SELECTOR - RADIO / UI / HW,
- *     one tile per row, always present and never changing. These
- *     tiles look visually DISTINCT from the option tiles beside them
- *     (ORANGE-accented instead of the CYAN/DARKGRAY/YELLOW palette
- *     the option tiles use - see menu_page_select_callback()'s
- *     styling) precisely so "this switches pages" reads differently
- *     at a glance from "this is a page's option". The currently
- *     selected page is solid ORANGE-on-BLACK; the other two are
- *     outlined (BLACK-on-BLACK fill, ORANGE text/border).
- *   - Columns 1-3 (all 3 rows = 9 slots): that page's OPTIONS, laid
- *     out row-major (slot 0 = row0/col1, slot 1 = row0/col2, ...,
- *     slot 7 = row2/col2). Slot 8 (row2/col3, bottom-right) is
- *     ALWAYS EXIT, regardless of which page is selected - it closes
- *     the whole menu (menu_screen_close()), same as the
- *     long-press-the-knob gesture does from anywhere (see
+ *   - Column 0 (all 3 rows): page NAVIGATION, always present and
+ *     never changing shape - see the PAGINATION note below for what
+ *     lives in it now.
+ *   - Columns 1-3 (all 3 rows = 9 slots): the selected page's
+ *     OPTIONS, laid out row-major (slot 0 = row0/col1, slot 1 =
+ *     row0/col2, ..., slot 7 = row2/col2). Slot 8 (row2/col3,
+ *     bottom-right) is ALWAYS EXIT, regardless of which page is
+ *     selected - it closes the whole menu (menu_screen_close()), same
+ *     as the long-press-the-knob gesture does from anywhere (see
  *     tune_encoder_poll()'s comment). A page that doesn't fill all 8
- *     option slots just leaves the rest empty (black) - HW starts
- *     with zero tiles today, deliberately, for future additions.
+ *     option slots just leaves the rest empty (black).
+ *
+ * PAGINATION, added 09/08/2026, per the project owner: column 0 was
+ * originally a fixed 3-tile PAGE SELECTOR, one tile per row, one page
+ * per tile (RADIO/UI/HW - fit exactly because there were exactly 3
+ * pages). That doesn't scale - MENU_AREA_H only has room for 3 tile
+ * rows total (see the height-budget comment on FREQ_KEYPAD's geometry
+ * just below for how tight that already is), so a 4th page (DIG, see
+ * below) has nowhere to add a 4th row. Column 0 is now a PAGER
+ * instead, reusing the exact same 3 slots regardless of how many
+ * pages exist:
+ *   - Row 0: "PREV" - steps s_menu_page back one, wrapping from page 0
+ *     to the last page.
+ *   - Row 1: the CURRENT page's name (k_menu_page_names[]), solid
+ *     ORANGE-on-BLACK same as the old "selected" look - purely
+ *     informational (enabled=0, see ui_screen_add_button()'s comment
+ *     in ui.c for what that does: still painted, never reacts to
+ *     touch) since it can't mean "switch to this page", it already IS
+ *     this page.
+ *   - Row 2: "NEXT" - steps s_menu_page forward one, wrapping from the
+ *     last page back to 0.
+ * Both PREV/NEXT share menu_page_step_callback() (direction via
+ * user_data, same (void*)(uintptr_t) pattern the old per-page
+ * callback used), styled ORANGE-outlined (BLACK-on-BLACK fill, ORANGE
+ * text/border) same as the old unselected page tiles - visually
+ * distinct from the CYAN/DARKGRAY/YELLOW palette the option tiles use,
+ * so "this changes pages" still reads differently from "this is a
+ * page's option" at a glance. Adding a 5th, 6th, ... page later is
+ * just another menu_page_t enum value + k_menu_page_names[] entry + a
+ * switch case in menu_grid_show() below - column 0 itself never needs
+ * to change again.
  *
  * Per-page option assignment (all pre-existing tiles, just
  * relocated - no settings were dropped):
@@ -1687,14 +2134,27 @@ static void badges_draw(void)
  *                       polarity UNCONFIRMED as of 03/08/2026).
  *                       Slots 1-7 reserved for future hardware
  *                       settings.
+ *   DIG   (slots 0-2), added 09/08/2026: digital-mode (currently just
+ *                       RTTY) parameters that no longer fit on RADIO
+ *                       once it hit 8/8 - see the SHIFT tile's
+ *                       declaration comment for why it moved here
+ *                       rather than staying put. SHIFT (mark/space
+ *                       separation), BAUD (bit rate), INV (station
+ *                       NORMAL/REVERSE convention, independent of the
+ *                       USB/LSB sideband mirror RTTY-L/RTTY-U already
+ *                       handle - see rtty_set_station_inverted()'s
+ *                       comment in rtty.h for the DDK9 field finding
+ *                       that prompted this). Slots 3-7 reserved for
+ *                       future digital modes (PSK31 and similar).
  *
  * Tile behavior is unchanged from before the redesign, just
  * regrouped by page:
- *   - AGC, SPT, SPC, BW, and ZOOM CYCLE/TOGGLE DIRECTLY on tap (same
- *     as their existing bottom-bar-button/badge equivalents where
- *     they have one) and stay on this screen - you can tap several of
- *     these in a row.
- *   - SQL/BL/SCALE/VOL/SMH/PGA instead open a DETAIL view
+ *   - AGC, SPT, SPC, BW, ZOOM, and BAUD CYCLE/TOGGLE DIRECTLY on tap
+ *     (same as their existing bottom-bar-button/badge equivalents
+ *     where they have one) and stay on this screen - you can tap
+ *     several of these in a row. INV is the same shape as RFAGC/SPK:
+ *     a plain two-state toggle, not a multi-way cycle.
+ *   - SQL/BL/SCALE/VOL/SMH/PGA/SHIFT instead open a DETAIL view
  *     (menu_detail_show()) for that target - see its own comment.
  *
  * menu_grid_show() itself always redraws the WHOLE MENU_AREA (page
@@ -1714,6 +2174,52 @@ static void badges_draw(void)
 #define MENU_TILE_Y0 (uint16_t)(MENU_AREA_Y + 8)
 #define MENU_TILE_COL(i) (uint16_t)(MENU_TILE_X0 + (i) * (MENU_TILE_W + MENU_TILE_GAP))
 #define MENU_TILE_ROW(i) (uint16_t)(MENU_TILE_Y0 + (i) * (MENU_TILE_H + MENU_TILE_GAP))
+
+/*
+ * Frequency-entry keypad geometry (added 07/08/2026) - a denser 4x4
+ * grid than the MENU_TILE_* one above, since a phone-style keypad
+ * needs 16 keys (10 digits + DEL/CLR/BACK + 3 unit-accept buttons)
+ * where the settings grid only ever needed up to 3 rows of 4. Reuses
+ * MENU_TILE_COL() as-is for the x positions - the column math (4
+ * cols, same MENU_AREA_W, same MENU_TILE_GAP) works out identical
+ * regardless of row height, so there's no reason to duplicate it.
+ * Only the row pitch differs (shorter tiles, 4 rows instead of 3),
+ * and rows start further down to leave room for the entry readout
+ * (see FREQ_KEYPAD_READOUT_H below) between the top border and the
+ * first row of keys.
+ */
+/*
+ * Height budget, checked to actually fit MENU_AREA_H (358) - this
+ * bit the project owner 07/08/2026: the FIRST version of this budget
+ * (56 + 4*68 + gaps) came out to 368, ten pixels TALLER than
+ * MENU_AREA_H, so row 3 spilled ten pixels past the bottom of
+ * MENU_AREA and into the bottom bar underneath - which
+ * menu_screen_close() never repaints (see its comment: "only the
+ * spectrum+waterfall panels need restoring"), so the overrun stayed
+ * corrupted on screen after closing the keypad. Budget, top to
+ * bottom: 8 (top margin) + 48 (readout) + 8 (gap) + 4*65 (rows) +
+ * 3*8 (inter-row gaps) + 8 (bottom margin) = 356, comfortably inside
+ * 358 this time - verify the arithmetic again before ever touching
+ * either constant below.
+ */
+#define FREQ_KEYPAD_READOUT_H 48  /* readout strip height, MENU_AREA_Y+8 downward */
+#define FREQ_KEYPAD_TILE_W    MENU_TILE_W /* same 4-column pitch as MENU_TILE_COL() */
+#define FREQ_KEYPAD_TILE_H    65
+#define FREQ_KEYPAD_Y0        (uint16_t)(MENU_AREA_Y + 8 + FREQ_KEYPAD_READOUT_H + MENU_TILE_GAP)
+#define FREQ_KEYPAD_COL(i)    MENU_TILE_COL(i)
+#define FREQ_KEYPAD_ROW(i)    (uint16_t)(FREQ_KEYPAD_Y0 + (i) * (FREQ_KEYPAD_TILE_H + MENU_TILE_GAP))
+
+/*
+ * Top-bar tap zone for opening the keypad - the whole left portion of
+ * the top bar (x: 0..MODE_X, y: 0..TOP_H), generous on purpose for a
+ * resistive touchscreen rather than tight around freq_display_draw()'s
+ * exact text bounds. Safe to be this generous: nothing else in the
+ * top bar is interactive to the left of MODE_X (MODE/STEP/VOL's own
+ * readouts at MODE_X/STEP_X/VOL_X are all >= MODE_X), so there's
+ * nothing this zone could steal a touch from.
+ */
+#define FREQ_TAP_X1 MODE_X
+#define FREQ_TAP_Y1 TOP_H
 
 /*
  * Option-slot geometry helpers: slot 0-8 -> (row, col) within the
@@ -2020,6 +2526,132 @@ static void menu_tile_pga_refresh(void)
     ui_button_draw(&s_menu_tile_pga);
 }
 
+/*
+ * Applies the CURRENT effective PGA gain (ceiling - backoff) to the
+ * codec - the ONLY function allowed to call aic3204_set_pga_gain_db()
+ * now (see s_rf_agc_enabled's declaration comment for why the two
+ * former direct call sites - the encoder-driven PGA change, and the
+ * WFM-boundary gain restore - both route through this instead now).
+ *
+ * Deliberately does NO UI redraw of its own (07/08/2026, fixed per
+ * the project owner after testing - see menu_tile_rfagc_refresh()'s
+ * comment for the corruption this used to cause): this gets called
+ * from rf_agc_poll(), a BACKGROUND poll with no idea what's on screen
+ * right now, so it must never touch anything inside MENU_AREA itself.
+ * Callers that need a UI update after calling this do it themselves,
+ * in whatever way is actually safe for their own context - see
+ * rf_agc_poll()'s badges_draw() call (the right-column badge grid is
+ * always visible, outside MENU_AREA, safe from any background
+ * context) and the encoder-driven PGA handler's existing
+ * settings_value_redraw() call (safe because being IN that handler
+ * means the person is provably looking at the PGA detail view right
+ * now).
+ */
+static void rf_agc_apply_pga(void)
+{
+    int32_t eff = (int32_t)s_pga_gain_db_x2 - (int32_t)s_rf_agc_backoff_x2;
+
+    if (eff < PGA_MIN_X2) { eff = PGA_MIN_X2; }
+    aic3204_set_pga_gain_db((float)eff * 0.5f);
+}
+
+/*
+ * Brief mute around an Rin (input impedance) switch - see
+ * aic3204_set_input_impedance()'s comment for why this is needed
+ * (unlike the PGA gain register, Rin switching isn't soft-stepped, so
+ * it's an abrupt analog reconnection that would otherwise pop).
+ * Reuses whichever settle-mute already exists for the ACTIVE demod
+ * mode (demod_am_reset_diag() covers AM/USB/LSB/NFM via
+ * s_am_mute_remaining, demod_wfm_reset_diag() covers WFM via
+ * s_wfm_mute_remaining - see both their comments in demod_am.c) -
+ * same mechanism already proven to hide the mode-switch transient,
+ * repurposed here for a different transient of the same general
+ * shape (a sudden front-end level change the AGC needs a moment to
+ * re-settle around before it's safe to listen to again).
+ */
+static void rf_agc_mute_for_transition(void)
+{
+    if (demod_am_get_mode() == DEMOD_MODE_WFM) {
+        demod_wfm_reset_diag();
+    } else {
+        demod_am_reset_diag();
+    }
+}
+
+/*
+ * One step UP in Rin (10k->20k->40k) - see s_rf_agc_enabled's
+ * declaration comment for the "why" and the net-6dB-step reasoning.
+ * Only called from rf_agc_poll() once PGA backoff is already maxed
+ * AND a new clip still came in - i.e. this is the LAST resort, not a
+ * routine step.
+ */
+static void rf_agc_escalate_rin(void)
+{
+    s_rf_agc_rin_level++;
+    s_rf_agc_backoff_x2 = (int16_t)(s_rf_agc_backoff_x2 - (int16_t)RF_AGC_RIN_STEP_X2);
+    if (s_rf_agc_backoff_x2 < 0) { s_rf_agc_backoff_x2 = 0; }
+
+    aic3204_set_input_impedance((aic3204_rin_t)s_rf_agc_rin_level);
+    rf_agc_mute_for_transition();
+    rf_agc_apply_pga();
+    badges_draw();
+    debug_print_dec("rf_agc: escalated Rin, level now (0=10k/1=20k/2=40k)", (uint32_t)s_rf_agc_rin_level);
+}
+
+/* One step DOWN in Rin - mirrors rf_agc_escalate_rin(), only called
+ * once PGA backoff has fully recovered to 0 at the current Rin level
+ * and the release cooldown has ALSO elapsed since the last clip. */
+static void rf_agc_deescalate_rin(void)
+{
+    s_rf_agc_rin_level--;
+    s_rf_agc_backoff_x2 = (int16_t)(s_rf_agc_backoff_x2 + (int16_t)RF_AGC_RIN_STEP_X2);
+    if (s_rf_agc_backoff_x2 > (int16_t)RF_AGC_BACKOFF_MAX_X2) {
+        s_rf_agc_backoff_x2 = (int16_t)RF_AGC_BACKOFF_MAX_X2;
+    }
+
+    aic3204_set_input_impedance((aic3204_rin_t)s_rf_agc_rin_level);
+    rf_agc_mute_for_transition();
+    rf_agc_apply_pga();
+    badges_draw();
+    debug_print_dec("rf_agc: de-escalated Rin, level now (0=10k/1=20k/2=40k)", (uint32_t)s_rf_agc_rin_level);
+}
+
+/*
+ * RFAGC grid tile - plain ON/OFF (cyan/darkgray), nothing else.
+ *
+ * Used to also show the live backoff amount ("-x.xDB") directly on
+ * the tile, redrawn from rf_agc_poll() every time the backoff
+ * changed - REMOVED 07/08/2026, per the project owner, after testing
+ * turned up real screen corruption: rf_agc_poll() runs in the
+ * background with no idea what's currently showing in MENU_AREA, so
+ * that redraw could land while some OTHER sub-screen (e.g. the PGA
+ * detail view, mid-adjustment) was on screen, painting this tile's
+ * stale grid-coordinate graphics right over live content - exactly
+ * the class of bug menu_tile_bw_callback()'s own guard comment
+ * already flagged as a risk, just actually triggered in practice
+ * because this is the first control that redraws itself from a
+ * continuous background timer instead of a one-off user action.
+ *
+ * The live indicator moved to the OVR badge (badges_draw(), always
+ * safe to redraw from anywhere - see its own comment) instead. This
+ * tile now only ever redraws from contexts that are provably safe:
+ * menu_grid_show() building the RADIO page, and this tile's own
+ * tap callback.
+ */
+static void menu_tile_rfagc_refresh(void)
+{
+    if (s_rf_agc_enabled) {
+        s_menu_tile_rfagc.label = "RFAGC ON";
+        s_menu_tile_rfagc.fg = GFX_COLOR_BLACK;
+        s_menu_tile_rfagc.bg = GFX_COLOR_CYAN;
+    } else {
+        s_menu_tile_rfagc.label = "RFAGC OFF";
+        s_menu_tile_rfagc.fg = GFX_COLOR_WHITE;
+        s_menu_tile_rfagc.bg = GFX_COLOR_DARKGRAY;
+    }
+    ui_button_draw(&s_menu_tile_rfagc);
+}
+
 /* NR (Spectral Subtraction strength, AM/USB/LSB only - see nr_ss.h and
  * demod_am.c's NR INTEGRATION comment). Raw 0-4095 label, no unit
  * suffix - see aux_row_display_draw()'s NR branch for why. Shows the
@@ -2052,6 +2684,31 @@ static void menu_tile_nr_refresh(void)
 
     s_menu_tile_nr.label = s_menu_tile_nr_buf;
     ui_button_draw(&s_menu_tile_nr);
+}
+
+/* SHIFT (DIG page) live value - "SHFT nnnnHZ", same digit-extraction
+ * shape as menu_tile_nr_refresh() just above, with a fixed "SHFT "
+ * prefix (4 chars + space) instead of "NR " so it still reads clearly
+ * abbreviated within the 159px tile at text_scale 2. */
+static void menu_tile_rtty_shift_refresh(void)
+{
+    uint16_t v = (uint16_t)(rtty_get_shift_hz() + 0.5f);
+    char digits[5];
+    uint8_t dpos = 4U;
+    uint8_t i, j;
+
+    digits[dpos] = '\0';
+    do { digits[--dpos] = (char)('0' + (v % 10U)); v /= 10U; } while (v > 0U && dpos > 0U);
+
+    s_menu_tile_rtty_shift_buf[0] = 'S'; s_menu_tile_rtty_shift_buf[1] = 'H';
+    s_menu_tile_rtty_shift_buf[2] = 'F'; s_menu_tile_rtty_shift_buf[3] = 'T';
+    s_menu_tile_rtty_shift_buf[4] = ' ';
+    j = 5U;
+    for (i = dpos; digits[i] != '\0'; i++) { s_menu_tile_rtty_shift_buf[j++] = digits[i]; }
+    s_menu_tile_rtty_shift_buf[j] = '\0';
+
+    s_menu_tile_rtty_shift.label = s_menu_tile_rtty_shift_buf;
+    ui_button_draw(&s_menu_tile_rtty_shift);
 }
 
 static void menu_tile_nb_refresh(void)
@@ -2254,6 +2911,47 @@ static void menu_tile_bw_callback(void *widget, ui_event_t event, void *user_dat
          * regardless, since the menu is obviously open right now if
          * this callback fired at all. */
         audio_bw_cycle();
+    }
+}
+
+/*
+ * BAUD (DIG page) - cycles the RTTY bit rate through
+ * k_rtty_baud_values[] (45.45->50->75->100->45.45), same "cycle
+ * directly on tap, stay on the grid" treatment as BW/SPC above rather
+ * than a DETAIL view - four fixed, well-known rates don't need a
+ * turn-the-knob-to-any-value control, just a quick tap through the
+ * short list, same reasoning as SPC's HEATMAP/LINE/OUTLINE cycle.
+ * Unconditional same as BW - harmless to pre-set outside RTTY mode.
+ */
+static void menu_tile_rtty_baud_refresh(void)
+{
+    const char *v = k_rtty_baud_labels[s_rtty_baud_idx];
+    uint8_t j = 5U;
+    uint8_t i;
+
+    s_menu_tile_rtty_baud_buf[0] = 'B'; s_menu_tile_rtty_baud_buf[1] = 'A';
+    s_menu_tile_rtty_baud_buf[2] = 'U'; s_menu_tile_rtty_baud_buf[3] = 'D';
+    s_menu_tile_rtty_baud_buf[4] = ' ';
+    for (i = 0; v[i] != '\0'; i++) {
+        s_menu_tile_rtty_baud_buf[j++] = v[i];
+    }
+    s_menu_tile_rtty_baud_buf[j] = '\0';
+
+    s_menu_tile_rtty_baud.label = s_menu_tile_rtty_baud_buf;
+    ui_button_draw(&s_menu_tile_rtty_baud);
+}
+
+static void menu_tile_rtty_baud_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) {
+        s_rtty_baud_idx = (uint8_t)((s_rtty_baud_idx + 1U) % RTTY_BAUD_COUNT);
+        rtty_set_baud(k_rtty_baud_values[s_rtty_baud_idx]);
+        debug_print("rtty: baud now ");
+        debug_print(k_rtty_baud_labels[s_rtty_baud_idx]);
+        debug_print("\n");
+        menu_tile_rtty_baud_refresh();
     }
 }
 
@@ -2610,9 +3308,16 @@ static void apply_demod_mode(demod_mode_t mode)
          * boundary - re-apply whatever they actually have dialed in
          * (s_volume_db_x2/s_pga_gain_db_x2 are already the live,
          * current values regardless of how they got there) now that
-         * the codec is back up and listening. */
+         * the codec is back up and listening. PGA goes through
+         * rf_agc_apply_pga() (07/08/2026) rather than a direct
+         * aic3204_set_pga_gain_db() call, so a mode change that
+         * crosses the WFM boundary while the RF-AGC is actively backed
+         * off re-applies the EFFECTIVE gain (ceiling - backoff), not
+         * the raw ceiling - otherwise the codec reset above would
+         * silently undo an active backoff and risk an immediate re-clip
+         * right after the switch. */
         aic3204_set_volume_db((float)s_volume_db_x2 * 0.5f);
-        aic3204_set_pga_gain_db((float)s_pga_gain_db_x2 * 0.5f);
+        rf_agc_apply_pga();
     }
 }
 
@@ -2695,11 +3400,98 @@ static void menu_tile_pga_callback(void *widget, ui_event_t event, void *user_da
     if (event == UI_EVENT_RELEASE) { menu_detail_show(ENCODER_TARGET_PGA); }
 }
 
+/*
+ * SHIFT (DIG page) - opens the same DETAIL view (ENCODER_TARGET_
+ * RTTY_SHIFT) tune_encoder_poll()'s ENCODER_TARGET_RTTY_SHIFT branch
+ * and menu_detail_value_redraw()'s ENCODER_TARGET_RTTY_SHIFT case
+ * already handle in full (both added 08/08/2026 alongside
+ * rtty_set_shift_hz()) - only the grid TILE itself (this callback +
+ * menu_tile_rtty_shift_refresh() below) was still missing until
+ * 09/08/2026, when it moved here from its original planned home on
+ * RADIO (which had already reached 8/8 - see this file's "Settings
+ * grid PAGES" comment for the DIG page this and BAUD/INV now live on).
+ */
+static void menu_tile_rtty_shift_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) { menu_detail_show(ENCODER_TARGET_RTTY_SHIFT); }
+}
+
+/*
+ * RFAGC tile: a plain toggle (per the project owner, "como el botón
+ * NR"), not a detail view - there's nothing to dial in, just on/off.
+ * Turning OFF immediately drops any active backoff AND Rin escalation,
+ * restoring the PGA to the plain ceiling value at 10k input impedance,
+ * rather than leaving either frozen in place - "off" should mean
+ * "back to exactly what the manual PGA control says, at the baseline
+ * input configuration", unsurprising even if you switch it off
+ * mid-backoff or mid-Rin-escalation.
+ */
+static void menu_tile_rfagc_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) {
+        s_rf_agc_enabled = s_rf_agc_enabled ? 0U : 1U;
+        debug_print(s_rf_agc_enabled ? "rf_agc: on\n" : "rf_agc: off\n");
+        if (!s_rf_agc_enabled) {
+            s_rf_agc_backoff_x2 = 0;
+            if (s_rf_agc_rin_level != 0U) {
+                s_rf_agc_rin_level = 0U;
+                aic3204_set_input_impedance(AIC3204_RIN_10K);
+                rf_agc_mute_for_transition(); /* Rin change - see its own comment for why this needs a mute */
+            }
+        }
+        rf_agc_apply_pga();
+        /* Both safe here: we're provably ON this exact tile (its own
+         * tap callback) for the grid redraw, and badges live outside
+         * MENU_AREA entirely - see menu_tile_rfagc_refresh()'s and the
+         * OVR badge's comments. Only needed for the OFF case (drops
+         * an active backoff straight to 0, so OVR should go dark
+         * immediately rather than wait for the next poll), but cheap
+         * enough to just always do it. */
+        menu_tile_rfagc_refresh();
+        badges_draw();
+    }
+}
+
 static void menu_tile_nr_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
     (void)user_data;
     if (event == UI_EVENT_RELEASE) { menu_detail_show(ENCODER_TARGET_NR); }
+}
+
+/*
+ * INV (DIG page) - the station NORMAL/REVERSE convention toggle (see
+ * rtty_set_station_inverted()'s comment in rtty.h for the DDK9 field
+ * finding this exists for). Plain two-state toggle, same shape as
+ * RFAGC/SPK just above/below - nothing to dial in, just flips one bit
+ * and swaps mark/space live.
+ */
+static void menu_tile_rtty_inv_refresh(void)
+{
+    if (rtty_get_station_inverted()) {
+        s_menu_tile_rtty_inv.label = "INV REV";
+        s_menu_tile_rtty_inv.fg = GFX_COLOR_BLACK;
+        s_menu_tile_rtty_inv.bg = GFX_COLOR_CYAN;
+    } else {
+        s_menu_tile_rtty_inv.label = "INV NORM";
+        s_menu_tile_rtty_inv.fg = GFX_COLOR_WHITE;
+        s_menu_tile_rtty_inv.bg = GFX_COLOR_DARKGRAY;
+    }
+    ui_button_draw(&s_menu_tile_rtty_inv);
+}
+
+static void menu_tile_rtty_inv_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) {
+        rtty_set_station_inverted(!rtty_get_station_inverted());
+        menu_tile_rtty_inv_refresh();
+    }
 }
 
 /*
@@ -2729,6 +3521,24 @@ static void menu_tile_speaker_pa_callback(void *widget, ui_event_t event, void *
     }
 }
 
+/*
+ * SLEEP (HW page) - one-shot action, not a toggle: fires
+ * screen_sleep_enter() and that's it, same shape as EXIT
+ * (menu_tile_exit_callback() just below) rather than the cycle/
+ * detail-view tiles elsewhere on this grid - there's no state to
+ * flip back and forth here, the WHOLE point is "stop looking at the
+ * screen until the encoder wakes it back up" (see screen_sleep_
+ * enter()'s comment).
+ */
+static void menu_tile_sleep_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) {
+        screen_sleep_enter();
+    }
+}
+
 static void menu_tile_smooth_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
@@ -2746,22 +3556,27 @@ static void menu_tile_exit_callback(void *widget, ui_event_t event, void *user_d
 }
 
 /*
- * Shared callback for all 3 page-selector tiles (RADIO/UI/HW) - see
- * the "Settings grid PAGES" comment on s_menu_page's declaration and
- * menu_grid_show()'s comment for the layout this switches between.
- * user_data carries the target menu_page_t (same (void*)(uintptr_t)
- * pattern menu_band_preset_callback()/menu_step_preset_callback() use
- * for their own index). Tapping the ALREADY-selected page still just
- * re-runs menu_grid_show() - harmless, and simpler than special-casing
- * a no-op.
+ * Shared callback for the pager's PREV/NEXT tiles (column 0, rows 0
+ * and 2) - see the "Settings grid PAGES" / PAGINATION comment on
+ * s_menu_page's declaration for the full story of why this replaced
+ * the old one-tile-per-page menu_page_select_callback() on 09/08/2026.
+ * user_data carries the step direction as a plain (void*)(intptr_t)
+ * +1/-1, same cast-through-a-pointer pattern menu_band_preset_callback()/
+ * menu_step_preset_callback() use for their own index, just signed
+ * this time. Wraps both directions (page 0's PREV lands on the last
+ * page, the last page's NEXT wraps to 0) via the +MENU_PAGE_COUNT
+ * before the modulo - avoids a signed-modulo-of-negative edge case
+ * without needing an explicit if/else.
  */
-static void menu_page_select_callback(void *widget, ui_event_t event, void *user_data)
+static void menu_page_step_callback(void *widget, ui_event_t event, void *user_data)
 {
-    menu_page_t page = (menu_page_t)(uintptr_t)user_data;
+    int32_t dir = (int32_t)(intptr_t)user_data;
 
     (void)widget;
-    if (event == UI_EVENT_RELEASE && page < MENU_PAGE_COUNT) {
-        s_menu_page = page;
+    if (event == UI_EVENT_RELEASE) {
+        int32_t next = ((int32_t)s_menu_page + dir + (int32_t)MENU_PAGE_COUNT) % (int32_t)MENU_PAGE_COUNT;
+
+        s_menu_page = (menu_page_t)next;
         menu_grid_show();
     }
 }
@@ -2819,6 +3634,7 @@ static void menu_bands_show(void)
     s_menu_bands_active = 1U;
     s_menu_step_active = 0U;
     s_menu_mode_active = 0U;
+    s_menu_freq_active = 0U;
     s_menu_open = 1U; /* harmless if already 1 (opened from the grid); required when opened straight from s_btn_bands, same reasoning as menu_step_list_show()'s comment */
 }
 
@@ -2868,6 +3684,37 @@ static void menu_mode_preset_callback(void *widget, ui_event_t event, void *user
          * WFM/NFM reasoning as the old cycling MODE button, see
          * apply_lo_tune()'s comment. */
         apply_lo_tune(s_tune_hz);
+
+        /* RTTY on/off + polarity - see k_demod_modes[]'s comment for
+         * the RTTY_VARIANT_NORMAL/INVERTED story. Picking a PLAIN
+         * mode (RTTY_VARIANT_NONE) always turns RTTY off, even if it
+         * was on before - switching to e.g. WFM or plain USB should
+         * unambiguously mean "I'm done with RTTY", not leave the
+         * decoder/scope silently running against audio that's no
+         * longer even SSB. */
+        switch (k_demod_modes[idx].rtty_variant) {
+        case RTTY_VARIANT_NORMAL:
+            rtty_set_mark_space_hz(CONFIG_RTTY_MARK_HZ, CONFIG_RTTY_SPACE_HZ);
+            /* Reapply any active station NORMAL/REVERSE convention on
+             * top of this fresh sideband-mirror base pair - see
+             * rtty_reapply_station_inversion()'s comment in rtty.h.
+             * Without this, switching modes would silently drop the
+             * DIG page's INV tile back to NORMAL even though the tile
+             * itself still reads REVERSE. */
+            rtty_reapply_station_inversion();
+            rtty_set_enabled(1U);
+            break;
+        case RTTY_VARIANT_INVERTED:
+            rtty_set_mark_space_hz(CONFIG_RTTY_SPACE_HZ, CONFIG_RTTY_MARK_HZ);
+            rtty_reapply_station_inversion();
+            rtty_set_enabled(1U);
+            break;
+        case RTTY_VARIANT_NONE:
+        default:
+            rtty_set_enabled(0U);
+            break;
+        }
+
         debug_print("mode: demodulator now ");
         debug_print(k_demod_modes[idx].label);
         debug_print("\n");
@@ -2915,6 +3762,7 @@ static void menu_step_list_show(void)
     s_menu_bands_active = 0U;
     s_menu_mode_active = 0U;
     s_menu_step_active = 1U;
+    s_menu_freq_active = 0U;
     s_menu_open = 1U; /* opened straight from the bottom bar, not the grid - unlike BANDS, nothing else sets this first */
     debug_print("menu: step picker opened\n");
 }
@@ -2955,8 +3803,195 @@ static void menu_mode_list_show(void)
     s_menu_bands_active = 0U;
     s_menu_step_active = 0U;
     s_menu_mode_active = 1U;
+    s_menu_freq_active = 0U;
     s_menu_open = 1U;
     debug_print("menu: mode picker opened\n");
+}
+
+/*
+ * --- Frequency-entry keypad ----------------------------------------------
+ *
+ * Added 07/08/2026, per the project owner: tap the frequency readout
+ * in the top bar (FREQ_TAP_X1/Y1's zone, checked in demo_touch_poll())
+ * to open this instead of only being able to spin the encoder or pick
+ * a BANDS preset. Same "reuse s_menu_screen/MENU_AREA" treatment as
+ * the STEP/MODE picker lists above, opened straight from the top bar
+ * rather than the settings grid.
+ *
+ * No decimal point key - deliberately. The three accept buttons
+ * (Hz/kHz/MHz) already cover fractional MHz entry without needing a
+ * float parser on a bare-metal target: typing "146520" then tapping
+ * kHz gives 146,520,000 Hz (146.520MHz) exactly as if you'd typed
+ * "146.520" and tapped MHz. Hz stays available for the rare case of
+ * wanting the exact integer Hz value directly (e.g. from a frequency
+ * counter reading).
+ */
+static void freq_keypad_readout_draw(void)
+{
+    /* FREQ_ENTRY_MAX_DIGITS(9) + NUL - same fixed-width-field
+     * reasoning as tune_freq_format()'s comment: always clear/redraw
+     * the WHOLE field so a shorter new value can't leave a ghost
+     * digit from a longer old one (e.g. CLR after typing 5 digits). */
+    char buf[FREQ_ENTRY_MAX_DIGITS + 1U];
+    uint8_t i;
+
+    gfx_fill_rect(MENU_AREA_X, (uint16_t)(MENU_AREA_Y + 8),
+                  MENU_AREA_W, FREQ_KEYPAD_READOUT_H, GFX_COLOR_BLACK);
+
+    if (s_freq_entry_digits == 0U) {
+        /* Nothing typed yet - a lone placeholder rather than "0", so
+         * it doesn't look like a real (zero) frequency was entered. */
+        gfx_text((uint16_t)(MENU_AREA_X + 16), (uint16_t)(MENU_AREA_Y + 16),
+                 "HZ----", GFX_COLOR_GRAY, GFX_COLOR_BLACK, 4);
+        return;
+    }
+
+    {
+        uint32_t v = s_freq_entry_value;
+        i = FREQ_ENTRY_MAX_DIGITS;
+        buf[i] = '\0';
+        do {
+            buf[--i] = (char)('0' + (v % 10U));
+            v /= 10U;
+        } while (v > 0U && i > 0U);
+    }
+    gfx_text((uint16_t)(MENU_AREA_X + 16), (uint16_t)(MENU_AREA_Y + 16),
+             &buf[i], GFX_COLOR_CYAN, GFX_COLOR_BLACK, 5);
+}
+
+static void menu_freq_keypad_digit_callback(void *widget, ui_event_t event, void *user_data)
+{
+    uintptr_t digit = (uintptr_t)user_data;
+
+    (void)widget;
+    if (event == UI_EVENT_RELEASE && s_freq_entry_digits < FREQ_ENTRY_MAX_DIGITS) {
+        s_freq_entry_value = s_freq_entry_value * 10U + (uint32_t)digit;
+        s_freq_entry_digits++;
+        freq_keypad_readout_draw();
+    }
+}
+
+static void menu_freq_keypad_del_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE && s_freq_entry_digits > 0U) {
+        s_freq_entry_value /= 10U;
+        s_freq_entry_digits--;
+        freq_keypad_readout_draw();
+    }
+}
+
+static void menu_freq_keypad_clr_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) {
+        s_freq_entry_value = 0U;
+        s_freq_entry_digits = 0U;
+        freq_keypad_readout_draw();
+    }
+}
+
+/*
+ * Shared by the Hz/kHz/MHz buttons - user_data is the multiplier
+ * (1/1000/1000000), passed the same (void*)(uintptr_t) way the
+ * digit callback's digit is. Ignored entirely if nothing was typed
+ * (s_freq_entry_digits==0) - no accidental retune to TUNE_MIN_HZ from
+ * an empty "0 Hz" entry. The multiply happens in a uint64_t
+ * intermediate on purpose: s_freq_entry_value is capped at 9 digits
+ * (max 999,999,999) precisely so it can never overflow uint32_t on
+ * its own, but 999,999,999 * 1,000,000 overflows uint32_t many times
+ * over - the same int64_t-then-clamp pattern tune_encoder_poll() and
+ * spec_drag_tune_apply() already use for exactly this reason.
+ */
+static void menu_freq_keypad_accept_callback(void *widget, ui_event_t event, void *user_data)
+{
+    uint32_t multiplier = (uint32_t)(uintptr_t)user_data;
+
+    (void)widget;
+    if (event == UI_EVENT_RELEASE && s_freq_entry_digits > 0U) {
+        uint64_t hz64 = (uint64_t)s_freq_entry_value * (uint64_t)multiplier;
+
+        if (hz64 < (uint64_t)TUNE_MIN_HZ) {
+            hz64 = (uint64_t)TUNE_MIN_HZ;
+        } else if (hz64 > (uint64_t)TUNE_MAX_HZ) {
+            hz64 = (uint64_t)TUNE_MAX_HZ;
+        }
+
+        s_tune_hz = (uint32_t)hz64;
+        apply_lo_tune(s_tune_hz);
+        debug_print_dec("tune: keypad entry now Hz", s_tune_hz);
+        freq_display_draw(); /* top bar - see its call in tune_encoder_poll() */
+        menu_screen_close();
+    }
+}
+
+static void menu_freq_keypad_show(void)
+{
+    static const struct {
+        uint8_t col, row;
+        const char *label;
+        uint16_t fg, bg;
+        ui_callback_t cb;
+        uintptr_t user_data;
+    } k_keys[15] = {
+        /* row0: 1 2 3 DEL */
+        {0, 0, "1",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 1},
+        {1, 0, "2",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 2},
+        {2, 0, "3",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 3},
+        {3, 0, "DEL",GFX_COLOR_BLACK, GFX_COLOR_ORANGE,   menu_freq_keypad_del_callback,   0},
+        /* row1: 4 5 6 CLR */
+        {0, 1, "4",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 4},
+        {1, 1, "5",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 5},
+        {2, 1, "6",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 6},
+        {3, 1, "CLR",GFX_COLOR_BLACK, GFX_COLOR_ORANGE,   menu_freq_keypad_clr_callback,   0},
+        /* row2: 7 8 9 (col3 = shared BACK widget, added separately below) */
+        {0, 2, "7",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 7},
+        {1, 2, "8",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 8},
+        {2, 2, "9",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 9},
+        /* row3: HZ 0 KHZ MHZ */
+        {0, 3, "HZ", GFX_COLOR_BLACK, GFX_COLOR_CYAN,     menu_freq_keypad_accept_callback, 1UL},
+        {1, 3, "0",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback,  0},
+        {2, 3, "KHZ",GFX_COLOR_BLACK, GFX_COLOR_CYAN,     menu_freq_keypad_accept_callback, 1000UL},
+        {3, 3, "MHZ",GFX_COLOR_BLACK, GFX_COLOR_CYAN,     menu_freq_keypad_accept_callback, 1000000UL},
+    };
+    uint8_t i;
+
+    gfx_fill_rect(MENU_AREA_X, MENU_AREA_Y, MENU_AREA_W, MENU_AREA_H, GFX_COLOR_BLACK);
+    gfx_rect(MENU_AREA_X, MENU_AREA_Y, MENU_AREA_W, MENU_AREA_H, GFX_COLOR_GRAY);
+    ui_screen_init(&s_menu_screen);
+
+    s_freq_entry_value = 0U;
+    s_freq_entry_digits = 0U;
+    freq_keypad_readout_draw();
+
+    for (i = 0; i < 15U; i++) {
+        s_menu_freq_tiles[i] = (ui_button_t){
+            FREQ_KEYPAD_COL(k_keys[i].col), FREQ_KEYPAD_ROW(k_keys[i].row),
+            FREQ_KEYPAD_TILE_W, FREQ_KEYPAD_TILE_H,
+            k_keys[i].label, k_keys[i].fg, k_keys[i].bg, GFX_COLOR_GRAY,
+            3, 0, 1, k_keys[i].cb, (void *)k_keys[i].user_data};
+        ui_screen_add_button(&s_menu_screen, &s_menu_freq_tiles[i]);
+    }
+
+    /* BACK: row2, col3 - shared widget/callback, same as STEP/MODE's
+     * picker lists (see menu_mode_list_show()'s use of it, just above). */
+    s_menu_detail_back = (ui_button_t){
+        FREQ_KEYPAD_COL(3), FREQ_KEYPAD_ROW(2), FREQ_KEYPAD_TILE_W, FREQ_KEYPAD_TILE_H,
+        "BACK", GFX_COLOR_BLACK, GFX_COLOR_YELLOW, GFX_COLOR_WHITE,
+        3, 0, 1, menu_tile_exit_callback, NULL};
+    ui_screen_add_button(&s_menu_screen, &s_menu_detail_back);
+
+    ui_screen_draw(&s_menu_screen);
+
+    s_menu_detail_active = 0U;
+    s_menu_bands_active = 0U;
+    s_menu_step_active = 0U;
+    s_menu_mode_active = 0U;
+    s_menu_freq_active = 1U;
+    s_menu_open = 1U; /* opened straight from the top bar, not the grid - same as STEP/MODE */
+    debug_print("menu: frequency keypad opened\n");
 }
 
 /*
@@ -3079,6 +4114,24 @@ static void menu_detail_value_redraw(void)
         gfx_text((uint16_t)((MENU_AREA_W - vw) / 2), MENU_DETAIL_VALUE_Y, buf, GFX_COLOR_CYAN, GFX_COLOR_BLACK, 6);
         break;
     }
+    case ENCODER_TARGET_RTTY_SHIFT: {
+        /* Same "raw value, no negative direction" shape as NR just
+         * above, but with an "Hz" suffix instead of "%" - shift is
+         * always a positive separation, see rtty_get_shift_hz(). */
+        char buf[10];
+        uint8_t pos = 9U;
+        uint16_t v = (uint16_t)(rtty_get_shift_hz() + 0.5f);
+        uint16_t vw;
+
+        buf[pos] = '\0';
+        buf[--pos] = 'z';
+        buf[--pos] = 'H';
+        do { buf[--pos] = (char)('0' + (v % 10U)); v /= 10U; } while (v > 0U && pos > 0U);
+        while (pos > 0U) { buf[--pos] = ' '; }
+        vw = gfx_text_width(buf, 6);
+        gfx_text((uint16_t)((MENU_AREA_W - vw) / 2), MENU_DETAIL_VALUE_Y, buf, GFX_COLOR_CYAN, GFX_COLOR_BLACK, 6);
+        break;
+    }
     case ENCODER_TARGET_SCALE: {
         char lo[FREQ_FIELD_CHARS + 1];
         char hi[FREQ_FIELD_CHARS + 1];
@@ -3120,6 +4173,7 @@ static void menu_detail_show(encoder_target_t target)
     case ENCODER_TARGET_PGA:       title = "PGA GAIN";  hint = "TURN KNOB TO ADJUST";  break;
     case ENCODER_TARGET_NR:        title = "NOISE RED"; hint = "TURN KNOB TO ADJUST";  break;
     case ENCODER_TARGET_SMOOTH:    title = "SMOOTH";    hint = "TURN KNOB TO ADJUST";  break;
+    case ENCODER_TARGET_RTTY_SHIFT: title = "RTTY SHIFT"; hint = "TURN KNOB TO ADJUST"; break;
     case ENCODER_TARGET_SCALE:     title = "SCALE";     hint = "PRESS KNOB: LO OR HI"; break;
     default:                        title = "";          hint = "";                     break;
     }
@@ -3194,37 +4248,33 @@ static void menu_grid_show(void)
     ui_screen_init(&s_menu_screen);
 
     /*
-     * --- Page selector column (col 0, all 3 rows) -----------------
-     * Visually distinct from every option tile: ORANGE instead of
-     * the CYAN(cycle)/DARKGRAY(opens detail)/YELLOW(exit) palette the
-     * right-hand side uses. Selected page: solid ORANGE fill,
-     * BLACK text. Unselected: BLACK fill, ORANGE text/border - reads
-     * as "outlined, tap to switch" next to the filled active one.
+     * --- Pager column (col 0, all 3 rows) --------------------------
+     * PREV (row 0) / current page name (row 1, informational) / NEXT
+     * (row 2) - see this file's PAGINATION comment for why this
+     * replaced the old one-tile-per-page selector on 09/08/2026.
+     * Visually distinct from every option tile: ORANGE instead of the
+     * CYAN(cycle)/DARKGRAY(opens detail)/YELLOW(exit) palette the
+     * right-hand side uses, same as the old page tiles were. PREV/NEXT
+     * always render the same BLACK-fill/ORANGE-outline "tap me" look
+     * (there's no "already selected" state for a step button); the
+     * row-1 label instead gets the old selector's solid ORANGE-fill
+     * look, since it's now the one telling you where you are.
      */
-    s_menu_page_radio = (ui_button_t){
+    s_menu_page_prev = (ui_button_t){
         MENU_TILE_COL(0), MENU_TILE_ROW(0), MENU_TILE_W, MENU_TILE_H,
-        "RADIO",
-        (s_menu_page == MENU_PAGE_RADIO) ? GFX_COLOR_BLACK  : GFX_COLOR_ORANGE,
-        (s_menu_page == MENU_PAGE_RADIO) ? GFX_COLOR_ORANGE : GFX_COLOR_BLACK,
-        GFX_COLOR_ORANGE,
-        2, 0, 1, menu_page_select_callback, (void *)(uintptr_t)MENU_PAGE_RADIO};
-    s_menu_page_ui = (ui_button_t){
+        "PREV", GFX_COLOR_ORANGE, GFX_COLOR_BLACK, GFX_COLOR_ORANGE,
+        2, 0, 1, menu_page_step_callback, (void *)(intptr_t)(-1)};
+    s_menu_page_label = (ui_button_t){
         MENU_TILE_COL(0), MENU_TILE_ROW(1), MENU_TILE_W, MENU_TILE_H,
-        "UI",
-        (s_menu_page == MENU_PAGE_UI) ? GFX_COLOR_BLACK  : GFX_COLOR_ORANGE,
-        (s_menu_page == MENU_PAGE_UI) ? GFX_COLOR_ORANGE : GFX_COLOR_BLACK,
-        GFX_COLOR_ORANGE,
-        2, 0, 1, menu_page_select_callback, (void *)(uintptr_t)MENU_PAGE_UI};
-    s_menu_page_hw = (ui_button_t){
+        k_menu_page_names[s_menu_page], GFX_COLOR_BLACK, GFX_COLOR_ORANGE, GFX_COLOR_ORANGE,
+        2, 0, 0, NULL, NULL}; /* enabled=0 - informational, not a step button, see ui_screen_add_button()'s comment in ui.c */
+    s_menu_page_next = (ui_button_t){
         MENU_TILE_COL(0), MENU_TILE_ROW(2), MENU_TILE_W, MENU_TILE_H,
-        "HW",
-        (s_menu_page == MENU_PAGE_HW) ? GFX_COLOR_BLACK  : GFX_COLOR_ORANGE,
-        (s_menu_page == MENU_PAGE_HW) ? GFX_COLOR_ORANGE : GFX_COLOR_BLACK,
-        GFX_COLOR_ORANGE,
-        2, 0, 1, menu_page_select_callback, (void *)(uintptr_t)MENU_PAGE_HW};
-    ui_screen_add_button(&s_menu_screen, &s_menu_page_radio);
-    ui_screen_add_button(&s_menu_screen, &s_menu_page_ui);
-    ui_screen_add_button(&s_menu_screen, &s_menu_page_hw);
+        "NEXT", GFX_COLOR_ORANGE, GFX_COLOR_BLACK, GFX_COLOR_ORANGE,
+        2, 0, 1, menu_page_step_callback, (void *)(intptr_t)(1)};
+    ui_screen_add_button(&s_menu_screen, &s_menu_page_prev);
+    ui_screen_add_button(&s_menu_screen, &s_menu_page_label);
+    ui_screen_add_button(&s_menu_screen, &s_menu_page_next);
 
     /*
      * --- EXIT (slot 8, row2/col3) - fixed on every page ------------
@@ -3275,12 +4325,19 @@ static void menu_grid_show(void)
             2, 0, 1, menu_tile_pga_callback, NULL};
         /* NR: Spectral Subtraction noise reduction strength (0-100%),
          * AM/USB/LSB only - see nr_ss.h and demod_am.c's NR
-         * INTEGRATION comment. Fills slot 5 - 2 slots (6-7) still free. */
+         * INTEGRATION comment. Fills slot 5 - 1 slot (7) still free. */
         s_menu_tile_nr = (ui_button_t){
             MENU_OPT_COL(5), MENU_OPT_ROW(5), MENU_TILE_W, MENU_TILE_H,
             "NR", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
             2, 0, 1, menu_tile_nr_callback, NULL};
-        /* Slots 6-7 intentionally empty - room to grow RADIO further. */
+        /* RFAGC: RF-level (analog PGA) auto-AGC toggle, added
+         * 07/08/2026 - see s_rf_agc_enabled's declaration comment.
+         * Fills slot 6 - slot 7 still free. */
+        s_menu_tile_rfagc = (ui_button_t){
+            MENU_OPT_COL(6), MENU_OPT_ROW(6), MENU_TILE_W, MENU_TILE_H,
+            "RFAGC", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_rfagc_callback, NULL};
+        /* Slot 7 intentionally empty - room to grow RADIO further. */
 
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_agc);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_squelch);
@@ -3288,6 +4345,7 @@ static void menu_grid_show(void)
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_bw);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_pga);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_nr);
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_rfagc);
 
         ui_screen_draw(&s_menu_screen);
         /* ui_screen_draw() just painted each tile with its STATIC
@@ -3300,6 +4358,7 @@ static void menu_grid_show(void)
         menu_tile_bw_refresh();
         menu_tile_pga_refresh();
         menu_tile_nr_refresh();
+        menu_tile_rfagc_refresh();
         break;
 
     case MENU_PAGE_UI:
@@ -3355,17 +4414,59 @@ static void menu_grid_show(void)
 
     case MENU_PAGE_HW:
         /* SPK: speaker PA enable/mute (PB7 - UNCONFIRMED, see
-         * speaker_pa_set_enabled()'s comment). First (and so far
-         * only) HW-page option; slots 1-7 still intentionally empty,
-         * reserved for future hardware-related settings. */
+         * speaker_pa_set_enabled()'s comment). Slots 2-7 still
+         * intentionally empty, reserved for future hardware-related
+         * settings. */
         s_menu_tile_speaker_pa = (ui_button_t){
             MENU_OPT_COL(0), MENU_OPT_ROW(0), MENU_TILE_W, MENU_TILE_H,
             "SPK", GFX_COLOR_BLACK, GFX_COLOR_CYAN, GFX_COLOR_GRAY,
             2, 0, 1, menu_tile_speaker_pa_callback, NULL};
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_speaker_pa);
 
+        /* SLEEP: added 10/08/2026 - screen_sleep_enter()'s one-shot
+         * action tile, same YELLOW "leaves the current view" styling
+         * as EXIT (fitting: it closes the whole menu too, on the way
+         * to blanking everything else) rather than the
+         * CYAN(cycle)/DARKGRAY(detail) palette the rest of the grid
+         * uses, so it reads as a bigger step than an ordinary setting.
+         * No _refresh() needed - there's nothing left on screen to
+         * repaint the instant this fires. */
+        s_menu_tile_sleep = (ui_button_t){
+            MENU_OPT_COL(1), MENU_OPT_ROW(1), MENU_TILE_W, MENU_TILE_H,
+            "SLEEP", GFX_COLOR_BLACK, GFX_COLOR_YELLOW, GFX_COLOR_WHITE,
+            2, 0, 1, menu_tile_sleep_callback, NULL};
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_sleep);
+
         ui_screen_draw(&s_menu_screen);
         menu_tile_speaker_pa_refresh();
+        break;
+
+    case MENU_PAGE_DIG:
+        /* SHIFT/BAUD/INV - RTTY parameters that no longer fit on
+         * RADIO once it hit 8/8 (see s_menu_tile_rtty_shift's
+         * declaration comment). Slots 3-7 intentionally empty - room
+         * to grow DIG with future digital modes (PSK31 and similar). */
+        s_menu_tile_rtty_shift = (ui_button_t){
+            MENU_OPT_COL(0), MENU_OPT_ROW(0), MENU_TILE_W, MENU_TILE_H,
+            "SHIFT", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_rtty_shift_callback, NULL};
+        s_menu_tile_rtty_baud = (ui_button_t){
+            MENU_OPT_COL(1), MENU_OPT_ROW(1), MENU_TILE_W, MENU_TILE_H,
+            "BAUD", GFX_COLOR_BLACK, GFX_COLOR_CYAN, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_rtty_baud_callback, NULL};
+        s_menu_tile_rtty_inv = (ui_button_t){
+            MENU_OPT_COL(2), MENU_OPT_ROW(2), MENU_TILE_W, MENU_TILE_H,
+            "INV", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_rtty_inv_callback, NULL};
+
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_rtty_shift);
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_rtty_baud);
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_rtty_inv);
+
+        ui_screen_draw(&s_menu_screen);
+        menu_tile_rtty_shift_refresh();
+        menu_tile_rtty_baud_refresh();
+        menu_tile_rtty_inv_refresh();
         break;
 
     default:
@@ -3382,6 +4483,7 @@ static void menu_grid_show(void)
     s_menu_bands_active = 0U;
     s_menu_step_active = 0U;
     s_menu_mode_active = 0U;
+    s_menu_freq_active = 0U;
     s_menu_open = 1U;
 }
 
@@ -3398,6 +4500,7 @@ static void menu_screen_close(void)
     s_menu_bands_active = 0U;
     s_menu_step_active = 0U;
     s_menu_mode_active = 0U;
+    s_menu_freq_active = 0U;
     /* Only the spectrum+waterfall panels need restoring - the top
      * bar, right column, and bottom bar were never hidden or
      * touch-disabled while the menu was open (see s_menu_screen's
@@ -3416,6 +4519,53 @@ static void menu_screen_close(void)
      * case the ZOOM tile was used while the menu was open. */
     spec_span_labels_draw();
     debug_print("menu: settings screen closed\n");
+}
+
+/*
+ * screen_sleep_enter()/screen_wake() - added 10/08/2026, per the
+ * project owner: a HW-page action (see menu_tile_sleep_callback())
+ * for long, unattended listening sessions where the display is both a
+ * battery drain (backlight PWM + constant EXMC redraw traffic) and,
+ * sitting right next to the RF front-end on this board, a real source
+ * of receive interference. Closing the menu and blanking the panel
+ * here is a ONE-TIME EXMC write, not the ongoing traffic this mode
+ * exists to stop - everything else that would keep touching the panel
+ * (spectrum/waterfall redraw, the RTTY scope, touch polling) is
+ * instead skipped entirely by main()'s loop while s_screen_asleep is
+ * set - see s_screen_asleep's declaration comment for the exact list,
+ * and just as importantly, what DOESN'T stop: the radio itself.
+ * Demodulation/audio run straight off the DMA ISR (s_block_hook, see
+ * sdr_rx.c), never through this loop at all, so listening continues
+ * uninterrupted with the screen dark - that's the whole point.
+ */
+static void screen_sleep_enter(void)
+{
+    if (s_menu_open) {
+        menu_screen_close(); /* leaves nothing stale registered in s_menu_screen behind for when the menu next opens */
+    }
+    gfx_fill_screen(GFX_COLOR_BLACK); /* one-time write - see this function's comment, not the ongoing traffic sleep exists to stop */
+    backlight_sleep();
+    s_screen_asleep = 1U;
+    debug_print("screen: asleep (press the knob to wake)\n");
+}
+
+/*
+ * Wakes from screen_sleep_enter() - triggered from main()'s loop by a
+ * SHORT press on the encoder while s_screen_asleep is set (see its
+ * comment there for why LONG press and rotation are both discarded
+ * instead of also waking/acting on it).
+ */
+static void screen_wake(void)
+{
+    backlight_wake();
+    s_screen_asleep = 0U;
+    /* Full repaint, the same call boot uses - every periodic readout
+     * (spectrum/waterfall, time, battery, S-meter, badges) was frozen
+     * the whole time asleep, so a partial/diff redraw has nothing
+     * valid left to diff against; simplest correct thing is exactly
+     * what boot already does. */
+    radio_screen_draw();
+    debug_print("screen: awake\n");
 }
 
 /*
@@ -3467,12 +4617,572 @@ static void apply_lo_tune(uint32_t freq_hz)
     }
 }
 
+/*
+ * RF-level (analog PGA) auto-AGC poll - called once per main-loop
+ * iteration, same as tune_encoder_poll() right below (both are
+ * "drain some ISR-set state and act on it outside the ISR" jobs).
+ * See s_rf_agc_enabled's declaration comment for the full design;
+ * this function is just the ballistics: instant-ish attack (one
+ * RF_AGC_STEP_X2 PGA-backoff step per RF_AGC_ATTACK_COOLDOWN_MS at
+ * most, as fast as the flag keeps firing, escalating to an Rin step
+ * instead once PGA backoff is maxed and clipping still isn't gone),
+ * slow release (one step back down only after RF_AGC_RELEASE_COOLDOWN_MS
+ * of a genuinely clip-free signal, PGA first then Rin).
+ */
+static void rf_agc_poll(void)
+{
+    uint32_t now = g_msticks;
+    uint8_t clipped;
+
+    if (!s_rf_agc_enabled) {
+        return;
+    }
+
+    clipped = demod_am_get_and_clear_rf_clip_flag();
+
+    if (clipped) {
+        s_rf_agc_last_clip_ms = now; /* restarts the release timer on ANY clip, even mid-cooldown */
+        if ((now - s_rf_agc_last_action_ms) >= RF_AGC_ATTACK_COOLDOWN_MS) {
+            if (s_rf_agc_backoff_x2 < (int16_t)RF_AGC_BACKOFF_MAX_X2) {
+                s_rf_agc_backoff_x2 = (int16_t)(s_rf_agc_backoff_x2 + RF_AGC_STEP_X2);
+                if (s_rf_agc_backoff_x2 > (int16_t)RF_AGC_BACKOFF_MAX_X2) {
+                    s_rf_agc_backoff_x2 = (int16_t)RF_AGC_BACKOFF_MAX_X2;
+                }
+                rf_agc_apply_pga();
+                s_rf_agc_last_action_ms = now;
+                badges_draw(); /* updates the OVR badge - see its comment; safe from ANY context, unlike the old tile redraw */
+                debug_print_dec("rf_agc: backing off, now x2 units", (uint32_t)s_rf_agc_backoff_x2);
+            } else if (s_rf_agc_rin_level < (uint8_t)AIC3204_RIN_40K) {
+                /* PGA backoff already maxed out AND still clipping -
+                 * last resort, see s_rf_agc_enabled's comment. */
+                rf_agc_escalate_rin();
+                s_rf_agc_last_action_ms = now;
+            }
+            /* else: maxed PGA backoff AND maxed Rin (40k) - nothing
+             * more this can do automatically; a signal strong enough
+             * to still clip through 30dB of PGA backoff plus 12dB of
+             * Rin attenuation is beyond what this feature can fix -
+             * time for a real external attenuator or a lower manual
+             * PGA ceiling. */
+        }
+    } else if ((s_rf_agc_backoff_x2 > 0 || s_rf_agc_rin_level > 0U)
+               && (now - s_rf_agc_last_clip_ms) >= RF_AGC_RELEASE_COOLDOWN_MS
+               && (now - s_rf_agc_last_action_ms) >= RF_AGC_ATTACK_COOLDOWN_MS) {
+        if (s_rf_agc_backoff_x2 > 0) {
+            s_rf_agc_backoff_x2 = (int16_t)(s_rf_agc_backoff_x2 - RF_AGC_STEP_X2);
+            if (s_rf_agc_backoff_x2 < 0) {
+                s_rf_agc_backoff_x2 = 0;
+            }
+            rf_agc_apply_pga();
+            s_rf_agc_last_action_ms = now;
+            badges_draw(); /* see the attack branch's comment above */
+            debug_print_dec("rf_agc: recovering, now x2 units", (uint32_t)s_rf_agc_backoff_x2);
+        } else {
+            /* PGA backoff already fully recovered to 0 at this Rin
+             * level - step Rin back down one, which itself restores
+             * some PGA backoff again (see rf_agc_deescalate_rin()) so
+             * there's room to keep recovering PGA-side on the NEXT
+             * release step instead of needing a second Rin step right
+             * away. */
+            rf_agc_deescalate_rin();
+            s_rf_agc_last_action_ms = now;
+        }
+        /* Deliberately NOT resetting s_rf_agc_last_clip_ms here - the
+         * NEXT recovery step still has to wait out the same
+         * RELEASE_COOLDOWN_MS measured from the last real clip, not
+         * from this recovery step, so a string of steps back up to
+         * the ceiling doesn't creep faster than one every 3s just
+         * because each step itself resets some other timer. */
+    }
+}
+
+/*
+ * Multi-line decoded-text panel - REWRITTEN 10/08/2026, per the
+ * project owner, from the original single-line ticker (see this
+ * file's git history for rtty_screen_text_push()): that version had
+ * two real problems - CR/LF collapsed to a plain space instead of an
+ * actual line break (so a station's line structure was invisible, just
+ * one long run-on ticker), and only RTTY_TEXT_STRIP_H (24px, one line)
+ * was reserved for it, no real scrollback at all.
+ *
+ * Now drawn into the SAME screen region the normal waterfall panel
+ * occupies (WF_PANEL_Y downward) - the waterfall itself is frozen the
+ * whole time the RTTY scope is showing anyway (see rtty_scope_active()'s
+ * comment: sdr_spectrum_waterfall_tick() simply isn't called), so that
+ * space was sitting idle. ALSO ENLARGED beyond the waterfall's native
+ * 76px by reclaiming part of the scope's own trace height too - see
+ * RTTY_TEXT_PANEL_H/RTTY_SCOPE_TRACE_H's comment just below for the
+ * exact split. Net effect: a real multi-line RTTY_TEXT_ROWS x
+ * RTTY_TEXT_COLS character grid instead of one ticker line, at the
+ * cost of a shorter (but still plenty resolving, see rtty_scope_draw()'s
+ * own comment on why the FFT itself is unaffected) tuning-scope trace.
+ *
+ * Genuinely LINE-ORIENTED now, not a byte ring buffer: rtty_text_push()
+ * tracks a cursor (row, col) into a fixed character grid.
+ *   - Printable characters just get placed at the cursor and advance
+ *     it; hitting RTTY_TEXT_COLS without an explicit CR/LF hard-wraps
+ *     to a new row (character wrap, not word wrap - this decoder has
+ *     no idea where a word boundary will fall until a character is
+ *     already committed to the grid, so word-wrap would need a whole
+ *     extra layer of lookahead/reflow for little practical benefit at
+ *     ~50 baud).
+ *   - CR and LF both start a new row - the actual fix for "line
+ *     endings aren't interpreted" - but a RUN of consecutive CR/LF
+ *     characters (real stations commonly send CR CR LF, or CR LF, at
+ *     end of line - the double CR gives an electromechanical
+ *     teleprinter's print head time to return) collapses to exactly
+ *     ONE line break via s_rtty_text_last_was_eol, so that convention
+ *     doesn't leave a trail of blank rows eating into the limited
+ *     scrollback.
+ *   - Once RTTY_TEXT_ROWS fills, the grid scrolls up by one row (the
+ *     oldest line dropped) instead of wrapping/overwriting - a real
+ *     scrollback feel instead of the old ticker's single-line slide.
+ */
+#define RTTY_TEXT_PANEL_H  144U /* exactly RTTY_TEXT_ROWS*RTTY_TEXT_LINE_H, no leftover slack - see both below */
+#define RTTY_TEXT_PANEL_Y  (uint16_t)((WF_PANEL_Y + WATERFALL_ROWS + 4U) - RTTY_TEXT_PANEL_H)
+#define RTTY_SCOPE_GAP_H   2U /* thin gap between the scope trace and the text panel, same idea as WF_PANEL_Y's own "64+280+2" gap from the normal spectrum panel */
+#define RTTY_SCOPE_TRACE_H (uint16_t)(RTTY_TEXT_PANEL_Y - SPEC_Y - RTTY_SCOPE_GAP_H) /* 358 - 144 - 2 = 212, replaces the old SPEC_H-based bar_area_h */
+
+#define RTTY_TEXT_SCALE    2U
+#define RTTY_TEXT_LINE_H   18U /* 7px glyph (gfx_font.h's GFX_FONT_HEIGHT) * scale 2 = 14, +4 leading */
+#define RTTY_TEXT_CHAR_W   12U /* (5+1)px * scale 2 - mirrors gfx.c's own per-glyph step formula (gfx_font.h isn't included outside gfx.c, so this is a plain literal like RTTY_TEXT_COLS' comment already is) */
+#define RTTY_TEXT_COLS     56U /* MAIN_W(676) / RTTY_TEXT_CHAR_W = 56 - same sizing the old ticker used */
+#define RTTY_TEXT_ROWS     8U  /* RTTY_TEXT_PANEL_H / RTTY_TEXT_LINE_H, exact */
+
+static char    s_rtty_text_grid[RTTY_TEXT_ROWS][RTTY_TEXT_COLS + 1U]; /* +1 NUL per row */
+static uint8_t s_rtty_text_row_len[RTTY_TEXT_ROWS];
+static uint8_t s_rtty_text_cur_row;
+static uint8_t s_rtty_text_cur_col;
+static uint8_t s_rtty_text_last_was_eol = 1U; /* starts "true" so a leading CR/LF right after rtty_text_panel_reset() doesn't waste a blank first line */
+
+/*
+ * s_rtty_text_draw_row/col: how far rtty_text_panel_draw() has ALREADY
+ * painted onto the real LCD - always <= (s_rtty_text_cur_row,
+ * s_rtty_text_cur_col) in reading order. Added 10/08/2026, per the
+ * project owner ("mucho flicker el texto"): the original version
+ * cleared the WHOLE 676x144 panel (gfx_fill_rect, ~97k pixels) and
+ * redrew every line on EVERY new character, even though normally only
+ * the single newest glyph actually changed - that clear-then-redraw
+ * cycle is exactly what read as flicker (a visible black flash before
+ * the text reappears), and was needless EXMC traffic on top of it.
+ * Now the common case (appending a character, no scroll) draws ONLY
+ * that one new glyph via gfx_char() directly onto its own still-blank
+ * background - no clear at all, so nothing ever flashes.
+ * s_rtty_text_full_redraw (below) is the escape hatch for the cases
+ * that genuinely need a full repaint (grid scrolled - every row's
+ * SCREEN POSITION changed - or the panel was just covered by the menu
+ * and needs repainting from the grid, not the grid re-cleared - see
+ * main()'s two separate transition checks for entering RTTY mode vs.
+ * merely the menu closing again).
+ */
+static uint8_t s_rtty_text_draw_row;
+static uint8_t s_rtty_text_draw_col;
+static uint8_t s_rtty_text_full_redraw = 1U; /* starts 1 so the very first draw after boot/reset paints the (blank) panel once */
+
+/*
+ * Blanks the grid and the panel, and resets the cursor - called ONLY
+ * on genuinely entering RTTY mode fresh (see main()'s s_rtty_mode_was_
+ * active transition, NOT the s_rtty_scope_was_active one - opening/
+ * closing the menu while already in RTTY must NOT wipe the
+ * scrollback, only repaint it, see rtty_text_force_redraw() below).
+ */
+static void rtty_text_panel_reset(void)
+{
+    uint8_t r;
+
+    for (r = 0; r < RTTY_TEXT_ROWS; r++) {
+        s_rtty_text_grid[r][0] = '\0';
+        s_rtty_text_row_len[r] = 0U;
+    }
+    s_rtty_text_cur_row = 0U;
+    s_rtty_text_cur_col = 0U;
+    s_rtty_text_last_was_eol = 1U;
+    gfx_fill_rect(0, RTTY_TEXT_PANEL_Y, MAIN_W, RTTY_TEXT_PANEL_H, GFX_COLOR_BLACK);
+    s_rtty_text_draw_row = 0U;
+    s_rtty_text_draw_col = 0U;
+    s_rtty_text_full_redraw = 0U; /* just painted blank directly above - nothing left pending */
+}
+
+/*
+ * Forces the NEXT rtty_text_panel_draw() to do a full repaint from the
+ * grid, WITHOUT touching the grid's actual content - added 10/08/2026
+ * for the "menu covered this area, now it needs repainting" case (see
+ * main()'s comment): the scrollback text itself is still exactly
+ * right, only the physical LCD pixels underneath went stale while the
+ * menu was drawn over them.
+ */
+static void rtty_text_force_redraw(void)
+{
+    s_rtty_text_full_redraw = 1U;
+}
+
+/* Advances the cursor to a fresh row, scrolling the whole grid up by
+ * one (dropping the oldest line) once RTTY_TEXT_ROWS is full - the
+ * actual "real scrollback" behavior, versus the old ticker's single-
+ * line slide. A scroll shifts every row's SCREEN position, so the
+ * incremental single-glyph draw path can't handle it - falls back to
+ * rtty_text_force_redraw() in that case only. */
+static void rtty_text_newline(void)
+{
+    if ((uint8_t)(s_rtty_text_cur_row + 1U) < RTTY_TEXT_ROWS) {
+        s_rtty_text_cur_row++;
+    } else {
+        uint8_t r;
+
+        for (r = 0; r < (RTTY_TEXT_ROWS - 1U); r++) {
+            uint8_t i;
+
+            for (i = 0; i <= s_rtty_text_row_len[r + 1U]; i++) { /* <= to copy the NUL too */
+                s_rtty_text_grid[r][i] = s_rtty_text_grid[r + 1U][i];
+            }
+            s_rtty_text_row_len[r] = s_rtty_text_row_len[r + 1U];
+        }
+        s_rtty_text_grid[RTTY_TEXT_ROWS - 1U][0] = '\0';
+        s_rtty_text_row_len[RTTY_TEXT_ROWS - 1U] = 0U;
+        /* s_rtty_text_cur_row stays at RTTY_TEXT_ROWS-1 - already the
+         * bottom row before AND after the scroll, only its CONTENTS
+         * (now blank, ready for the new line) changed. */
+        rtty_text_force_redraw();
+    }
+    s_rtty_text_cur_col = 0U;
+}
+
+/* Places one printable character at the cursor, hard-wrapping to a
+ * new row first if the current one is already full (see this block's
+ * top comment on why character-wrap, not word-wrap). */
+static void rtty_text_putc(char c)
+{
+    uint8_t row;
+
+    if (s_rtty_text_cur_col >= RTTY_TEXT_COLS) {
+        rtty_text_newline();
+    }
+    row = s_rtty_text_cur_row;
+    s_rtty_text_grid[row][s_rtty_text_cur_col] = c;
+    s_rtty_text_cur_col++;
+    s_rtty_text_row_len[row] = s_rtty_text_cur_col;
+    s_rtty_text_grid[row][s_rtty_text_cur_col] = '\0';
+}
+
+/*
+ * Feeds one decoded character into the multi-line grid - the actual
+ * CR/LF interpretation fix, replacing the old rtty_screen_text_push()'s
+ * "collapse to a space" - see this block's top comment for the
+ * consecutive-CR/LF collapsing rule. Purely updates the GRID (state) -
+ * never touches the LCD directly, so it's safe to call unconditionally
+ * from rtty_poll() every main loop pass regardless of whether the
+ * scope panel is actually visible right now (menu open, different
+ * mode momentarily, etc.) - same "ISR/background sets state, the
+ * visible-when-appropriate draw call reads it" split this project
+ * already uses everywhere else. rtty_text_panel_draw() (called only
+ * when the scope is genuinely on screen) is what turns this into
+ * pixels.
+ */
+static void rtty_text_push(char c)
+{
+    if (c == '\r' || c == '\n') {
+        if (!s_rtty_text_last_was_eol) {
+            rtty_text_newline();
+        }
+        s_rtty_text_last_was_eol = 1U;
+    } else {
+        s_rtty_text_last_was_eol = 0U;
+        rtty_text_putc(c);
+    }
+}
+
+/*
+ * Paints the panel from the grid - see s_rtty_text_draw_row/col's
+ * comment for the flicker fix this implements. Two paths:
+ *
+ *   - FULL redraw (s_rtty_text_full_redraw): the expensive path, only
+ *     taken right after a scroll or after the menu covered this area -
+ *     clears the whole panel once and redraws every non-empty row.
+ *   - INCREMENTAL (the common case, every OTHER call): draws just the
+ *     characters that arrived since the last draw, one gfx_char() each,
+ *     straight onto still-blank pixels - no clear, so nothing flashes.
+ *     Safe to assume at most one row's worth of characters arrived
+ *     between two calls: RTTY's fastest common rate (100 baud) is
+ *     still one character every ~10ms, while this is only called once
+ *     per scope FFT frame (~20-30fps, ~33-50ms/frame) - filling an
+ *     entire 56-char row between two draws would need a baud rate far
+ *     beyond anything this decoder supports.
+ */
+static void rtty_text_panel_draw(void)
+{
+    if (s_rtty_text_full_redraw) {
+        uint8_t r;
+
+        gfx_fill_rect(0, RTTY_TEXT_PANEL_Y, MAIN_W, RTTY_TEXT_PANEL_H, GFX_COLOR_BLACK);
+        for (r = 0; r < RTTY_TEXT_ROWS; r++) {
+            if (s_rtty_text_row_len[r] > 0U) {
+                gfx_text(4, (uint16_t)(RTTY_TEXT_PANEL_Y + 4U + (uint16_t)r * RTTY_TEXT_LINE_H),
+                         s_rtty_text_grid[r], GFX_COLOR_GREEN, GFX_COLOR_BLACK, RTTY_TEXT_SCALE);
+            }
+        }
+        s_rtty_text_full_redraw = 0U;
+        s_rtty_text_draw_row = s_rtty_text_cur_row;
+        s_rtty_text_draw_col = s_rtty_text_cur_col;
+        return;
+    }
+
+    while (s_rtty_text_draw_row != s_rtty_text_cur_row || s_rtty_text_draw_col != s_rtty_text_cur_col) {
+        if (s_rtty_text_draw_col >= s_rtty_text_row_len[s_rtty_text_draw_row]) {
+            /* This row is fully drawn already (a newline happened,
+             * without a scroll - see rtty_text_newline()) - move on to
+             * the next one. That row's length is FINAL at this point
+             * (rtty_text_putc() only ever appends to the CURRENT row),
+             * so there's nothing left behind to catch up on. */
+            s_rtty_text_draw_row++;
+            s_rtty_text_draw_col = 0U;
+            continue;
+        }
+        gfx_char((uint16_t)(4U + (uint16_t)s_rtty_text_draw_col * RTTY_TEXT_CHAR_W),
+                 (uint16_t)(RTTY_TEXT_PANEL_Y + 4U + (uint16_t)s_rtty_text_draw_row * RTTY_TEXT_LINE_H),
+                 s_rtty_text_grid[s_rtty_text_draw_row][s_rtty_text_draw_col],
+                 GFX_COLOR_GREEN, GFX_COLOR_BLACK, RTTY_TEXT_SCALE);
+        s_rtty_text_draw_col++;
+    }
+}
+
+/*
+ * Drains rtty.c's decoded-character ring buffer, both to the on-screen
+ * text panel (rtty_text_push(), above) and to debug UART - added
+ * 08/08/2026. UART side: accumulates into a small line buffer and
+ * flushes on CR/LF or when nearly full, rather than one debug_print()
+ * call per character - RTTY's ~45 baud means a character every
+ * ~170ms at best, so call overhead isn't a real concern, but a few
+ * dozen individual "single-char" UART writes per line would still be
+ * needlessly noisy in the log output. Both consumers read from the
+ * SAME rtty_get_char() ring buffer via this one drain loop - can't
+ * have two separate poll functions each calling rtty_get_char()
+ * independently, since it's a single tail pointer (whichever drains
+ * first would silently steal characters from the other).
+ */
+static void rtty_poll(void)
+{
+    static char line[64];
+    static uint8_t line_len = 0U;
+    char c;
+
+    while (rtty_get_char(&c)) {
+        rtty_text_push(c);
+
+        if (c == '\r' || c == '\n') {
+            if (line_len > 0U) {
+                line[line_len] = '\0';
+                debug_print("rtty: ");
+                debug_print(line);
+                debug_print("\n");
+                line_len = 0U;
+            }
+        } else if (line_len < (uint8_t)(sizeof(line) - 1U)) {
+            line[line_len] = c;
+            line_len++;
+        } else {
+            /* line buffer full without a CR/LF - flush what we have
+             * rather than silently drop the rest of a long line. */
+            line[line_len] = '\0';
+            debug_print("rtty: ");
+            debug_print(line);
+            debug_print("\n");
+            line_len = 0U;
+        }
+    }
+}
+
+/*
+ * Clears the spectrum panel once, on the transition INTO the scope
+ * from the normal spectrum (see that call site's comment) - never
+ * per-frame. Unlike the old hand-rolled bar-diff renderer this used
+ * to protect, spectrum_draw() (see rtty_scope_draw(), rewritten
+ * 08/08/2026 to reuse it - per the project owner, wanting the normal
+ * spectrum's HEATMAP/LINE/OUTLINE rendering instead of a plain green
+ * bar plot) already redraws every column unconditionally each call,
+ * so there's no "stale diff baseline" risk anymore - this is now
+ * purely cosmetic, avoiding a brief (<=1 scope-frame, ~43ms) flash of
+ * the old RF spectrum's last frame while the FIRST new FFT window
+ * fills. Only clears down to RTTY_SCOPE_TRACE_H now (used to be the
+ * full old SPEC_H) - the rest of the old spectrum-panel area below
+ * that now belongs to the text panel, reset separately by
+ * rtty_text_panel_reset() at the same call site (see main()'s
+ * transition block).
+ */
+static void rtty_scope_panel_reset(void)
+{
+    gfx_fill_rect(0, SPEC_Y, MAIN_W, RTTY_SCOPE_TRACE_H, GFX_COLOR_BLACK);
+}
+
+/*
+ * 1 when the RTTY tuning scope should be showing INSTEAD of the
+ * normal RF spectrum: actually in USB or LSB (the only modes RTTY/
+ * rtty_scope make sense in) AND the RTTY decoder itself switched on -
+ * i.e. currently in one of the RTTY-L/RTTY-U modes (see
+ * k_demod_modes[]/menu_mode_preset_callback()), not plain USB/LSB.
+ * Checked fresh every frame rather than cached - cheap (two reads),
+ * and means flipping RTTY on/off or changing mode swaps the panel
+ * back and forth automatically, no extra plumbing needed.
+ */
+static uint8_t rtty_scope_active(void)
+{
+    demod_mode_t m = demod_am_get_mode();
+    return (uint8_t)((m == DEMOD_MODE_USB || m == DEMOD_MODE_LSB) && rtty_get_enabled());
+}
+
+/*
+ * Draws the RTTY tuning scope trace into the TOP RTTY_SCOPE_TRACE_H px
+ * of the normal spectrum panel's area (SPEC_Y/MAIN_W) - see
+ * rtty_scope_active() for when this replaces the normal spectrum
+ * instead of sdr_spectrum_waterfall_tick(), and this block's own
+ * comment (right above RTTY_TEXT_PANEL_H) for how that height and the
+ * text panel below it split the combined SPEC_Y..(WF_PANEL_Y+
+ * WATERFALL_ROWS+4) region between them. Trace itself via
+ * spectrum_draw() - REUSED from the normal RF spectrum (08/08/2026,
+ * per the project owner) rather than this module's own original
+ * hand-rolled green bar plot. spectrum_draw() is genuinely decoupled
+ * from its usual RF/I-Q data source (see spectrum.h: it just takes a
+ * dB array + a rectangle), so it picks up whichever style (HEATMAP/
+ * LINE/OUTLINE, spectrum_set_style()) and line-smooth setting is
+ * already active for the normal spectrum, automatically - no separate
+ * style state for this panel.
+ *
+ * *** WHY A SEPARATE FFT ENGINE STILL EXISTS (rtty_scope.c), EVEN
+ * THOUGH THE RENDERER IS SHARED *** - see rtty_scope.h's own comment:
+ * reusing spectrum_draw() only reuses the RENDERING. The actual FFT
+ * resolution problem that motivated a dedicated 512-point real FFT
+ * (23.4Hz/bin @ 12kHz vs the RF spectrum's fixed 256-point/46.9Hz-bin
+ * @ its own 8X zoom - insufficient to separate a 170Hz RTTY shift,
+ * confirmed by hand before this was built) is completely unrelated to
+ * which function paints the pixels - fft.c's FFT_SIZE is a
+ * compile-time constant shared by the real-time RF spectrum/waterfall
+ * path, not something this panel can safely resize without touching
+ * that shared, performance-critical engine. Shrinking RTTY_SCOPE_
+ * TRACE_H (see this block's top comment) only affects the trace's
+ * on-screen PIXEL HEIGHT (amplitude axis) - it has no bearing on this
+ * frequency-axis resolution at all.
+ *
+ * Linear magnitude -> dB conversion: rtty_scope_get_frame() returns
+ * power normalized to the frame's own peak (0..1, see its comment) -
+ * converted here to dB relative to that peak (0dB at the peak,
+ * clamped to a DB_FLOOR below), matching the normal spectrum's own
+ * dB-based convention and giving spectrum_draw()'s log-scaled
+ * rendering something meaningful to compress - a raw linear 0..1
+ * plot would look overly spiky (peak dominant, everything else
+ * nearly invisible) compared to how any of HEATMAP/LINE/OUTLINE
+ * actually expect to be fed. Uses the same IEEE754 bit-trick log2
+ * approximation as the S-meter (smeter_log2_approx()) instead of
+ * libm's log10f, for the same reason: this project links without
+ * syscall stubs, and log10f drags in __errno.
+ *
+ * Two vertical marker lines at the LIVE rtty_get_mark_hz()/
+ * rtty_get_space_hz() (cyan/orange) - not the config.h defaults
+ * directly, since those are now just the STARTING point (see
+ * rtty_set_mark_space_hz()'s comment: the encoder nudges these live
+ * while the scope is showing). Drawn AFTER spectrum_draw() every
+ * frame, unconditionally - no more separate "erase the old line
+ * position" bookkeeping needed (that used to matter when this used a
+ * diff-based bar renderer that only touched CHANGED columns;
+ * spectrum_draw() repaints every column every call, so any previous
+ * line position gets overwritten as a side effect automatically).
+ *
+ * Text panel drawn LAST, via rtty_text_panel_draw() - separated out
+ * (10/08/2026) from this function's own body since it now has its own
+ * dirty-flag gating (see s_rtty_text_dirty's comment) rather than the
+ * old ticker's unconditional every-frame repaint.
+ */
+#define RTTY_SCOPE_DB_FLOOR -60.0f
+static void rtty_scope_draw(void)
+{
+    static float s_db[RTTY_SCOPE_BINS];
+    const float *mag;
+    float hz_per_bin = rtty_scope_hz_per_bin();
+    float nyquist_hz = hz_per_bin * (float)RTTY_SCOPE_BINS;
+    uint16_t bar_y = SPEC_Y;
+    uint16_t bar_area_h = RTTY_SCOPE_TRACE_H;
+    uint32_t i;
+    uint16_t mark_x, space_x;
+
+    if (!rtty_scope_frame_ready()) {
+        return;
+    }
+    mag = rtty_scope_get_frame();
+
+    for (i = 0; i < RTTY_SCOPE_BINS; i++) {
+        /* 10*log10(x) = 10*log2(x)/log2(10) = 10*log2(x)*0.30103.
+         * Clamp the input away from 0 first (smeter_log2_approx()'s
+         * bit-trick needs x>0), same floor-then-log shape as
+         * smeter_segments_from_peak() uses. */
+        float p = mag[i];
+        if (p < 1.0e-6f) { p = 1.0e-6f; }
+        s_db[i] = 10.0f * smeter_log2_approx(p) * 0.30103f;
+        if (s_db[i] < RTTY_SCOPE_DB_FLOOR) { s_db[i] = RTTY_SCOPE_DB_FLOOR; }
+    }
+
+    spectrum_draw(s_db, RTTY_SCOPE_BINS, 0, bar_y, MAIN_W, bar_area_h,
+                  RTTY_SCOPE_DB_FLOOR, 0.0f,
+                  0,        /* center_mark_offset_px - no meaningful "LO" in audio-domain, dead center is fine/harmless */
+                  0, 0, 0); /* band_active off - mark/space already have their own dedicated lines below */
+
+    mark_x  = (uint16_t)((rtty_get_mark_hz()  / nyquist_hz) * (float)MAIN_W);
+    space_x = (uint16_t)((rtty_get_space_hz() / nyquist_hz) * (float)MAIN_W);
+    if (mark_x < MAIN_W)  { gfx_vline(mark_x,  bar_y, bar_area_h, GFX_COLOR_CYAN); }
+    if (space_x < MAIN_W) { gfx_vline(space_x, bar_y, bar_area_h, GFX_COLOR_ORANGE); }
+
+    rtty_text_panel_draw();
+}
+
+
 static void tune_encoder_poll(void)
 {
     int32_t detents    = encoder_take_delta();
     uint8_t press       = encoder_take_press();
     uint8_t long_press  = encoder_take_long_press();
     uint8_t changed = 0;
+
+    /*
+     * While the RTTY scope is showing AND the settings menu is
+     * closed, the encoder temporarily nudges BOTH mark AND space
+     * together (CONFIG_RTTY_ENCODER_STEP_HZ per detent, preserving
+     * the shift between them) instead of tuning the VFO - see
+     * rtty_set_mark_space_hz()'s comment for why this needs to be a
+     * LIVE, no-recompile adjustment. Checked first, before touching
+     * s_encoder_target/press/long_press below, and returns
+     * immediately - same "intercept before the normal target logic"
+     * shape as the long-press handler right after this block. Button
+     * press/long-press are silently swallowed while in this mode (no
+     * tune-step-cycle, no "back to TUNE" gesture) - fine while RTTY
+     * doesn't have its own detail-view controls yet, not worth the
+     * extra complexity of wiring those here too.
+     *
+     * *** !s_menu_open added 08/08/2026 *** - without it, the encoder
+     * kept nudging mark/space even while MENU/MODE was open, hijacking
+     * it away from whatever the open menu screen actually expects
+     * (tile navigation, a detail-view value, etc.) - same class of bug
+     * as rtty_scope_draw() not checking s_menu_open, just on the input
+     * side instead of the display side.
+     */
+    if (rtty_scope_active() && !s_menu_open) {
+        if (detents != 0) {
+            float step = (float)detents * CONFIG_RTTY_ENCODER_STEP_HZ;
+            float mark  = rtty_get_mark_hz()  + step;
+            float space = rtty_get_space_hz() + step;
+
+            /* Clamp to a sane positive range within the scope's own
+             * 0..6kHz (Nyquist) display - besides being physically
+             * meaningless outside that band, a negative Hz value
+             * would also misbehave cast to uint32_t for the debug
+             * prints below. */
+            if (mark  < 0.0f) { mark  = 0.0f; }
+            if (space < 0.0f) { space = 0.0f; }
+            if (mark  > 6000.0f) { mark  = 6000.0f; }
+            if (space > 6000.0f) { space = 6000.0f; }
+
+            rtty_set_mark_space_hz(mark, space);
+            debug_print_dec("rtty: mark Hz now", (uint32_t)mark);
+            debug_print_dec("rtty: space Hz now", (uint32_t)space);
+        }
+        return;
+    }
 
     /* Long-press: unconditionally hands the knob back to TUNE and, if
      * the settings menu is open, closes it too - one gesture that
@@ -3531,7 +5241,6 @@ static void tune_encoder_poll(void)
     }
 
     if (s_encoder_target == ENCODER_TARGET_PGA) {
-
         /* Same "button still cycles tune step" courtesy as VOLUME
          * above. */
         if (press) {
@@ -3547,9 +5256,36 @@ static void tune_encoder_poll(void)
 
             if ((int16_t)v != s_pga_gain_db_x2) {
                 s_pga_gain_db_x2 = (int16_t)v;
-                aic3204_set_pga_gain_db((float)s_pga_gain_db_x2 * 0.5f);
+                /* rf_agc_apply_pga() (07/08/2026), not a direct
+                 * aic3204_set_pga_gain_db() call - the encoder now
+                 * moves the CEILING, and this recomputes/applies the
+                 * effective gain (ceiling - any active RF-AGC
+                 * backoff) instead of overwriting the codec with the
+                 * raw ceiling and silently undoing an active backoff -
+                 * see s_rf_agc_enabled's declaration comment. */
+                rf_agc_apply_pga();
                 settings_value_redraw();
             }
+        }
+        return;
+    }
+
+    if (s_encoder_target == ENCODER_TARGET_RTTY_SHIFT) {
+        /* Same "button still cycles tune step" courtesy as PGA/VOLUME
+         * above. */
+        if (press) {
+            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            if (!s_menu_open) { step_display_draw(); }
+        }
+
+        if (detents != 0) {
+            float v = rtty_get_shift_hz() + (float)detents * CONFIG_RTTY_SHIFT_STEP_HZ;
+
+            if (v < CONFIG_RTTY_SHIFT_MIN_HZ) { v = CONFIG_RTTY_SHIFT_MIN_HZ; }
+            if (v > CONFIG_RTTY_SHIFT_MAX_HZ) { v = CONFIG_RTTY_SHIFT_MAX_HZ; }
+
+            rtty_set_shift_hz(v);
+            settings_value_redraw();
         }
         return;
     }
@@ -4081,6 +5817,18 @@ static void demo_touch_poll(void)
     static uint8_t s_spec_drag_active = 0U;     /* 1 while the CURRENT gesture is a spectrum drag-to-tune */
     static uint16_t s_spec_drag_prev_x = 0U;    /* x of the last sample applied, for per-sample deltas */
     static float s_spec_drag_hz_accum = 0.0f;   /* sub-SPEC_DRAG_HZ_STEP carry - see spec_drag_tune_apply()'s comment */
+    /* s_freq_tap_active: added 07/08/2026 alongside the frequency
+     * keypad - a tap starting in the top-bar FREQ_TAP_X1/Y1 zone opens
+     * menu_freq_keypad_show(). Decided once on press and honored
+     * through the whole gesture (fires on release regardless of where
+     * the finger ends up), same deliberate reasoning as
+     * s_touch_owner_is_menu/s_spec_drag_active above - the release
+     * sample's coordinates on this resistive panel can't be trusted.
+     * Checked entirely outside the ui_screen framework (no ui_button_t
+     * sits over the frequency readout - see freq_display_draw()'s
+     * comment for why that wouldn't work cleanly), same treatment as
+     * the spectrum drag zone just above it. */
+    static uint8_t s_freq_tap_active = 0U;
     uint16_t x = 0, y = 0;
     uint8_t pressed = touch_read(&x, &y);
 
@@ -4105,6 +5853,18 @@ static void demo_touch_poll(void)
             && x < MAIN_W && y >= SPEC_Y && y < (uint16_t)(SPEC_Y + SPEC_H));
         s_spec_drag_prev_x = x;
         s_spec_drag_hz_accum = 0.0f;
+
+        /* Frequency keypad tap zone - top bar only, so mutually
+         * exclusive with both of the above by construction (MENU_AREA
+         * and the spectrum panel both start at SPEC_Y, well below
+         * FREQ_TAP_Y1/TOP_H). Allowed even while s_menu_open (opening
+         * the keypad from on top of some OTHER menu screen just swaps
+         * s_menu_screen's contents, same as tapping BANDS/STEP/MODE
+         * already does from the bottom bar while the settings grid is
+         * open) - only excluded while a gesture already claimed by
+         * the menu or the spectrum drag, which can't happen here
+         * anyway since this zone is geometrically disjoint from both. */
+        s_freq_tap_active = (uint8_t)(x < FREQ_TAP_X1 && y < FREQ_TAP_Y1);
     }
 
     if (s_touch_owner_is_menu) {
@@ -4118,9 +5878,14 @@ static void demo_touch_poll(void)
         s_spec_drag_prev_x = x;
     }
 
+    if (s_freq_tap_active && !pressed) {
+        menu_freq_keypad_show();
+    }
+
     if (!pressed) {
         s_touch_active = 0U;   /* gesture over - the next press re-decides ownership */
         s_spec_drag_active = 0U;
+        s_freq_tap_active = 0U;
     }
 }
 

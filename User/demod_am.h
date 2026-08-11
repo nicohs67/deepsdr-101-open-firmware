@@ -584,6 +584,38 @@ demod_am_cycles_breakdown_t demod_am_get_last_cycles_breakdown(void);
  * dB/S-units in the main loop, not here. Safe to poll anytime. */
 float demod_am_get_signal_peak(void);
 
+/*
+ * RF front-end clipping flag - added 07/08/2026, per the project
+ * owner, for the RF-level (analog PGA) auto-AGC in main.c
+ * (rf_agc_poll()/s_rf_agc_enabled). Set from INSIDE the RX DMA
+ * interrupt (both demod_am_process_raw() and demod_wfm_process_raw()
+ * scan every raw_interleaved block for samples riding the ADC's
+ * railed value - see rf_clip_scan() in demod_am.c), because that's
+ * the only place raw, pre-DSP samples ever exist: by the time
+ * anything downstream (envelope, AGC, s_env[]) sees a value, a
+ * genuinely clipped sample already lost information no software can
+ * recover - digital AGC gain math being mathematically correct
+ * doesn't help if the INPUT was already flat-topped. This flag is
+ * the escape hatch: the ISR can detect it cheaply (a plain scan, same
+ * cost class as the existing min/max tracking), but changing the
+ * actual PGA gain means a bit-banged I2C transaction
+ * (aic3204_set_pga_gain_db()) that must NEVER run inside an ISR (see
+ * demod_am_process_raw()'s own "runs in the RX DMA interrupt"
+ * warning) - so this just sets a flag and gets out; main.c's
+ * rf_agc_poll(), called once per main-loop iteration same as
+ * tune_encoder_poll(), is what actually acts on it.
+ *
+ * Test-and-clear semantics (reads AND clears the flag in one call) -
+ * the ISR only ever sets it (never clears), so there's no meaningful
+ * race beyond the same "plain volatile shared with an ISR" class
+ * every other cross-context field in this file already accepts (e.g.
+ * s_last_cycles_*) - a flag set between the read and the clear just
+ * means it's caught on the NEXT poll instead, harmless for something
+ * this coarse-grained (backoff steps happen on a many-milliseconds
+ * cooldown, not sample-accurate).
+ */
+uint8_t demod_am_get_and_clear_rf_clip_flag(void);
+
 /* LO offset for low-IF tuning: actual LO = selected_freq -
  * DEMOD_IF_OFFSET_HZ (see the LOW-IF TUNING note above). Currently
  * Fs/4 (96000/4 = 24000 - was 48000/4 = 12000 before AM/SSB/NFM moved

@@ -1,8 +1,8 @@
 # Descrption
 
 This project is a collaboration between EA8DGL Esteban, UA6YKK Alexandr and 
-EA7GIB Blas, aiming to create open firmware for the DEEPSDR 101 with the 
-GD32F450 MCU. 
+EA7GIB Blas, aiming to create open firmware for the DEEPSDR 101 and BAJEI SDR V5 
+clone with the GD32F450 MCU. 
 
 It is currently in the development phase, and programming is being carried 
 out primarily using AI. The current version is functional and supports most 

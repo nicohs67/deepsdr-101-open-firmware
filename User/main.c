@@ -5,6 +5,9 @@
 #include "ui.h"
 #include "waterfall.h"
 #include "touch.h"
+#include "touch_calib.h"
+#include "spi_flash.h"
+#include "settings.h"
 #include "aic3204.h"
 #include "config.h"
 #include "rtty.h"
@@ -61,6 +64,7 @@ static void rtty_text_panel_reset(void);
 static void rtty_text_force_redraw(void);
 static void rtty_scope_draw(void);
 static void apply_lo_tune(uint32_t freq_hz);
+static void apply_demod_mode(demod_mode_t mode);
 static void menu_detail_value_redraw(void);
 static void settings_value_redraw(void);
 
@@ -69,6 +73,21 @@ static void settings_value_redraw(void);
 #if CALIB_HEIGHT_TEST
 static void calib_height_ruler_draw(void);
 #endif
+
+/* Set to 1 to stream raw+calibrated touch coordinates to the debug
+ * UART (throttled, ~150ms) while a finger is held down anywhere on
+ * screen - see touch_debug_stream_poll()'s comment. Temporary
+ * diagnostic for the "screen edges don't respond" report, 18/08/2026 -
+ * back to 0 once that's tracked down. */
+#define TOUCH_EDGE_DEBUG 1
+
+/* Set to 1 to run spi_flash_probe_dump() once at boot (needs
+ * DEBUG_UART_ENABLED=1 to actually see anything - see spi_flash.h's
+ * comment). ONE-TIME bring-up step to confirm the external SPI flash
+ * chip's identity and whether LBA 0 really holds a FAT boot sector,
+ * BEFORE any write/erase support gets added to spi_flash.c - back to
+ * 0 for normal use once that's been confirmed on real hardware. */
+#define SPI_FLASH_PROBE_TEST 1
 
 /*
  * TUNE_START_HZ moved to config.h (CONFIG_TUNE_START_HZ) 07/08/2026,
@@ -87,6 +106,104 @@ static void calib_height_ruler_draw(void);
  * menu-open guard, see main()'s comment there), and C needs the real
  * declaration, not just a prototype, visible before that first use. */
 static uint8_t s_menu_open = 0U;
+
+/*
+ * Set right before main()'s loop starts (after the boot-time
+ * settings_load()/apply_lo_tune()/apply_demod_mode() calls have all
+ * run) - apply_lo_tune()/apply_demod_mode() call settings_mark_dirty()
+ * at their end ONLY while this is 1, so the boot sequence's own
+ * initial calls (which just re-apply whatever settings_load() already
+ * loaded, or the firmware defaults if there was nothing to load)
+ * don't immediately trigger a pointless "save what we just loaded
+ * right back" a few seconds into every single boot - see settings.h's
+ * write-cycle-wear comment for why that's worth avoiding, not just
+ * wasted time.
+ */
+static uint8_t s_settings_ready_for_autosave = 0U;
+
+/* Moved up from its old spot alongside the rest of the encoder-tuning
+ * state (much further down this file, where its full explanatory
+ * comment still lives) - 17/08/2026, same reasoning as s_menu_open
+ * above: main()'s boot sequence (settings_load()/apply_lo_tune())
+ * now reads/writes this directly before the main loop starts, so the
+ * real declaration has to be visible there too, not just at the
+ * later apply_lo_tune(s_tune_hz) call sites. */
+static uint32_t s_tune_hz = TUNE_START_HZ;
+
+/* Moved up alongside s_tune_hz, same reasoning as it and
+ * s_tune_step_idx - main()'s boot sequence needs to apply a loaded
+ * volume before entering the main loop (right after the AIC3204 codec
+ * is confirmed up, same point mode/step/vfo already get applied - see
+ * there). s_volume_db_x2 is kept directly in the hardware's native
+ * 0.5dB units (see its own comment further down, still in place) -
+ * avoids float rounding drift across repeated encoder adjustments. */
+static int16_t s_volume_db_x2 = 0;
+#define VOLUME_STEP_X2 2 /* 2 * 0.5dB = 1.0dB per encoder detent */
+#define VOLUME_MIN_X2  (-127)  /* -63.5dB */
+#define VOLUME_MAX_X2  48      /* +24.0dB */
+
+/* Single choke point for every REAL s_volume_db_x2 change (encoder
+ * only, currently) - added 18/08/2026 alongside CONFIG.CSV
+ * persistence, same "one place, not one settings_mark_dirty() per
+ * call site" reasoning as set_tune_step_idx(). Applies the new value
+ * to the codec too (aic3204_set_volume_db()) - the encoder call site
+ * already did this itself before, folded in here instead so loading a
+ * saved volume at boot can go through the same function. Does NOT
+ * redraw anything - callers that show the volume on screen still do
+ * that themselves, same as set_tune_step_idx() leaving its own
+ * redraws to its callers. */
+static void set_volume_db_x2(int16_t v)
+{
+    s_volume_db_x2 = v;
+    aic3204_set_volume_db((float)s_volume_db_x2 * 0.5f);
+    if (s_settings_ready_for_autosave) {
+        settings_mark_dirty();
+    }
+}
+
+/* Moved up alongside s_tune_hz, same reasoning - see config.h for
+ * why CONFIG_TUNE_START_STEP_IDX is what it is (was BAND_STEP_100K,
+ * fine for the old FM-broadcast startup frequency, useless for HF
+ * voice tuning - a single click would jump clean past a QSO); changed
+ * 07/08/2026 alongside CONFIG_TUNE_START_HZ. */
+static uint8_t s_tune_step_idx = CONFIG_TUNE_START_STEP_IDX;
+
+/* Extended 31/07/2026 (100/1K/10K/100K/1M -> 8 steps) to cover the
+ * channel spacings real bands actually use, needed for the BANDS
+ * presets further down (each preset picks an INDEX into this array,
+ * see band_preset_t) - 5K for SW AM broadcast, 12K5/25K for VHF voice
+ * channels (2m repeaters, airband). Order matters: the BAND_STEP_*
+ * defines further down are literal indices into this array, so
+ * inserting/removing/reordering an entry means updating those too. */
+static const uint32_t k_tune_steps[] = {
+    100UL, 1000UL, 5000UL, 10000UL, 12500UL, 25000UL, 100000UL, 1000000UL
+};
+#define TUNE_STEP_COUNT (sizeof(k_tune_steps) / sizeof(k_tune_steps[0]))
+
+/* Single choke point for every s_tune_step_idx change (menu tile,
+ * step-list picker, encoder-driven BW/step cycling at every band's
+ * default-step reset...) - added 18/08/2026 alongside CONFIG.CSV
+ * persistence so all of those call sites mark settings dirty through
+ * ONE place instead of needing settings_mark_dirty() added at each of
+ * the (many) individual assignment sites by hand and risking one
+ * getting missed. */
+static void set_tune_step_idx(uint8_t idx)
+{
+    s_tune_step_idx = idx;
+    if (s_settings_ready_for_autosave) {
+        settings_mark_dirty();
+    }
+}
+
+/* Filled by settings_load() in main()'s boot sequence - see
+ * settings_loaded_t's comment for why this is one struct rather than
+ * a scalar per setting. Consumed once, right before entering the main
+ * loop (mode/audio_bw need demod_am_init() to have run first, vfo_hz
+ * needs to land before the real apply_lo_tune() call - see there for
+ * exactly where/why each field gets applied), then not touched again -
+ * settings_poll()'s own SAVE path reads the LIVE values instead
+ * (s_tune_hz, demod_am_get_mode(), etc.), not this struct. */
+static settings_loaded_t s_loaded_settings;
 
 /*
  * Screen SLEEP (HW page's SLEEP tile) - added 10/08/2026, per the
@@ -195,6 +312,43 @@ int main(void)
     waterfall_init();
     touch_init();
     debug_print_hex32("RCU_PLLI2S after touch_init", RCU_PLLI2S);
+
+    spi_flash_init(); /* unconditional - settings_load()/settings_poll() need this every boot, not just under the SPI_FLASH_PROBE_TEST diagnostics below */
+
+#if SPI_FLASH_PROBE_TEST
+    /* Bring-up ONLY - see SPI_FLASH_PROBE_TEST's and
+     * spi_flash_probe_dump()'s comments. Read-only up through
+     * spi_flash_probe_fat_scan(); spi_flash_probe_write_selftest()
+     * writes a throwaway pattern into a confirmed-free scratch block
+     * to prove the erase+program path before anything real depends on
+     * it - already done and confirmed on real hardware, 17/08/2026
+     * (Winbond W25Q16, genuine FAT12, same volume the bootloader's
+     * USB-MSC mode uses for update4.bin). Kept here, gated off by
+     * default, purely as a re-runnable diagnostic if the flash chip
+     * or filesystem is ever in question again.
+     */
+    spi_flash_probe_dump();
+    spi_flash_probe_root_dir();
+    {
+        spi_flash_fat_scan_t fat_scan;
+        spi_flash_probe_fat_scan(&fat_scan);
+        spi_flash_probe_write_selftest(&fat_scan);
+    }
+#endif
+
+    /*
+     * Real settings load - see settings.h's comment for the schema and
+     * settings_load()'s comment for exactly what it does/doesn't
+     * apply directly. Touch calibration gets applied right here
+     * (touch_set_calibration() has no other side effects to sequence
+     * around). Everything else is only STORED in s_loaded_settings
+     * here - actually applying vfo_hz/mode/tune_step_hz/audio_bw needs
+     * to wait for demod_am_init() (mode/audio_bw) and the real LO tune
+     * (further down, see the apply_demod_mode()/apply_lo_tune() calls
+     * right before radio_screen_draw()) rather than reaching ahead of
+     * this project's own established boot ordering.
+     */
+    (void)settings_load(&s_loaded_settings);
 
     debug_print("\n--- AIC3204: phase 1 (I2C communication only) ---\n");
     aic3204_init(AIC3204_ADDR_DEFAULT);
@@ -311,8 +465,49 @@ int main(void)
      * BANDS/keypad), run once here so the radio boots up actually
      * listening where the frequency readout says it is, not just
      * displaying the right number over a still-90.8MHz LO.
+     *
+     * Uses s_tune_hz (not the TUNE_START_HZ macro directly) as of
+     * 17/08/2026, so a VFO frequency loaded from CONFIG.CSV by
+     * settings_load() further up actually takes effect - s_tune_hz's
+     * own initializer IS TUNE_START_HZ, so this is unchanged when
+     * there's nothing to load (first boot, no CONFIG.CSV yet).
+     * Demod mode/audio_bw/step go first (same order every other retune
+     * call site in this file already uses - mode then frequency),
+     * applied only for whichever fields settings_load() actually
+     * found (see s_loaded_settings' comment) - tune_step_hz needs an
+     * extra step, looking up which k_tune_steps[] INDEX matches the
+     * loaded Hz value (by value, not a raw saved index - see
+     * settings.h's comment on why), falling back to leaving
+     * s_tune_step_idx at its firmware default if no exact match is
+     * found (e.g. a CONFIG.CSV saved by a build with a different step
+     * table).
      */
-    apply_lo_tune(TUNE_START_HZ);
+    if (s_loaded_settings.have_mode) {
+        apply_demod_mode(s_loaded_settings.mode);
+    }
+    if (s_loaded_settings.have_audio_bw) {
+        demod_am_set_audio_bw(s_loaded_settings.audio_bw);
+    }
+    if (s_loaded_settings.have_volume_db_x2) {
+        int32_t v = s_loaded_settings.volume_db_x2;
+
+        if (v < VOLUME_MIN_X2) { v = VOLUME_MIN_X2; }
+        if (v > VOLUME_MAX_X2) { v = VOLUME_MAX_X2; }
+        set_volume_db_x2((int16_t)v); /* codec already up by this point in the boot sequence - see AIC3204 phase 1/2 further up - safe to apply here */
+    }
+    if (s_loaded_settings.have_tune_step_hz) {
+        uint32_t i;
+        for (i = 0U; i < TUNE_STEP_COUNT; i++) {
+            if (k_tune_steps[i] == s_loaded_settings.tune_step_hz) {
+                s_tune_step_idx = (uint8_t)i; /* direct assignment, not set_tune_step_idx() - this is the boot-time LOAD applying what was saved, not a new user change to save again */
+                break;
+            }
+        }
+    }
+    if (s_loaded_settings.have_vfo_hz) {
+        s_tune_hz = s_loaded_settings.vfo_hz;
+    }
+    apply_lo_tune(s_tune_hz);
 
 #if CALIB_HEIGHT_TEST
     calib_height_ruler_draw();
@@ -320,6 +515,12 @@ int main(void)
     splash_screen_draw(); /* personalizable splash screen, see splash_screen.c */
     radio_screen_draw(); /* full radio UI, all readouts included */
 #endif
+
+    /* From here on, apply_lo_tune()/apply_demod_mode() calls mean a
+     * REAL user-driven change (encoder, BANDS, keypad, mode menu) -
+     * see s_settings_ready_for_autosave's own comment for why this
+     * has to wait until after the two boot-time calls just above. */
+    s_settings_ready_for_autosave = 1U;
 
     debug_print("main: entering the main loop\n");
 
@@ -357,6 +558,37 @@ int main(void)
             (void)encoder_take_long_press();
             if (encoder_take_press()) {
                 screen_wake();
+            }
+        } else if (touch_calib_active()) {
+            /*
+             * Touch calibration wizard (HW page's CAL tile, see
+             * menu_tile_cal_callback()/touch_calib_done_callback())
+             * owns the WHOLE screen and touch input while active -
+             * same "skip everything display/touch-related" reasoning
+             * as s_screen_asleep just above, except the radio itself
+             * keeps running exactly the same way (DMA-driven, never
+             * routed through this loop - see s_screen_asleep's
+             * comment). Rotation is discarded same as while asleep;
+             * a SHORT press cancels (touch_calib_cancel() leaves
+             * whatever calibration was active before untouched, then
+             * this repaints the radio screen the wizard drew over -
+             * same "wizard doesn't know what it interrupted" reasoning
+             * as touch_calib_done_callback() needing to do the same
+             * thing on a successful finish, not just here). A long
+             * press does nothing, matching screen_wake()'s treatment
+             * of it while asleep.
+             */
+            (void)encoder_take_delta();
+            (void)encoder_take_long_press();
+            if (encoder_take_press()) {
+                touch_calib_cancel();
+                if (s_menu_open) {
+                    menu_screen_close();
+                }
+                radio_screen_draw();
+                debug_print("touch_calib: cancelled via encoder press\n");
+            } else {
+                touch_calib_poll();
             }
         } else
         {
@@ -432,6 +664,10 @@ int main(void)
         }
         rf_agc_poll(); /* RF-level (analog PGA) auto-AGC - see its own comment */
         rtty_poll(); /* drains rtty.c's decoded text to debug UART - see its own comment */
+        settings_poll(s_tune_hz, demod_am_get_mode(), k_tune_steps[s_tune_step_idx], demod_am_get_audio_bw(), s_volume_db_x2); /* debounced CONFIG.CSV autosave - see settings.h's comment; cheap no-op most iterations */
+#if TOUCH_EDGE_DEBUG
+        touch_debug_stream_poll(); /* see TOUCH_EDGE_DEBUG's comment */
+#endif
 #endif
 
         g_fill_count++;
@@ -809,6 +1045,7 @@ static ui_button_t s_menu_tile_rtty_inv;   /* RTTY station NORMAL/REVERSE conven
 static ui_button_t s_menu_tile_nr; /* NR (Spectral Subtraction) strength, AM/USB/LSB only - see nr_ss.h, fills RADIO page slot 5 */
 static ui_button_t s_menu_tile_speaker_pa; /* speaker PA enable/mute (PB7) - HW page, see its own comment */
 static ui_button_t s_menu_tile_sleep; /* screen SLEEP one-shot action - HW page, added 10/08/2026, see screen_sleep_enter()'s comment */
+static ui_button_t s_menu_tile_cal; /* touch CALibration one-shot action - HW page, see touch_calib.h/menu_tile_cal_callback() */
 /* s_speaker_pa_enabled: backs BOTH the tile's label (menu_tile_speaker_pa_refresh())
  * and the actual GPIO level (speaker_pa_set_enabled(), defined down
  * with the rest of the GPIO drivers near led_gpio_init() - declared
@@ -894,17 +1131,17 @@ static uint8_t s_spec_smooth_passes = 0U;
 #define TUNE_MIN_HZ 100000UL
 #define TUNE_MAX_HZ 180000000UL
 
-static uint32_t s_tune_hz = TUNE_START_HZ;
-/* Extended 31/07/2026 (100/1K/10K/100K/1M -> 8 steps) to cover the
- * channel spacings real bands actually use, needed for the BANDS
- * presets below (each preset picks an INDEX into this array, see
- * band_preset_t) - 5K for SW AM broadcast, 12K5/25K for VHF voice
- * channels (2m repeaters, airband). Order matters: BAND_STEP_5K etc.
- * below are literal indices into this array, so inserting/removing/
- * reordering an entry means updating those too. */
-static const uint32_t k_tune_steps[] = {
-    100UL, 1000UL, 5000UL, 10000UL, 12500UL, 25000UL, 100000UL, 1000000UL
-};
+/* s_tune_hz's actual declaration moved up near s_menu_open, 17/08/2026
+ * - see the comment there. This comment block (the "why 7.150MHz",
+ * "why apply_lo_tune(s_tune_hz) exists separately from
+ * ms5351_tune_captured()" reasoning above) still applies unchanged. */
+/* k_tune_steps[]/TUNE_STEP_COUNT's actual declarations moved up near
+ * s_tune_step_idx, 18/08/2026, for the same reason s_tune_hz was:
+ * main()'s boot sequence now needs both (to look up which INDEX
+ * matches a "tune_step_hz" value loaded from CONFIG.CSV, by VALUE
+ * rather than by raw index - see set_tune_step_idx()'s neighborhood
+ * up there for the full comment) before entering the main loop. */
+
 #define BAND_STEP_100HZ 0U
 #define BAND_STEP_1K    1U
 #define BAND_STEP_5K    2U
@@ -926,12 +1163,10 @@ static const uint32_t k_tune_steps[] = {
 static const char *k_tune_step_labels[] = {
     "100 ", "1K  ", "5K  ", "10K ", "12K5", "25K ", "100K", "1M  "
 };
-#define TUNE_STEP_COUNT (sizeof(k_tune_steps) / sizeof(k_tune_steps[0]))
-static uint8_t s_tune_step_idx = CONFIG_TUNE_START_STEP_IDX; /* see config.h -
-    was BAND_STEP_100K (100kHz, fine for the old FM-broadcast startup
-    frequency, useless for HF voice tuning - a single click would jump
-    clean past a QSO). Changed 07/08/2026 alongside CONFIG_TUNE_START_HZ -
-    if you change one, check whether the other still makes sense too. */
+/* s_tune_step_idx's actual declaration moved up near s_menu_open/
+ * s_tune_hz, 18/08/2026 - see the comment there. This comment block
+ * (why CONFIG_TUNE_START_STEP_IDX is what it is) still applies
+ * unchanged. */
 
 /* STEP picker list - added 01/08/2026, replaces the old "STEP button
  * just cycles to the next entry" behavior with a real pick-from-a-list
@@ -1101,12 +1336,10 @@ static ui_button_t s_menu_band_tiles[BAND_PRESET_COUNT]; /* the BANDS preset-lis
  * that changed 31/07/2026. VOL still jumps straight to VOLUME/TUNE
  * regardless of what's selected in the menu, same as before.
  *
- * s_volume_db_x2 is kept directly in the hardware's native 0.5dB
- * units (same encoding aic3204_set_volume_db() converts to
- * internally) - avoids float rounding drift across repeated encoder
- * adjustments. Starts at 0 (0dB, unity - matches the byte-exact
- * captured baseline aic3204_phase2_init() leaves the chip at, so
- * turning the encoder for the first time doesn't jump the volume).
+ * s_volume_db_x2's actual declaration (and the VOLUME_STEP_X2/MIN/MAX
+ * macros) moved up near s_tune_hz, 18/08/2026 - see the comment
+ * there. This comment block (0.5dB-native-units reasoning, starting
+ * at 0dB to match the captured baseline) still applies unchanged.
  *
  * (encoder_target_t itself is now declared earlier in this file -
  * see the comment right before the settings-menu block above - since
@@ -1117,10 +1350,6 @@ static void menu_detail_show(encoder_target_t target);
 
 
 static encoder_target_t s_encoder_target = ENCODER_TARGET_TUNE;
-static int16_t s_volume_db_x2 = 0;
-#define VOLUME_STEP_X2 2 /* 2 * 0.5dB = 1.0dB per encoder detent */
-#define VOLUME_MIN_X2  (-127)  /* -63.5dB */
-#define VOLUME_MAX_X2  48      /* +24.0dB */
 /* PGA (analog input gain, MIC_PGA_L/R - see aic3204_set_pga_gain_db())
  * - same 0.5dB-native-units reasoning as s_volume_db_x2 above, just
  * unsigned (0-95, matching the register's 0-47.5dB range, no cut
@@ -2856,6 +3085,9 @@ static void audio_bw_cycle(void)
     debug_print("audio filter: now ");
     debug_print(k_audio_bw_labels[(uint8_t)bw]);
     debug_print("\n");
+    if (s_settings_ready_for_autosave) {
+        settings_mark_dirty();
+    }
 
     /* badges_draw() (not just a direct s_btn_audio_bw update) because
      * it's the function that already knows how to compute bw_label
@@ -3319,6 +3551,12 @@ static void apply_demod_mode(demod_mode_t mode)
         aic3204_set_volume_db((float)s_volume_db_x2 * 0.5f);
         rf_agc_apply_pga();
     }
+
+    /* See s_settings_ready_for_autosave's comment (same reasoning as
+     * apply_lo_tune()'s own settings_mark_dirty() call). */
+    if (s_settings_ready_for_autosave) {
+        settings_mark_dirty();
+    }
 }
 
 static void menu_band_preset_callback(void *widget, ui_event_t event, void *user_data)
@@ -3330,7 +3568,7 @@ static void menu_band_preset_callback(void *widget, ui_event_t event, void *user
         const band_preset_t *p = &k_band_presets[idx];
 
         s_tune_hz = p->freq_hz;
-        s_tune_step_idx = p->step_idx;
+        set_tune_step_idx(p->step_idx);
         apply_demod_mode(p->mode);
         apply_lo_tune(s_tune_hz);
 
@@ -3539,6 +3777,54 @@ static void menu_tile_sleep_callback(void *widget, ui_event_t event, void *user_
     }
 }
 
+/*
+ * Fires once the touch_calib.c wizard has computed and APPLIED a good
+ * calibration (touch_calib_start()'s on_done - see touch_calib.h's
+ * comment; not called if the wizard is cancelled). The wizard drew
+ * over the ENTIRE screen (top bar, right column, bottom bar included -
+ * unlike the settings grid, which only ever covers MENU_AREA), so a
+ * full radio_screen_draw() is needed here, not menu_screen_close()'s
+ * usual partial spectrum/waterfall-only repaint - same reasoning as
+ * screen_wake()'s comment for why IT does a full repaint too. Also
+ * closes the settings menu itself (CAL is a HW-page tile, so
+ * s_menu_open was necessarily 1 to have reached this) so the radio
+ * screen isn't drawn underneath a menu that's about to look stale.
+ */
+static void touch_calib_done_callback(const touch_calibration_t *cal)
+{
+    (void)cal; /* touch_calib.c already applied it via touch_set_calibration() and printed it to the debug UART - nothing left for this callback to do with the value itself */
+    if (s_menu_open) {
+        menu_screen_close();
+    }
+    radio_screen_draw();
+    debug_print("touch_calib: wizard finished, radio screen restored\n");
+
+    /* Immediate save (not the debounced settings_mark_dirty() path) -
+     * finishing the calibration wizard is already a deliberate,
+     * infrequent action on its own; waiting out
+     * SETTINGS_SAVE_DEBOUNCE_MS on top of that would just be a
+     * pointless delay before something the user explicitly just did
+     * gets persisted. */
+    settings_save_now(s_tune_hz, demod_am_get_mode(), k_tune_steps[s_tune_step_idx], demod_am_get_audio_bw(), s_volume_db_x2);
+}
+
+/*
+ * CAL (HW page) - one-shot action, same "leaves the current view"
+ * shape as SLEEP/EXIT just above/below rather than a cycle or detail
+ * tile: tapping it hands the WHOLE screen to touch_calib.c's wizard
+ * (see its header comment) until the user either finishes all 3
+ * points or cancels with a short encoder press (see main()'s loop,
+ * the touch_calib_active() branch).
+ */
+static void menu_tile_cal_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE) {
+        touch_calib_start(touch_calib_done_callback);
+    }
+}
+
 static void menu_tile_smooth_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
@@ -3660,7 +3946,7 @@ static void menu_step_preset_callback(void *widget, ui_event_t event, void *user
 
     (void)widget;
     if (event == UI_EVENT_RELEASE && idx < TUNE_STEP_COUNT) {
-        s_tune_step_idx = (uint8_t)idx;
+        set_tune_step_idx((uint8_t)idx);
         debug_print_dec("tune: step now Hz", k_tune_steps[s_tune_step_idx]);
         /* Same "menu_screen_close() doesn't know this readout actually
          * CHANGED" gap as menu_band_preset_callback()'s comment - needs
@@ -4437,6 +4723,17 @@ static void menu_grid_show(void)
             2, 0, 1, menu_tile_sleep_callback, NULL};
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_sleep);
 
+        /* CAL: touch screen calibration wizard - see touch_calib.h and
+         * menu_tile_cal_callback()'s comment. Same YELLOW "leaves the
+         * current view" styling as SLEEP/EXIT: it takes over the whole
+         * screen too, just temporarily instead of until the encoder
+         * wakes it. Slots 3-7 still intentionally empty. */
+        s_menu_tile_cal = (ui_button_t){
+            MENU_OPT_COL(2), MENU_OPT_ROW(2), MENU_TILE_W, MENU_TILE_H,
+            "CAL", GFX_COLOR_BLACK, GFX_COLOR_YELLOW, GFX_COLOR_WHITE,
+            2, 0, 1, menu_tile_cal_callback, NULL};
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_cal);
+
         ui_screen_draw(&s_menu_screen);
         menu_tile_speaker_pa_refresh();
         break;
@@ -4614,6 +4911,14 @@ static void apply_lo_tune(uint32_t freq_hz)
         } else {
             demod_am_set_if_offset_active(1U);
         }
+    }
+
+    /* See s_settings_ready_for_autosave's comment: only a REAL retune
+     * (encoder/BANDS/keypad, after boot) should trigger the debounced
+     * autosave - not the two boot-time calls that just re-apply
+     * whatever was already loaded (or the firmware default). */
+    if (s_settings_ready_for_autosave) {
+        settings_mark_dirty();
     }
 }
 
@@ -5221,7 +5526,7 @@ static void tune_encoder_poll(void)
          * exist on the menu detail view (see s_menu_open's checks
          * throughout this function). */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5232,8 +5537,7 @@ static void tune_encoder_poll(void)
             if (v > VOLUME_MAX_X2) { v = VOLUME_MAX_X2; }
 
             if ((int16_t)v != s_volume_db_x2) {
-                s_volume_db_x2 = (int16_t)v;
-                aic3204_set_volume_db((float)s_volume_db_x2 * 0.5f);
+                set_volume_db_x2((int16_t)v);
                 settings_value_redraw();
             }
         }
@@ -5244,7 +5548,7 @@ static void tune_encoder_poll(void)
         /* Same "button still cycles tune step" courtesy as VOLUME
          * above. */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5274,7 +5578,7 @@ static void tune_encoder_poll(void)
         /* Same "button still cycles tune step" courtesy as PGA/VOLUME
          * above. */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5295,7 +5599,7 @@ static void tune_encoder_poll(void)
         /* Same "button still cycles tune step" courtesy as VOLUME
          * mode above. */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5358,7 +5662,7 @@ static void tune_encoder_poll(void)
         /* Button just cycles the tune step, same courtesy as VOLUME/
          * BACKLIGHT - no second sub-value to toggle here. */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5380,7 +5684,7 @@ static void tune_encoder_poll(void)
         /* Same "button still cycles tune step" courtesy as VOLUME/
          * BACKLIGHT/SQUELCH above. */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5402,7 +5706,7 @@ static void tune_encoder_poll(void)
         /* Same "button still cycles tune step" courtesy as every other
          * target above. */
         if (press) {
-            s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+            set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
         }
 
@@ -5421,7 +5725,7 @@ static void tune_encoder_poll(void)
     }
 
     if (press) {
-        s_tune_step_idx = (uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT);
+        set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
         debug_print_dec("tune: step now Hz", k_tune_steps[s_tune_step_idx]);
         step_display_draw();
     }

@@ -90,6 +90,14 @@ typedef struct {
 
 void touch_set_calibration(const touch_calibration_t *cal);
 
+/* Copies the currently-active calibration into *out - whatever the
+ * last touch_set_calibration() call set (touch_init()'s hardcoded
+ * default if none has run yet this session). Added alongside
+ * settings.c/spi_flash.c's config-file persistence (17/08/2026) - that
+ * code needs to read back the live calibration to save it, and there
+ * was no getter before this. */
+void touch_get_calibration(touch_calibration_t *out);
+
 /* Lectura calibrada: aplica touch_set_calibration() a touch_read_raw() y
  * recorta el resultado a [0, GFX_SCREEN_WIDTH-1] x [0, GFX_SCREEN_HEIGHT-1].
  * Devuelve 1 si habia contacto (mismo criterio que touch_read_raw()). Sin
@@ -102,5 +110,31 @@ uint8_t touch_read(uint16_t *x, uint16_t *y);
  * para el primer bring-up: tocar cada esquina del panel y comprobar que
  * los valores cambian de forma coherente antes de fiarse de nada mas. */
 void touch_debug_raw(void);
+
+/*
+ * Continuous, throttled raw+calibrated dump - added 18/08/2026 to
+ * chase down "the screen edges don't respond to touch" reports. Call
+ * once per main loop iteration (behind a temporary debug gate, same
+ * pattern as CALIB_HEIGHT_TEST/SPI_FLASH_PROBE_TEST in main.c) while
+ * chasing an edge-response issue: prints BOTH the raw ADC reading AND
+ * touch_read()'s calibrated (x,y) on the same line, throttled to
+ * roughly once every 150ms while a finger is held down (not once per
+ * ~43ms frame, which would flood the UART) - so pressing near a
+ * screen edge and watching the log answers directly which of the two
+ * layers is actually at fault:
+ *   - raw keeps changing smoothly all the way to the physical edge,
+ *     but the calibrated (x,y) misbehaves (stays clamped at the same
+ *     value, or the wrong one) -> a CALIBRATION problem (e.g.
+ *     touch_calib.c's CAL_MARGIN keeps the measured raw_*_min/max away
+ *     from the true physical edge, so touch_read() has to linearly
+ *     EXTRAPOLATE beyond what was ever actually measured out there -
+ *     if the panel is even slightly non-linear near its bezel, that
+ *     extrapolation is exactly where it'd go wrong first).
+ *   - raw itself goes flat / stops changing near the edge -> the
+ *     resistive panel genuinely isn't sensing pressure there, a
+ *     hardware/mechanical limitation of that specific area of the
+ *     panel, not something touch_read()'s math can fix.
+ * Does nothing (no-op) while nothing is pressed. */
+void touch_debug_stream_poll(void);
 
 #endif /* TOUCH_H */

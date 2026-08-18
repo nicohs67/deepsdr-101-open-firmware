@@ -318,6 +318,11 @@ void touch_set_calibration(const touch_calibration_t *cal)
     s_cal = *cal;
 }
 
+void touch_get_calibration(touch_calibration_t *out)
+{
+    *out = s_cal;
+}
+
 static uint16_t clamp_u16(int32_t v, uint16_t max_exclusive)
 {
     if (v < 0) {
@@ -332,8 +337,9 @@ static uint16_t clamp_u16(int32_t v, uint16_t max_exclusive)
 uint8_t touch_read(uint16_t *x, uint16_t *y)
 {
     uint16_t raw_x, raw_y;
-    int32_t sx, sy;
+    int32_t val_x, val_y; /* scaled from the raw_x/raw_y HARDWARE channels respectively, BEFORE swap_xy relabels which one ends up as the final screen x vs y */
     int32_t range_x, range_y;
+    uint16_t target_w, target_h; /* which screen dimension each hardware channel actually lands in - see the SWAP FIX comment below */
 
     if (!touch_read_raw(&raw_x, &raw_y)) {
         return 0;
@@ -348,24 +354,39 @@ uint8_t touch_read(uint16_t *x, uint16_t *y)
         range_y = 1;
     }
 
-    sx = ((int32_t)raw_x - (int32_t)s_cal.raw_x_min) * GFX_SCREEN_WIDTH / range_x;
-    sy = ((int32_t)raw_y - (int32_t)s_cal.raw_y_min) * GFX_SCREEN_HEIGHT / range_y;
+    /*
+     * SWAP FIX (added alongside touch_calib.c): on a NON-square panel
+     * (800x480 here), scaling val_x to GFX_SCREEN_WIDTH and val_y to
+     * GFX_SCREEN_HEIGHT and only THEN swapping them (the original code)
+     * is wrong whenever swap_xy=1 - it would hand out a "screen x" that
+     * only ever reached GFX_SCREEN_HEIGHT-1 (480) instead of
+     * GFX_SCREEN_WIDTH-1 (800), and a "screen y" clamped down from a
+     * 0-799 range to 0-479, silently losing the top ~320 rows. Fixed by
+     * deciding EACH hardware channel's target scale (width or height)
+     * from swap_xy BEFORE scaling, so the swap only ever relabels which
+     * value is x and which is y - never which scale was used to produce
+     * it. With swap_xy=0 this is numerically identical to the old code.
+     */
+    target_w = s_cal.swap_xy ? GFX_SCREEN_HEIGHT : GFX_SCREEN_WIDTH;  /* what raw_x's channel scales to */
+    target_h = s_cal.swap_xy ? GFX_SCREEN_WIDTH  : GFX_SCREEN_HEIGHT; /* what raw_y's channel scales to */
+
+    val_x = ((int32_t)raw_x - (int32_t)s_cal.raw_x_min) * (int32_t)target_w / range_x;
+    val_y = ((int32_t)raw_y - (int32_t)s_cal.raw_y_min) * (int32_t)target_h / range_y;
 
     if (s_cal.invert_x) {
-        sx = GFX_SCREEN_WIDTH - 1 - sx;
+        val_x = (int32_t)target_w - 1 - val_x;
     }
     if (s_cal.invert_y) {
-        sy = GFX_SCREEN_HEIGHT - 1 - sy;
+        val_y = (int32_t)target_h - 1 - val_y;
     }
 
     if (s_cal.swap_xy) {
-        int32_t tmp = sx;
-        sx = sy;
-        sy = tmp;
+        *x = clamp_u16(val_y, GFX_SCREEN_WIDTH);
+        *y = clamp_u16(val_x, GFX_SCREEN_HEIGHT);
+    } else {
+        *x = clamp_u16(val_x, GFX_SCREEN_WIDTH);
+        *y = clamp_u16(val_y, GFX_SCREEN_HEIGHT);
     }
-
-    *x = clamp_u16(sx, GFX_SCREEN_WIDTH);
-    *y = clamp_u16(sy, GFX_SCREEN_HEIGHT);
     return 1;
 }
 
@@ -378,5 +399,36 @@ void touch_debug_raw(void)
         debug_print_dec("touch raw_y", raw_y);
     } else {
         debug_print("touch: sin contacto\n");
+    }
+}
+
+static uint32_t s_debug_stream_last_ms = 0U;
+#define TOUCH_DEBUG_STREAM_PERIOD_MS 150UL
+
+void touch_debug_stream_poll(void)
+{
+    uint16_t raw_x, raw_y;
+
+    if (!touch_is_pressed()) {
+        return;
+    }
+    if ((g_msticks - s_debug_stream_last_ms) < TOUCH_DEBUG_STREAM_PERIOD_MS) {
+        return;
+    }
+    s_debug_stream_last_ms = g_msticks;
+
+    if (touch_read_raw(&raw_x, &raw_y)) {
+        uint16_t cal_x = 0U, cal_y = 0U;
+        uint8_t cal_ok = touch_read(&cal_x, &cal_y);
+
+        debug_print_dec("touch_debug_stream: raw_x", raw_x);
+        debug_print_dec("touch_debug_stream: raw_y", raw_y);
+        if (cal_ok) {
+            debug_print_dec("touch_debug_stream: calibrated x", cal_x);
+            debug_print_dec("touch_debug_stream: calibrated y", cal_y);
+        } else {
+            debug_print("touch_debug_stream: touch_read() returned 0 (lost contact between the two reads?)\n");
+        }
+        debug_print("\n");
     }
 }

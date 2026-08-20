@@ -2,7 +2,6 @@ name: Robust Native GCC ARM Build
 
 on: [push, pull_request, workflow_dispatch]
 
-# Fornisce i permessi di scrittura al workflow per poter fare il push nel repository
 permissions:
   contents: write
 
@@ -14,7 +13,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        persist-credentials: true # Mantiene le credenziali per fare il push successivo
+        persist-credentials: true
+        fetch-depth: 0 # Recupera l'intera cronologia, fondamentale per gestire i pull e i rebase senza errori
 
     - name: Install ARM GCC and Python
       run: |
@@ -59,19 +59,28 @@ jobs:
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         
-        # Rimuove eventuali file temporanei oggetto per non sporcare il repository
+        # Elimina i file temporanei intermedi
         find . -name "*.o" -delete
         rm -f ./firmware.elf
         
-        # Aggiunge i nuovi binari generati alla radice
+        # Sincronizza lo stato locale scaricando eventuali commit remoti inviati nel frattempo
+        git fetch origin main
+        git rsync ./firmware.bin ./update4.bin /tmp/ 2>/dev/null || cp ./firmware.bin ./update4.bin /tmp/
+        
+        # Effettua il reset o il pull per allinearsi al server remoto
+        git reset --hard origin/main
+        
+        # Ripristina i file binari appena compilati sopra lo stato allineato
+        cp /tmp/firmware.bin ./firmware.bin
+        cp /tmp/update4.bin ./update4.bin
+        
         git add ./firmware.bin ./update4.bin
         
-        # Esegue il commit solo se i file sono effettivamente cambiati/nuovi
         if git diff --cached --quiet; then
-          echo "Nessuna modifica rilevata nei firmware."
+          echo "Nessuna modifica rilevata nei firmware binarizzati."
         else
           git commit -m "Automated build: aggiornati firmware.bin e update4.bin [skip ci]"
-          git push origin HEAD:${{ github.ref }}
+          git push origin HEAD:main
         fi
 
     - name: Carica i firmware nei download temporanei (Artifacts)

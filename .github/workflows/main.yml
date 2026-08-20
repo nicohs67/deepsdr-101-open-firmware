@@ -1,0 +1,83 @@
+name: Robust Native GCC ARM Build
+
+on: [push, pull_request, workflow_dispatch]
+
+# Fornisce i permessi di scrittura al workflow per poter fare il push nel repository
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: true # Mantiene le credenziali per fare il push successivo
+
+    - name: Install ARM GCC and Python
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi python3
+
+    - name: Patch SPI Flash Mode (Sblocca Scrittura DeepSDR)
+      run: |
+        find . -name "main.c" -exec sed -i 's/#define SPI_FLASH_PROBE_TEST 1/#define SPI_FLASH_PROBE_TEST 0/g' {} +
+        echo "Disattivata la modalità provvisoria di sola lettura della Flash SPI."
+
+    - name: Compilazione Modulare e Link
+      run: |
+        INC=$(find . -name "*.h" -exec dirname {} \; | sort -u | sed 's/^/-I/')
+        LDSCRIPT=$(find . -name "*_FLASH.ld" | head -n 1)
+        echo "Uso il file linker: $LDSCRIPT"
+        CFLAGS="$INC -O2 -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -DGD32F450 -ffunction-sections -fdata-sections"
+        
+        for file in $(find . -name "*.c"); do
+            obj="${file%.c}.o"
+            arm-none-eabi-gcc $CFLAGS -c "$file" -o "$obj"
+        done
+        
+        for file in $(find . \( -name "*.s" -o -name "*.S" \)); do
+            obj="${file%.s}.o"
+            obj="${obj%.S}.o"
+            arm-none-eabi-gcc $CFLAGS -c "$file" -o "$obj"
+        done
+        
+        OBJS=$(find . -name "*.o")
+        arm-none-eabi-gcc $OBJS -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -Wl,--gc-sections -T $LDSCRIPT -o ./firmware.elf --specs=nano.specs -lm
+        arm-none-eabi-objcopy -O binary ./firmware.elf ./firmware.bin
+
+    - name: Genera update4.bin firmato nella cartella principale
+      run: |
+        python3 -c "data=open('./firmware.bin','rb').read(); signed=data.ljust(0x40000,b'\xff')[:0x40000]+bytes.fromhex('8f25c865599c5531'); open('./update4.bin','wb').write(signed); print('update4.bin creato!')"
+        ls -lh ./firmware.bin
+        ls -lh ./update4.bin
+
+    - name: Commit e Push dei firmware nel repository (Ramo main)
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Rimuove eventuali file temporanei oggetto per non sporcare il repository
+        find . -name "*.o" -delete
+        rm -f ./firmware.elf
+        
+        # Aggiunge i nuovi binari generati alla radice
+        git add ./firmware.bin ./update4.bin
+        
+        # Esegue il commit solo se i file sono effettivamente cambiati/nuovi
+        if git diff --cached --quiet; then
+          echo "Nessuna modifica rilevata nei firmware."
+        else
+          git commit -m "Automated build: aggiornati firmware.bin e update4.bin [skip ci]"
+          git push origin HEAD:${{ github.ref }}
+        fi
+
+    - name: Carica i firmware nei download temporanei (Artifacts)
+      uses: actions/upload-artifact@v4
+      with:
+        name: deepsdr-101-firmwares
+        path: |
+          ./firmware.bin
+          ./update4.bin

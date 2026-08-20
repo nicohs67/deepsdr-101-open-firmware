@@ -2,6 +2,10 @@ name: Robust Native GCC ARM Build
 
 on: [push, pull_request, workflow_dispatch]
 
+# Fornisce i permessi di scrittura al workflow per poter fare il push nel repository
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -9,6 +13,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        persist-credentials: true # Mantiene le credenziali per fare il push successivo
 
     - name: Install ARM GCC and Python
       run: |
@@ -48,7 +54,27 @@ jobs:
         ls -lh ./firmware.bin
         ls -lh ./update4.bin
 
-    - name: Carica i firmware pronti nei download (Artifacts)
+    - name: Commit e Push dei firmware nel repository (Ramo main)
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Rimuove eventuali file temporanei oggetto per non sporcare il repository
+        find . -name "*.o" -delete
+        rm -f ./firmware.elf
+        
+        # Aggiunge i nuovi binari generati alla radice
+        git add ./firmware.bin ./update4.bin
+        
+        # Esegue il commit solo se i file sono effettivamente cambiati/nuovi
+        if git diff --cached --quiet; then
+          echo "Nessuna modifica rilevata nei firmware."
+        else
+          git commit -m "Automated build: aggiornati firmware.bin e update4.bin [skip ci]"
+          git push origin HEAD:${{ github.ref }}
+        fi
+
+    - name: Carica i firmware nei download temporanei (Artifacts)
       uses: actions/upload-artifact@v4
       with:
         name: deepsdr-101-firmwares

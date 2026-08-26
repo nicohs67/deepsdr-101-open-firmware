@@ -23,7 +23,10 @@
  *
  * Currently covers: touch calibration (the 7 touch_calibration_t
  * fields - see touch.h), VFO frequency, demod mode, tune step, the
- * AM/SSB audio filter width, and speaker volume. Does NOT currently cover memory
+ * AM/SSB audio filter width, speaker volume, and the MS5351 crystal
+ * reference frequency (ms5351_xtal_hz - see ms5351_get_xtal_hz()'s
+ * comment; applied directly from settings_load(), same "no boot-order
+ * dependency" reasoning as touch calibration). Does NOT currently cover memory
  * channels - CHANNEL.CSV already exists for that on this volume (727
  * bytes, format not yet reverse-engineered from this project's code)
  * and deserves its own look before deciding whether to read/write it

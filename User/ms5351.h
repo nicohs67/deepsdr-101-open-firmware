@@ -50,7 +50,43 @@
  */
 
 #define MS5351_ADDR      0x60U
-#define MS5351_XTAL_HZ   26000000UL
+/* PPM-corrected (21/08/2026) - measured via the SAM PLL carrier-
+ * frequency-offset meter (see sam_freq_offset.c), two known-frequency
+ * stations:
+ *   7220000 Hz -> +20Hz   (2.770 ppm)
+ *   13855000 Hz -> +43Hz  (3.104 ppm)
+ * Close enough between the two (~12% relative) to treat as one flat
+ * crystal ppm error rather than something frequency-dependent, so
+ * combined via a single-parameter least-squares fit (offset = k*freq,
+ * forced through the origin) rather than a plain average of the two
+ * ppm figures, weighting the higher (more precise, larger-denominator)
+ * frequency appropriately: k = sum(offset_i*freq_i)/sum(freq_i^2) =
+ * 3.032e-6.
+ *
+ * Direction check (worth keeping - easy to get backwards): a
+ * DOWN-converted carrier appearing at a HIGHER-than-expected baseband
+ * frequency (needing the PLL to shift UP, i.e. a POSITIVE reading)
+ * means the LO's actual frequency was LOWER than commanded, which
+ * happens when the real crystal runs SLOWER than the value this
+ * driver assumes for all its PLL math - so a positive reading means
+ * the assumed XTAL_HZ needs to be REDUCED, not increased.
+ *
+ *   ppm_true = -3.032 ppm
+ *   corrected = 26000000 * (1 + ppm_true/1e6) = 26000000 - 78.8 = 25999921 Hz
+ *
+ * Two points now agree well enough to trust this - if a third,
+ * well-separated measurement later disagrees noticeably, that would
+ * point to a real frequency-dependent effect this flat-ppm model
+ * doesn't capture, worth re-opening then.
+ *
+ * NOT a #define anymore (26/08/2026) - now just the BOOT-TIME DEFAULT
+ * for a runtime variable (see ms5351_get_xtal_hz()/ms5351_set_xtal_hz()
+ * below), so the CAL PPM tile (main.c, MENU_PAGE_HW) can correct it
+ * on live hardware and persist the result to CONFIG.CSV
+ * ("ms5351_xtal_hz" key - see settings.c) instead of requiring a
+ * recompile every time the board's actual crystal error is
+ * re-measured. */
+#define MS5351_XTAL_HZ_DEFAULT   25999921UL
 
 /* The LO frequency encoded in the captured tune block, for reference
  * and for validating ms5351_set_lo_freq() against known-good bytes:
@@ -113,10 +149,64 @@ uint8_t ms5351_tune_captured(void);
 uint8_t ms5351_set_lo_freq(uint32_t freq_hz);
 
 /*
+ * Puts CLK0/CLK1 (the quadrature LO pair feeding the QSD) into Hi-Z:
+ * both output-enable-masked (reg3, same "1=disabled" mask
+ * ms5351_init()/ms5351_clk2_8mhz() already use) AND powered down at
+ * the CLK-control level (reg16/17 PDN bit, same 0x80 pattern
+ * ms5351_init() uses while reconfiguring) - belt and braces, matching
+ * every other place this driver disables a clock. CLK2 is untouched
+ * either way (see ms5351_clk2_8mhz()'s header - it's an unrelated,
+ * currently-unused auxiliary output, not the QSD LO).
+ *
+ * Added 13/08/2026 for bench testing: injecting a test signal
+ * directly into the codec's IN2/IN3 pins (bypassing the antenna/QSD
+ * front end) needs the QSD's own switches to stop toggling first, or
+ * whatever the QSD is chopping (even just floating-input noise, with
+ * no antenna connected) keeps landing on the same IN2/IN3 nodes and
+ * fighting with the injected test signal.
+ *
+ * To resume normal reception afterward, just call
+ * ms5351_set_lo_freq() again with the desired LO frequency - it
+ * always does a full PLL-reset retune (this function forces that by
+ * invalidating the last-tuned-divider cache), so there's no separate
+ * "re-enable" call needed.
+ *
+ * Returns 1 if all writes were ACKed.
+ */
+uint8_t ms5351_lo_disable(void);
+
+/*
  * CLK2 8MHz auxiliary output (PLLA/104), captured as configured but
  * powered down. on=1 powers it up and enables its output, on=0
  * returns it to the captured (off) state. Returns 1 if ACKed.
  */
 uint8_t ms5351_clk2_8mhz(uint8_t on);
+
+/*
+ * Runtime crystal frequency (26/08/2026) - replaces the old
+ * MS5351_XTAL_HZ #define everywhere frac_divide() needs the actual
+ * reference frequency. Starts at MS5351_XTAL_HZ_DEFAULT every boot;
+ * settings_load() overwrites it from CONFIG.CSV's "ms5351_xtal_hz"
+ * key if present (same "caller applies it, settings.c just parses
+ * it" split touch calibration doesn't use, since here there's no
+ * ordering dependency on the rest of main()'s boot sequence the way
+ * vfo_hz/mode have - safe to apply immediately from within
+ * settings_load() itself, same as touch_set_calibration()).
+ *
+ * ms5351_get_xtal_hz() is also what settings.c's build_csv() reads to
+ * persist the current value - see its own comment for why that's a
+ * direct call instead of yet another settings_poll()/
+ * settings_save_now() parameter (same pattern as
+ * touch_get_calibration()).
+ */
+uint32_t ms5351_get_xtal_hz(void);
+
+/* Does NOT retune the LO by itself - the caller (see main.c's CAL PPM
+ * tile) must follow this with an ms5351_set_lo_freq() call (or
+ * equivalently apply_lo_tune(s_tune_hz)) for the new reference to
+ * actually take effect on the running LO. Kept separate rather than
+ * retuning internally because this driver has no idea what frequency
+ * is currently supposed to be on the air - only main.c does. */
+void ms5351_set_xtal_hz(uint32_t xtal_hz);
 
 #endif /* MS5351_H */

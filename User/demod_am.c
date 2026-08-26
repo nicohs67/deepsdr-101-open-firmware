@@ -1,4 +1,5 @@
 #include "demod_am.h"
+#include "sam.h" /* DEMOD_MODE_SAM - 21/08/2026 */
 #include "config.h"
 #include "sdr_rx.h"
 #include "gd32_i2s.h"
@@ -964,6 +965,19 @@ demod_mode_t demod_am_get_mode(void)
     return (demod_mode_t)s_mode;
 }
 
+/* SAM carrier-frequency-offset state (21/08/2026) - file scope (not a
+ * static local inside demod_am_process_raw()'s DEMOD_MODE_SAM branch
+ * anymore) specifically so demod_am_get_sam_carrier_hz() below can
+ * expose the live reading to main.c's own UI code, for the MS5351 PPM
+ * calibration on-screen readout. */
+static sam_t s_sam;
+static uint8_t s_sam_init_done = 0u;
+
+float32_t demod_am_get_sam_carrier_hz(void)
+{
+    return s_sam.carrier_hz;
+}
+
 /* AM/SSB audio filter width - see demod_am_set_audio_bw()'s comment in
  * demod_am.h. Same "plain uint8_t-sized enum, no critical section"
  * reasoning as s_mode above. Default AUDIO_BW_4K0 (the widest of the
@@ -1732,6 +1746,24 @@ void demod_am_process_raw(const int16_t *raw_interleaved)
             s_iq_cplx[2U * n + 1U] = s_q_buf[n];
         }
         arm_cmplx_mag_f32(s_iq_cplx, s_env, SDR_RX_BLOCK_SAMPLES);
+    } else if (s_mode == (uint8_t)DEMOD_MODE_SAM) {
+        /* Synchronous AM (both sidebands) - see sam.h/sam.c. Same
+         * s_i_buf/s_q_buf tap AM's own envelope detector uses (96kHz,
+         * post channel-filter) - apply_lo_tune() already treats every
+         * non-WFM mode (AM included) with the same low-IF tuning
+         * scheme, so the real carrier is already correctly centered
+         * near DC here regardless of mode, no special tuning handling
+         * needed for SAM specifically. */
+        {
+        uint32_t k;
+        if (!s_sam_init_done) {
+            sam_init(&s_sam, 96000.0f, 4000.0f, 200.0f, 65.0f / 75.0f);
+            s_sam_init_done = 1u;
+        }
+        for (k = 0; k < SDR_RX_BLOCK_SAMPLES; k++) {
+            s_env[k] = sam_step(&s_sam, s_i_buf[k], s_q_buf[k], 96000.0f);
+        }
+        }
     } else if (s_mode == (uint8_t)DEMOD_MODE_NFM) {
         /* NFM: same discriminator as WFM (see fm_discriminate()'s
          * comment), but on the down-mixed + NFM_CHF_COEFFS-filtered

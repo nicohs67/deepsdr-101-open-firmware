@@ -4,6 +4,22 @@
 #include "debug_uart.h"
 #include "gd32f4xx.h" /* DWT/CoreDebug - low-band phase-alignment delay, see delay_us_dwt() */
 
+/* Runtime crystal reference - see ms5351_get_xtal_hz()/
+ * ms5351_set_xtal_hz()'s comment in ms5351.h for why this replaced
+ * the old MS5351_XTAL_HZ #define. Every frac_divide() call below that
+ * used to reference the macro now reads this instead. */
+static uint32_t s_xtal_hz = MS5351_XTAL_HZ_DEFAULT;
+
+uint32_t ms5351_get_xtal_hz(void)
+{
+    return s_xtal_hz;
+}
+
+void ms5351_set_xtal_hz(uint32_t xtal_hz)
+{
+    s_xtal_hz = xtal_hz;
+}
+
 /*
  * Si5351/MS5351 register map, the subset we use:
  *
@@ -366,7 +382,7 @@ static uint8_t ms5351_set_lo_freq_lowband(uint32_t freq_hz)
          * redoes this identically right after we return - a harmless
          * no-op THIS call, and the real fine-retune path on every
          * subsequent call within this zone. */
-        frac_divide(fvco, MS5351_XTAL_HZ, &pll_p1, &pll_p2);
+        frac_divide(fvco, s_xtal_hz, &pll_p1, &pll_p2);
         ok &= wr_ms(REG_MSNB_BASE, pll_p1, pll_p2, FRAC_C, "MSNB PLLB fVCO (low-band align)");
 
         /* Step 2: MS0=MS1=divider for (freq-df), phase registers
@@ -400,7 +416,7 @@ static uint8_t ms5351_set_lo_freq_lowband(uint32_t freq_hz)
      * frequency within the current zone (MS0/MS1's divider ratio,
      * and therefore the 90-degree relationship established above,
      * stays untouched). */
-    frac_divide(fvco, MS5351_XTAL_HZ, &pll_p1, &pll_p2);
+    frac_divide(fvco, s_xtal_hz, &pll_p1, &pll_p2);
     ok &= wr_ms(REG_MSNB_BASE, pll_p1, pll_p2, FRAC_C, "MSNB PLLB (low-band retune)");
 
     if (ok) {
@@ -468,9 +484,9 @@ uint8_t ms5351_set_lo_freq(uint32_t freq_hz)
     /* PLLB feedback: fvco / xtal = a + b/c, c = FRAC_C, floor
      * arithmetic throughout (verified bit-exact against the capture
      * for 90.800MHz -> div 10). */
-    a   = (uint32_t)(fvco / MS5351_XTAL_HZ);
-    rem = fvco % MS5351_XTAL_HZ;
-    b   = (uint32_t)((rem * FRAC_C) / MS5351_XTAL_HZ);
+    a   = (uint32_t)(fvco / s_xtal_hz);
+    rem = fvco % s_xtal_hz;
+    b   = (uint32_t)((rem * FRAC_C) / s_xtal_hz);
 
     f128   = (uint32_t)(((uint64_t)b * 128U) / FRAC_C);
     pll_p1 = 128U * a + f128 - 512U;

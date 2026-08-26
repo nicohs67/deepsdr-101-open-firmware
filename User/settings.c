@@ -2,6 +2,7 @@
 #include "touch.h"
 #include "spi_flash.h"
 #include "debug_uart.h"
+#include "ms5351.h"
 
 extern volatile uint32_t g_msticks; /* same free-running ms counter touch.c/touch_calib.c/spi_flash.c already use */
 
@@ -76,6 +77,7 @@ static const char *mode_to_str(demod_mode_t mode)
     case DEMOD_MODE_LSB: return "LSB";
     case DEMOD_MODE_NFM: return "NFM";
     case DEMOD_MODE_WFM: return "WFM";
+    case DEMOD_MODE_SAM: return "SAM"; /* 26/08/2026 fix - was missing, so saving while in SAM silently persisted "AM" instead */
     default:             return "AM"; /* unreachable in practice, but never emit garbage into the file */
     }
 }
@@ -111,6 +113,11 @@ static uint32_t build_csv(uint8_t *buf, uint32_t buf_size,
     p = append_str(buf, p, buf_size, "tune_step_hz,");    p = append_u32(buf, p, buf_size, tune_step_hz);   p = append_str(buf, p, buf_size, "\n");
     p = append_str(buf, p, buf_size, "audio_bw,");        p = append_str(buf, p, buf_size, audio_bw_to_str(audio_bw)); p = append_str(buf, p, buf_size, "\n");
     p = append_str(buf, p, buf_size, "volume_db_x2,");    p = append_i32(buf, p, buf_size, volume_db_x2);   p = append_str(buf, p, buf_size, "\n");
+    /* MS5351 crystal reference (26/08/2026) - read directly from
+     * ms5351.c, same "not threaded through every settings_poll()/
+     * settings_save_now() call site" pattern as touch_get_calibration()
+     * just above - see ms5351_get_xtal_hz()'s comment. */
+    p = append_str(buf, p, buf_size, "ms5351_xtal_hz,");  p = append_u32(buf, p, buf_size, ms5351_get_xtal_hz()); p = append_str(buf, p, buf_size, "\n");
     return p;
 }
 
@@ -233,11 +240,23 @@ uint8_t settings_load(settings_loaded_t *out)
             else if (key_is(key, key_len, "vfo_hz")) { out->vfo_hz = manual_atou32(val, val_len); out->have_vfo_hz = 1U; got_any = 1U; }
             else if (key_is(key, key_len, "tune_step_hz")) { out->tune_step_hz = manual_atou32(val, val_len); out->have_tune_step_hz = 1U; got_any = 1U; }
             else if (key_is(key, key_len, "volume_db_x2")) { out->volume_db_x2 = (int16_t)manual_atoi32(val, val_len); out->have_volume_db_x2 = 1U; got_any = 1U; }
+            else if (key_is(key, key_len, "ms5351_xtal_hz")) {
+                /* Applied directly, same as touch_set_calibration()
+                 * just below - no ordering dependency on the rest of
+                 * main()'s boot sequence (ms5351_init()/
+                 * ms5351_tune_captured() don't care what s_xtal_hz is
+                 * until the first real ms5351_set_lo_freq() call,
+                 * which always happens after settings_load() in
+                 * main()). */
+                ms5351_set_xtal_hz(manual_atou32(val, val_len));
+                got_any = 1U;
+            }
             else if (key_is(key, key_len, "mode")) {
                 if      ((val_len >= 3U) && mem_eq(val, (const uint8_t *)"USB", 3U)) { out->mode = DEMOD_MODE_USB; }
                 else if ((val_len >= 3U) && mem_eq(val, (const uint8_t *)"LSB", 3U)) { out->mode = DEMOD_MODE_LSB; }
                 else if ((val_len >= 3U) && mem_eq(val, (const uint8_t *)"NFM", 3U)) { out->mode = DEMOD_MODE_NFM; }
                 else if ((val_len >= 3U) && mem_eq(val, (const uint8_t *)"WFM", 3U)) { out->mode = DEMOD_MODE_WFM; }
+                else if ((val_len >= 3U) && mem_eq(val, (const uint8_t *)"SAM", 3U)) { out->mode = DEMOD_MODE_SAM; } /* 26/08/2026 fix, see mode_to_str()'s comment */
                 else if ((val_len >= 2U) && mem_eq(val, (const uint8_t *)"AM", 2U))  { out->mode = DEMOD_MODE_AM; }
                 else { continue; } /* unrecognized value - don't set have_mode, leave the caller's default alone */
                 out->have_mode = 1U;

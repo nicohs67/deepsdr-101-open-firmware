@@ -190,7 +190,8 @@ typedef enum {
     DEMOD_MODE_USB,
     DEMOD_MODE_LSB,
     DEMOD_MODE_NFM,
-    DEMOD_MODE_WFM
+    DEMOD_MODE_WFM,
+    DEMOD_MODE_SAM /* synchronous AM (both sidebands) - 21/08/2026, see sam.h */
 } demod_mode_t;
 
 /*
@@ -362,6 +363,15 @@ void demod_am_set_mode(demod_mode_t mode);
 /* Query the current mode - used by main.c for the on-screen mode
  * label. */
 demod_mode_t demod_am_get_mode(void);
+
+/* Live SAM carrier-frequency-offset reading, Hz (21/08/2026) - see
+ * sam.h's own top comment and demod_am.c's s_sam declaration. Only
+ * meaningful while DEMOD_MODE_SAM is active and has had time to
+ * settle (several hundred ms to a few seconds after retuning) -
+ * reads 0 (or a stale value) otherwise. For MS5351 PPM calibration:
+ * tune to a station with a precisely known carrier frequency, wait
+ * for this to settle, then ppm = 1e6 * this_value / tuned_freq_hz. */
+float demod_am_get_sam_carrier_hz(void);
 
 /*
  * AM/SSB AUDIO FILTER WIDTH - added 02/08/2026, extended to a 3-way

@@ -38,6 +38,7 @@ static void freq_display_draw(void);
 static void step_display_draw(void);
 static void aux_row_display_draw(void);
 static void mode_display_draw(void);
+static void sam_calib_display_draw(void);
 static void time_display_draw(void);
 static void battery_display_draw(void);
 static void badges_draw(void);
@@ -385,6 +386,20 @@ int main(void)
                               * inits in this block; run before audio starts
                               * flowing so the speaker is never briefly at an
                               * undefined level for even one frame. */
+
+    /* PA6/PA7 explicit Hi-Z (21/08/2026) - CLK0/CLK1 from the MS5351
+     * route through these pins via 100-ohm series resistors (found by
+     * inspection of the real board, not from any schematic on file).
+     * Never configured anywhere in this codebase before now - left at
+     * the GD32F4's power-on-reset default (floating input), which
+     * SHOULD already be high-impedance, but doing it explicitly here
+     * removes any doubt (no other init code accidentally claims these
+     * pins for something else later, and it documents the intent).
+     * Run before ms5351_init() so the LO never sees anything other
+     * than Hi-Z on these lines from the moment it starts up. */
+    rcu_periph_clock_enable(RCU_GPIOA);
+    gpio_mode_set(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO_PIN_6 | GPIO_PIN_7);
+
     ms5351_init();
 
     debug_print("\n--- MCLK: TIMER2_CH0/PC6, 1.536MHz ---\n");
@@ -1046,6 +1061,7 @@ static ui_button_t s_menu_tile_nr; /* NR (Spectral Subtraction) strength, AM/USB
 static ui_button_t s_menu_tile_speaker_pa; /* speaker PA enable/mute (PB7) - HW page, see its own comment */
 static ui_button_t s_menu_tile_sleep; /* screen SLEEP one-shot action - HW page, added 10/08/2026, see screen_sleep_enter()'s comment */
 static ui_button_t s_menu_tile_cal; /* touch CALibration one-shot action - HW page, see touch_calib.h/menu_tile_cal_callback() */
+static ui_button_t s_menu_tile_cal_ppm; /* MS5351 crystal PPM CALibration one-shot action - HW page, added 26/08/2026, see menu_tile_cal_ppm_callback() */
 /* s_speaker_pa_enabled: backs BOTH the tile's label (menu_tile_speaker_pa_refresh())
  * and the actual GPIO level (speaker_pa_set_enabled(), defined down
  * with the rest of the GPIO drivers near led_gpio_init() - declared
@@ -1219,6 +1235,7 @@ typedef struct {
 
 static const demod_mode_entry_t k_demod_modes[] = {
     { "AM",     DEMOD_MODE_AM,  RTTY_VARIANT_NONE },
+    { "SAM",    DEMOD_MODE_SAM, RTTY_VARIANT_NONE }, /* synchronous AM, 21/08/2026 - see sam.h */
     { "USB",    DEMOD_MODE_USB, RTTY_VARIANT_NONE },
     { "LSB",    DEMOD_MODE_LSB, RTTY_VARIANT_NONE },
     { "NFM",    DEMOD_MODE_NFM, RTTY_VARIANT_NONE },
@@ -1350,6 +1367,24 @@ static void menu_detail_show(encoder_target_t target);
 
 
 static encoder_target_t s_encoder_target = ENCODER_TARGET_TUNE;
+
+/* s_volume_target_last_ms - added 26/08/2026, project owner report:
+ * VOL is a bottom-bar TOGGLE (demo_button_callback(), s_btn_vol), not
+ * a menu detail view - it has no EXIT tile to end the adjustment, so
+ * without this it stayed "hot" (encoder still adjusting volume)
+ * indefinitely until the user pressed VOL again or long-pressed the
+ * knob. g_msticks timestamp of the last VOLUME-target activity
+ * (entering the mode, or turning the knob while in it) -
+ * tune_encoder_poll()'s ENCODER_TARGET_VOLUME branch reverts to TUNE
+ * on its own once VOLUME_TARGET_TIMEOUT_MS passes with no further
+ * activity. Deliberately does NOT apply to VOLUME reached via its own
+ * menu tile (menu_detail_show(ENCODER_TARGET_VOLUME)) - that's a menu
+ * detail like PGA/SCALE/etc and ends via EXIT (menu_screen_close(),
+ * see its own comment) same as those, not a timeout; the
+ * !s_menu_open guard at the check site is what keeps the two paths
+ * from interfering with each other. */
+static uint32_t s_volume_target_last_ms = 0U;
+#define VOLUME_TARGET_TIMEOUT_MS 4000UL /* "a few seconds" per the project owner - comfortably longer than the pause between two encoder detents while actually adjusting */
 /* PGA (analog input gain, MIC_PGA_L/R - see aic3204_set_pga_gain_db())
  * - same 0.5dB-native-units reasoning as s_volume_db_x2 above, just
  * unsigned (0-95, matching the register's 0-47.5dB range, no cut
@@ -1689,10 +1724,94 @@ static void mode_display_draw(void)
     case DEMOD_MODE_LSB: label = "LSB"; color = GFX_COLOR_GREEN; break;
     case DEMOD_MODE_NFM: label = "NFM"; color = GFX_COLOR_ORANGE; break;
     case DEMOD_MODE_WFM: label = "WFM"; color = GFX_COLOR_CYAN; break;
+    case DEMOD_MODE_SAM: label = "SAM"; color = GFX_COLOR_YELLOW; break;
     case DEMOD_MODE_AM:
     default:             label = "AM "; color = GFX_COLOR_YELLOW; break;
     }
     gfx_text((uint16_t)MODE_X, MODE_Y, label, color, GFX_COLOR_DARKGRAY, 3);
+}
+
+/*
+ * sam_current_ppm_error() - 26/08/2026, replaces the old raw-Hz
+ * readout (see sam_calib_display_draw()'s history below): a Hz offset
+ * on its own isn't practical to act on - it means something different
+ * at every tuned frequency, so you had to do the ppm = offset_hz /
+ * tuned_hz * 1e6 division by hand before it meant anything. This
+ * does that division once, here, so both the live on-screen readout
+ * AND the CAL PPM tile's actual correction (menu_tile_cal_ppm_callback()
+ * below) read from exactly the same number - no risk of the display
+ * and the applied correction ever disagreeing.
+ *
+ * Valid only while DEMOD_MODE_SAM is selected and tuned to a station
+ * of known carrier frequency (SAM's PLL locks onto whatever carrier
+ * is strongest in-band, known or not) - callers must check
+ * demod_am_get_mode() themselves, same as the old Hz readout did.
+ * s_tune_hz is always > 0 (TUNE_MIN_HZ enforces that), so no
+ * divide-by-zero guard needed.
+ */
+static float sam_current_ppm_error(void)
+{
+    return (demod_am_get_sam_carrier_hz() / (float)s_tune_hz) * 1.0e6f;
+}
+
+/*
+ * MS5351 PPM calibration readout (21/08/2026, reworked 26/08/2026 to
+ * show ppm instead of raw Hz - see sam_current_ppm_error()'s comment
+ * for why). Shown right under the mode label, only while SAM is
+ * selected (blanked otherwise, so switching away from SAM doesn't
+ * leave a stale reading on screen). Manual formatting, no sprintf -
+ * same convention as volume_format() above.
+ */
+/*
+ * X/Y (26/08/2026, moved from under MODE - see this function's own
+ * comment for the ppm math, unchanged here) - the MODE_X position
+ * put this readout's 140px-wide field right on top of VOL_X/VOL_Y's
+ * own text (both around x=430-490, this one at y=47-63 landing
+ * inside VOL_Y=38's row), so the two overwrote each other on the
+ * real hardware even though they never collided during review. Moved
+ * to the free gap between STEP's field (ends around x=550) and
+ * TIME_X (690) on the SAME row as STEP (y=STEP_Y) instead - nothing
+ * else occupies that span, and keeping the row parallels how VOL
+ * sits right under STEP: this now sits right of STEP the same way
+ * VOL sits under it. */
+#define SAM_CALIB_X (STEP_X + 130)
+#define SAM_CALIB_Y STEP_Y
+static void sam_calib_display_draw(void)
+{
+    if (demod_am_get_mode() != DEMOD_MODE_SAM) {
+        gfx_fill_rect((uint16_t)SAM_CALIB_X, (uint16_t)SAM_CALIB_Y, 120U, 16U, GFX_COLOR_DARKGRAY);
+        return;
+    }
+
+    {
+        float ppm_f = sam_current_ppm_error();
+        uint8_t negative = (ppm_f < 0.0f) ? 1U : 0U;
+        float mag_f = negative ? -ppm_f : ppm_f;
+        uint16_t whole = (uint16_t)mag_f;
+        uint16_t tenth = (uint16_t)((mag_f - (float)whole) * 10.0f + 0.5f);
+        if (tenth >= 10U) { tenth = 0U; whole++; } /* rounding carry */
+
+        char buf[20];
+        int8_t pos = 19;
+        buf[pos] = '\0';
+        buf[--pos] = 'M';
+        buf[--pos] = 'P';
+        buf[--pos] = 'P';
+        buf[--pos] = (char)('0' + tenth);
+        buf[--pos] = '.';
+        do {
+            if (pos > 0) {
+                buf[--pos] = (char)('0' + (whole % 10U));
+            }
+            whole /= 10U;
+        } while (whole > 0U && pos > 0);
+        if (pos > 0) {
+            buf[--pos] = negative ? '-' : '+';
+        }
+
+        gfx_fill_rect((uint16_t)SAM_CALIB_X, (uint16_t)SAM_CALIB_Y, 120U, 16U, GFX_COLOR_DARKGRAY);
+        gfx_text((uint16_t)SAM_CALIB_X, (uint16_t)SAM_CALIB_Y, &buf[pos], GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, 2);
+    }
 }
 
 /*
@@ -3825,6 +3944,141 @@ static void menu_tile_cal_callback(void *widget, ui_event_t event, void *user_da
     }
 }
 
+/* Longest transient label this tile ever shows ("-99.9PM") plus the
+ * null terminator - menu_tile_cal_ppm_refresh() below always writes a
+ * complete, freshly-terminated string into this buffer before
+ * pointing the tile's label at it, so there's no stale-data risk
+ * across refreshes despite it being static. */
+static char s_cal_ppm_label[10] = "PPM";
+
+/*
+ * PPM (HW page) - one-shot action, added 26/08/2026 per the project
+ * owner: turns the live ppm error sam_current_ppm_error() already
+ * computes (see its comment, and sam_calib_display_draw() for the
+ * on-screen readout this shares its math with) into an actual
+ * correction of the MS5351's assumed crystal frequency, instead of
+ * leaving that as a number you had to compute PPM from by hand and
+ * then go recompile MS5351_XTAL_HZ_DEFAULT with (the old workflow -
+ * see ms5351.h's history comment).
+ *
+ * Preconditions enforced here rather than just documented, since a
+ * bogus correction silently applied would be worse than no
+ * correction at all:
+ *   - Must be in SAM mode (sam_current_ppm_error() is meaningless
+ *     otherwise - the PLL isn't even running).
+ *   - |ppm| must be under CAL_PPM_SANITY_LIMIT - a PLL that hasn't
+ *     locked yet (just switched into SAM, or not actually tuned to a
+ *     carrier) reads garbage/noise here, not a real crystal error;
+ *     50ppm is already enormous for any crystal, genuine values from
+ *     the 21/08/2026 measurements were ~3ppm - this is a "reject
+ *     obvious garbage" gate, not a tight tolerance.
+ * Both rejections flash the tile label with a short reason (see
+ * menu_tile_cal_ppm_refresh()) instead of silently doing nothing, so
+ * a tap that didn't work doesn't look identical to one that did.
+ *
+ * On success: computes the corrected crystal frequency from the
+ * CURRENTLY assumed one (ms5351_get_xtal_hz(), not the compiled-in
+ * default) so repeated calibration runs compose correctly instead of
+ * each one overwriting the last from the same 26MHz nominal baseline;
+ * applies it (ms5351_set_xtal_hz()); forces an immediate retune at
+ * the current VFO frequency so the correction takes effect without
+ * requiring the user to nudge the encoder first; and saves CONFIG.CSV
+ * right away (settings_save_now(), not the debounced path - same
+ * "deliberate, infrequent action" reasoning as touch_calib_done_callback()
+ * just above).
+ */
+#define CAL_PPM_SANITY_LIMIT_PPM 50.0f
+static void menu_tile_cal_ppm_refresh(void)
+{
+    s_menu_tile_cal_ppm.label = s_cal_ppm_label;
+    ui_button_draw(&s_menu_tile_cal_ppm);
+}
+
+static void menu_tile_cal_ppm_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event != UI_EVENT_RELEASE) {
+        return;
+    }
+
+    if (demod_am_get_mode() != DEMOD_MODE_SAM) {
+        debug_print("cal_ppm: not in SAM mode - tune to a known-frequency station in SAM first\n");
+        {
+            const char *msg = "SAM?";
+            uint8_t i;
+            for (i = 0U; (i < 8U) && (msg[i] != '\0'); i++) { s_cal_ppm_label[i] = msg[i]; }
+            s_cal_ppm_label[i] = '\0';
+        }
+        menu_tile_cal_ppm_refresh();
+        return;
+    }
+
+    {
+        float ppm_err = sam_current_ppm_error();
+        float ppm_mag = (ppm_err < 0.0f) ? -ppm_err : ppm_err;
+
+        if (ppm_mag > CAL_PPM_SANITY_LIMIT_PPM) {
+            debug_print("cal_ppm: reading exceeds sanity limit - PLL likely not locked, ignoring\n");
+            {
+                const char *msg = "LOCK?";
+                uint8_t i;
+                for (i = 0U; (i < 8U) && (msg[i] != '\0'); i++) { s_cal_ppm_label[i] = msg[i]; }
+                s_cal_ppm_label[i] = '\0';
+            }
+            menu_tile_cal_ppm_refresh();
+            return;
+        }
+
+        {
+            uint32_t old_xtal_hz = ms5351_get_xtal_hz();
+            /* new = old * (1 - ppm_err/1e6) - see ms5351.h's direction
+             * comment for why a POSITIVE ppm_err means the assumed
+             * xtal is too HIGH and must be REDUCED. +0.5f rounds to
+             * nearest Hz instead of always truncating down. */
+            uint32_t new_xtal_hz = (uint32_t)((float)old_xtal_hz * (1.0f - ppm_err / 1.0e6f) + 0.5f);
+
+            ms5351_set_xtal_hz(new_xtal_hz);
+            apply_lo_tune(s_tune_hz); /* retune NOW at the corrected reference - see this function's header comment */
+
+            debug_print_dec("cal_ppm: old MS5351 xtal Hz", old_xtal_hz);
+            debug_print_dec("cal_ppm: new MS5351 xtal Hz", new_xtal_hz);
+
+            settings_save_now(s_tune_hz, demod_am_get_mode(), k_tune_steps[s_tune_step_idx], demod_am_get_audio_bw(), s_volume_db_x2);
+
+            /* Show the applied correction (not the post-correction
+             * residual, which would read ~0 and tell the user
+             * nothing useful) on the tile itself, same manual
+             * formatting convention as sam_calib_display_draw(). */
+            {
+                uint8_t negative = (ppm_err < 0.0f) ? 1U : 0U;
+                uint16_t whole = (uint16_t)ppm_mag;
+                uint16_t tenth = (uint16_t)((ppm_mag - (float)whole) * 10.0f + 0.5f);
+                char tmp[10];
+                int8_t pos = 9;
+                if (tenth >= 10U) { tenth = 0U; whole++; }
+                tmp[pos] = '\0';
+                tmp[--pos] = 'M';
+                tmp[--pos] = 'P';
+                tmp[--pos] = (char)('0' + tenth);
+                tmp[--pos] = '.';
+                do {
+                    if (pos > 0) { tmp[--pos] = (char)('0' + (whole % 10U)); }
+                    whole /= 10U;
+                } while (whole > 0U && pos > 0);
+                if (pos > 0) { tmp[--pos] = negative ? '-' : '+'; }
+                {
+                    uint8_t i = 0U;
+                    int8_t src = pos;
+                    while ((tmp[src] != '\0') && (i < 9U)) { s_cal_ppm_label[i++] = tmp[src++]; }
+                    s_cal_ppm_label[i] = '\0';
+                }
+            }
+            menu_tile_cal_ppm_refresh();
+        }
+    }
+}
+
 static void menu_tile_smooth_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
@@ -4005,6 +4259,7 @@ static void menu_mode_preset_callback(void *widget, ui_event_t event, void *user
         debug_print(k_demod_modes[idx].label);
         debug_print("\n");
         mode_display_draw();
+        sam_calib_display_draw(); /* prompt blank/draw right on mode change, not just at the next periodic tick */
         badges_draw(); /* BW badge is mode-dependent, see its comment */
         menu_screen_close();
     }
@@ -4734,8 +4989,22 @@ static void menu_grid_show(void)
             2, 0, 1, menu_tile_cal_callback, NULL};
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_cal);
 
+        /* PPM: MS5351 crystal PPM calibration - see
+         * menu_tile_cal_ppm_callback()'s comment. Same YELLOW
+         * "one-shot action" styling as SLEEP/CAL rather than the
+         * cycle/detail palette, and reuses "PPM" as its resting
+         * label - menu_tile_cal_ppm_refresh() overwrites it with the
+         * applied correction (or a rejection reason) right after a
+         * tap. Slots 4-7 still intentionally empty. */
+        s_menu_tile_cal_ppm = (ui_button_t){
+            MENU_OPT_COL(3), MENU_OPT_ROW(3), MENU_TILE_W, MENU_TILE_H,
+            "PPM", GFX_COLOR_BLACK, GFX_COLOR_YELLOW, GFX_COLOR_WHITE,
+            2, 0, 1, menu_tile_cal_ppm_callback, NULL};
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_cal_ppm);
+
         ui_screen_draw(&s_menu_screen);
         menu_tile_speaker_pa_refresh();
+        menu_tile_cal_ppm_refresh();
         break;
 
     case MENU_PAGE_DIG:
@@ -4798,6 +5067,30 @@ static void menu_screen_close(void)
     s_menu_step_active = 0U;
     s_menu_mode_active = 0U;
     s_menu_freq_active = 0U;
+    /* Hand the knob back to TUNE unconditionally - fixes a real bug
+     * (26/08/2026, reported by the project owner): closing the menu
+     * via EXIT left s_encoder_target on whatever detail was open
+     * (PGA, SCALE, SQUELCH, ...), so the knob kept adjusting that
+     * parameter after the menu screen was already gone, with no way
+     * back short of the long-press gesture below (tune_encoder_poll())
+     * or reopening the menu and picking something else to bounce
+     * through. That long-press handler already does exactly this
+     * s_encoder_target reset + aux_row_display_draw() pair for its
+     * own case - this just makes EXIT (and every other path that
+     * reaches menu_screen_close(): a MODE/STEP/BANDS/RTTY picker
+     * selection, screen_sleep_enter(), ...) do the same, since none
+     * of those should leave a menu-opened target "hot" either. Safe
+     * even when the target was already TUNE (menu_detail_show() is
+     * the only thing that ever sets a non-TUNE target from inside the
+     * menu, and it can't run while the menu is closed) and safe with
+     * VOLUME too, whether that was reached via its own menu tile or
+     * (harmlessly redundantly, since the bottom VOL button's own
+     * timeout already retires it - see s_volume_target_last_ms's
+     * comment) via the bottom VOL button. */
+    if (s_encoder_target != ENCODER_TARGET_TUNE) {
+        s_encoder_target = ENCODER_TARGET_TUNE;
+        aux_row_display_draw();
+    }
     /* Only the spectrum+waterfall panels need restoring - the top
      * bar, right column, and bottom bar were never hidden or
      * touch-disabled while the menu was open (see s_menu_screen's
@@ -5519,6 +5812,7 @@ static void tune_encoder_poll(void)
     }
 
     if (s_encoder_target == ENCODER_TARGET_VOLUME) {
+        uint8_t volume_activity = 0U;
 
         /* Volume mode: the encoder button still cycles the tune step
          * (ready for when you flip back) - but only draw it if the
@@ -5528,6 +5822,7 @@ static void tune_encoder_poll(void)
         if (press) {
             set_tune_step_idx((uint8_t)((s_tune_step_idx + 1U) % TUNE_STEP_COUNT));
             if (!s_menu_open) { step_display_draw(); }
+            volume_activity = 1U;
         }
 
         if (detents != 0) {
@@ -5540,6 +5835,25 @@ static void tune_encoder_poll(void)
                 set_volume_db_x2((int16_t)v);
                 settings_value_redraw();
             }
+            volume_activity = 1U;
+        }
+
+        /* Auto-timeout (26/08/2026) - see s_volume_target_last_ms's
+         * comment: VOL is a bottom-bar toggle, not a menu detail with
+         * its own EXIT, so without this the encoder kept adjusting
+         * volume indefinitely. Any real activity this poll (press OR
+         * detents, checked above) refreshes the timestamp instead of
+         * tripping the timeout on the very poll that just used it.
+         * !s_menu_open excludes VOLUME reached via its own menu tile
+         * (menu_detail_show(ENCODER_TARGET_VOLUME)) - that path ends
+         * via EXIT (menu_screen_close()) same as PGA/SCALE/etc, not a
+         * timeout. */
+        if (volume_activity) {
+            s_volume_target_last_ms = g_msticks;
+        } else if (!s_menu_open && ((g_msticks - s_volume_target_last_ms) >= VOLUME_TARGET_TIMEOUT_MS)) {
+            s_encoder_target = ENCODER_TARGET_TUNE;
+            debug_print("vol: inactivity timeout - encoder back to TUNE\n");
+            aux_row_display_draw();
         }
         return;
     }
@@ -5809,6 +6123,9 @@ static void demo_button_callback(void *widget, ui_event_t event, void *user_data
         if (widget == &s_btn_vol) {
             s_encoder_target = (s_encoder_target == ENCODER_TARGET_VOLUME)
                                 ? ENCODER_TARGET_TUNE : ENCODER_TARGET_VOLUME;
+            if (s_encoder_target == ENCODER_TARGET_VOLUME) {
+                s_volume_target_last_ms = g_msticks; /* starts the inactivity timeout - see s_volume_target_last_ms's comment */
+            }
             debug_print((s_encoder_target == ENCODER_TARGET_VOLUME)
                         ? "vol: encoder now controls VOLUME\n"
                         : "vol: encoder now controls TUNE\n");
@@ -6644,6 +6961,7 @@ static void sdr_spectrum_waterfall_tick(void)
      * the whole time the menu is showing, only the spectrum/waterfall
      * panel underneath the menu gets skipped below. */
     smeter_draw(smeter_segments_from_peak(demod_am_get_signal_peak()));
+    sam_calib_display_draw(); /* MS5351 PPM calibration readout, 21/08/2026 - see its own comment; needs to update live as the PLL converges, same cadence as the S-meter above, not just on mode-change events */
     {
         static uint32_t s_last_time_min = 0xFFFFFFFFUL;
         uint32_t now_min = g_msticks / 60000UL;

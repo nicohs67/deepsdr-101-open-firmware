@@ -44,6 +44,7 @@ static void battery_display_draw(void);
 static void badges_draw(void);
 static void smeter_draw(uint8_t segs);
 static uint8_t smeter_segments_from_peak(float peak);
+static void snr_update_and_draw(const float *db_frame);
 static void tune_encoder_poll(void);
 static void menu_screen_open(void);
 static void menu_screen_close(void);
@@ -351,6 +352,32 @@ int main(void)
      */
     (void)settings_load(&s_loaded_settings);
 
+    /*
+     * *** 01/09/2026, rate-aware cold boot TRIED then REVERTED same
+     * day *** - an attempt to boot straight into AIC3204_RATE_192K
+     * when the saved mode was WFM (avoiding a cold-96K-then-warm-192K
+     * double reset, on the theory that a warm nRESET might not
+     * resettle some analog bias/reference circuit the way a true
+     * power-on does) made WFM audio sound "robotizado" on a cold boot
+     * - confirmed reproducible, and NOT fixed by also arming WFM's
+     * settle-mute (demod_wfm_reset_diag()) the way a live switch does.
+     * Two independent fixes failing to resolve a newly-introduced,
+     * clearly audible regression means the "double reset" theory (or
+     * at least this project's understanding of what's actually
+     * different about a genuine cold 192K bring-up vs this codebase's
+     * OTHER boot machinery) isn't solid enough to keep chasing blind,
+     * without live hardware access to instrument it further. Reverted
+     * to the plain, always-96K-first cold boot below, unconditionally
+     * - restoring the exact behavior this project had before today's
+     * attempt, which is known-good: WFM is only ever entered via
+     * apply_demod_mode()'s live-switch path, thoroughly validated on
+     * real hardware (see that function's own comment) and confirmed
+     * clean by the project owner. The WFM sensitivity investigation
+     * itself (needing more PGA gain than before) remains open - see
+     * gd32f450-sdr-firmware notes - but chasing it via the cold-boot
+     * rate is set aside for now in favor of not trading a mild
+     * sensitivity issue for an audible audio corruption bug.
+     */
     debug_print("\n--- AIC3204: phase 1 (I2C communication only) ---\n");
     aic3204_init(AIC3204_ADDR_DEFAULT);
     if (!aic3204_probe_and_reset()) {
@@ -406,7 +433,7 @@ int main(void)
     gd32_i2s_mclk_timer_start();
 
     debug_print("\n--- I2S1: phase 3 (clocks + circular DMA, test tone) ---\n");
-    gd32_i2s_init_slave_192k();
+    gd32_i2s_init_slave(AIC3204_RATE_96K);
 
     /*
      * REORDERED (28/07/2026): sdr_rx_init() moved to run IMMEDIATELY
@@ -428,7 +455,7 @@ int main(void)
     sdr_rx_init();
 
     debug_print("\n--- AIC3204: phase 2 (clock + single-ended ADC baseline + power-up) ---\n");
-    aic3204_phase2_init();
+    aic3204_phase2_init(AIC3204_RATE_96K);
 
     /*
      * Audio out: switch DMA0/CH4 from the bring-up test tone to the
@@ -436,7 +463,10 @@ int main(void)
      * per-block RX hook (runs in the RX DMA interrupt - see
      * demod_am.h for why it cannot live in this loop). Order matters:
      * the stream transport must exist before the hook can write into
-     * it.
+     * it. WFM is reached only via apply_demod_mode()'s live-switch
+     * path further down (if s_loaded_settings.mode is WFM) - see this
+     * block's own header comment for why a rate-aware cold boot was
+     * tried and reverted.
      */
     debug_print("\n--- Audio: TX stream + AM demodulator hook ---\n");
     gd32_i2s_dma_start_stream();
@@ -1054,6 +1084,7 @@ static ui_button_t s_menu_tile_zoom; /* spectrum/waterfall zoom, see spec_zoom_t
 static ui_button_t s_menu_tile_bw; /* AM/SSB audio filter width selector (4K0/2K3/1K8) - repurposed 02/08/2026 from the grid's BANDS tile, see menu_tile_bw_callback()'s comment */
 static ui_button_t s_menu_tile_pga; /* AIC3204 MIC_PGA analog input gain - fills the grid's last spare slot */
 static ui_button_t s_menu_tile_rfagc; /* RF-level auto-AGC (PGA backoff) toggle, added 07/08/2026 - fills RADIO slot 6 */
+static ui_button_t s_menu_tile_att; /* manual codec input attenuator (AIC3204 Rin: 10k/20k/40k = 0/-6/-12dB), added 01/09/2026 - fills RADIO slot 7, see menu_tile_att_callback()'s comment */
 static ui_button_t s_menu_tile_rtty_shift; /* RTTY mark/space separation, added 08/08/2026 - fills DIG slot 0 (moved off RADIO 09/08/2026, see the "Settings grid PAGES" comment) */
 static ui_button_t s_menu_tile_rtty_baud;  /* RTTY bit rate, added 09/08/2026 - DIG slot 1, see rtty_set_baud()'s comment */
 static ui_button_t s_menu_tile_rtty_inv;   /* RTTY station NORMAL/REVERSE convention, added 09/08/2026 - DIG slot 2, see rtty_set_station_inverted()'s comment */
@@ -1094,6 +1125,7 @@ static char s_menu_tile_smooth_buf[16];
 static char s_menu_tile_spec_style_buf[16];
 static char s_menu_tile_bw_buf[16];
 static char s_menu_tile_zoom_buf[16];
+static char s_menu_tile_att_buf[16];
 
 /* NR master on/off (Spectral Subtraction - see nr_ss.h), mirrored into
  * nr_ss_set_enabled() on every change - toggled by the bottom bar's NR
@@ -2179,6 +2211,137 @@ static uint8_t smeter_segments_from_peak(float peak)
 }
 
 /*
+ * --- SNR readout, added 01/09/2026 ------------------------------------
+ *
+ * Drawn in the gap between the S-meter (ends at SMETER_Y+SMETER_SEG_H)
+ * and the status badges (start at BADGE_Y0 = RCOL_Y+60) - plenty of
+ * clearance for one scale-1 (7px) text line.
+ *
+ * DELIBERATELY LABELED "dB", NOT "dBm" - same reasoning as the
+ * S-meter's own comment just above: without a calibrated antenna/
+ * frontend gain figure, there's no real zero-dBm reference to measure
+ * against, so a "dBm" label would be an invented number, same as an
+ * invented S-unit would be. An SNR figure sidesteps that problem in a
+ * way a standalone level reading can't: it's the DIFFERENCE of two
+ * readings taken from the exact same uncalibrated dB-relative scale
+ * (sdr_spectrum_waterfall_tick()'s own s_db_frame[], already computed
+ * every frame for the panadapter/waterfall - no new signal chain
+ * added), so whatever fixed calibration offset that scale is missing
+ * cancels out in the subtraction. The RESULT is a genuinely meaningful
+ * dB figure even though neither of the two numbers that produced it
+ * would be, on its own.
+ *
+ * Signal estimate: the peak bin within SNR_SIGNAL_HALF_WIN bins either
+ * side of center (FFT_BINS_IQ/2 - the VFO/tuned point, fftshift order,
+ * same convention spectrum_draw()'s center_mark uses).
+ * Noise estimate: the plain mean (not median - cheap, no sort needed,
+ * and this project's existing dB-domain approximations already accept
+ * this kind of looseness elsewhere, e.g. smeter_log2_approx()) of
+ * every bin OUTSIDE SNR_GUARD_HALF_WIN bins of center - wide enough to
+ * exclude the signal's own filter skirts from polluting the noise
+ * floor estimate, at the cost of also excluding some genuinely-quiet
+ * spectrum right next to a wide signal (WFM especially - acceptable,
+ * given plenty of bins remain either way at FFT_BINS_IQ=256).
+ * Both window sizes are bin counts, not Hz - since Hz/bin varies with
+ * mode/zoom, the true "channel width in bins" this should track also
+ * varies; fixed windows are a first-pass approximation only, same
+ * spirit as the S-meter's own un-calibrated honesty above.
+ *
+ * Like the rest of this status column, this only gets fresh data while
+ * the settings menu is closed - s_db_frame itself stops updating while
+ * the menu covers the spectrum panel (see sdr_spectrum_waterfall_tick()'s
+ * own "!s_menu_open" comment) - so unlike the S-meter (driven by
+ * demod_am_get_signal_peak(), independent of s_db_frame), this reading
+ * visibly freezes while the menu is open rather than going stale
+ * silently. Acceptable: there's no fresher spectrum data being
+ * computed during that window anyway.
+ */
+#define SNR_X (RCOL_X + 6)
+#define SNR_Y (SMETER_Y + SMETER_SEG_H + 4)
+#define SNR_SIGNAL_HALF_WIN 3U  /* bins each side of center counted as "signal" */
+#define SNR_GUARD_HALF_WIN  8U  /* bins each side of center excluded from the noise average */
+
+static int32_t s_snr_db_last_drawn = 0x7FFFFFFF; /* force first draw */
+
+static void snr_update_and_draw(const float *db_frame)
+{
+    uint32_t center = FFT_BINS_IQ / 2U;
+    uint32_t lo_sig = (center > SNR_SIGNAL_HALF_WIN) ? (center - SNR_SIGNAL_HALF_WIN) : 0U;
+    uint32_t hi_sig = center + SNR_SIGNAL_HALF_WIN;
+    uint32_t lo_guard = (center > SNR_GUARD_HALF_WIN) ? (center - SNR_GUARD_HALF_WIN) : 0U;
+    uint32_t hi_guard = center + SNR_GUARD_HALF_WIN;
+    float sig_peak;
+    float noise_sum = 0.0f;
+    uint32_t noise_n = 0U;
+    uint32_t k;
+    float snr_db;
+    int32_t snr_rounded;
+    uint8_t negative;
+    uint32_t mag;
+    char buf[16];
+    int8_t pos = 15;
+
+    if (hi_sig >= FFT_BINS_IQ) { hi_sig = FFT_BINS_IQ - 1U; }
+    if (hi_guard >= FFT_BINS_IQ) { hi_guard = FFT_BINS_IQ - 1U; }
+
+    sig_peak = db_frame[lo_sig];
+    for (k = lo_sig; k <= hi_sig; k++) {
+        if (db_frame[k] > sig_peak) { sig_peak = db_frame[k]; }
+    }
+    for (k = 0U; k < FFT_BINS_IQ; k++) {
+        if (k >= lo_guard && k <= hi_guard) {
+            continue; /* skip the guard band around the signal */
+        }
+        noise_sum += db_frame[k];
+        noise_n++;
+    }
+    if (noise_n == 0U) {
+        return; /* guard band somehow covers the whole span - nothing to compute against */
+    }
+    snr_db = sig_peak - (noise_sum / (float)noise_n);
+
+    /* Round to the nearest whole dB - same "skip the blit if nothing
+     * visibly changed" discipline as smeter_draw()'s segment check. */
+    snr_rounded = (snr_db >= 0.0f) ? (int32_t)(snr_db + 0.5f) : (int32_t)(snr_db - 0.5f);
+    if (snr_rounded == s_snr_db_last_drawn) {
+        return;
+    }
+    s_snr_db_last_drawn = snr_rounded;
+
+    negative = (snr_rounded < 0) ? 1U : 0U;
+    mag = negative ? (uint32_t)(-snr_rounded) : (uint32_t)snr_rounded;
+
+    buf[pos] = '\0';
+    buf[--pos] = 'B';
+    buf[--pos] = 'd';
+    do {
+        if (pos > 0) {
+            buf[--pos] = (char)('0' + (mag % 10U));
+        }
+        mag /= 10U;
+    } while (mag > 0U && pos > 0);
+    if (pos > 0) {
+        buf[--pos] = negative ? '-' : '+';
+    }
+    if (pos > 0) {
+        buf[--pos] = ' ';
+    }
+    if (pos > 0) {
+        buf[--pos] = 'R';
+    }
+    if (pos > 0) {
+        buf[--pos] = 'N';
+    }
+    if (pos > 0) {
+        buf[--pos] = 'S';
+    }
+
+    gfx_fill_rect((uint16_t)SNR_X, (uint16_t)SNR_Y, (uint16_t)(RCOL_W - 12), 9U,
+                   GFX_COLOR_DARKGRAY);
+    gfx_text((uint16_t)SNR_X, (uint16_t)SNR_Y, &buf[pos], GFX_COLOR_YELLOW, GFX_COLOR_DARKGRAY, 1);
+}
+
+/*
  * STATUS BADGES: up to 6, in a 2x3 grid under the S-meter. Each shows
  * a radio state at a glance:
  *   NR / SPT  - NR (03/08/2026) is real again: lit whenever the
@@ -2192,13 +2355,18 @@ static uint8_t smeter_segments_from_peak(float peak)
  *               smoothing is active (passes > 0) - see
  *               s_spec_smooth_passes' comment; it used to be the NB
  *               (noise blanker) badge, which never drove any real DSP.
- *   AGC       - lit: the demod AGC really is always active (even in
- *               MANUAL profile the loop still runs, it just skips the
- *               peak-tracking math - see agc_profile_t's MANUAL note
- *               in demod_am.h).
+ *   AGC       - lit: the demod AGC loop really is always active (even
+ *               in MANUAL profile - i.e. the user-facing "AGC off" -
+ *               the loop still runs, it just skips the peak-tracking
+ *               math and outputs fixed unity gain - see
+ *               agc_profile_t's MANUAL note in demod_am.h). This
+ *               badge reflects the loop running, not whether it's
+ *               actively adjusting gain right now.
  *   [profile] - s_btn_agc_profile, a REAL touchable button (not a
- *               plain badge_draw() call) showing MAN/SLW/MED/FST -
- *               tap it to cycle, see agc_profile_button_callback()
+ *               plain badge_draw() call) showing OFF/SLW/MED/FST -
+ *               tap it to cycle (MANUAL included again as of
+ *               01/09/2026 - see agc_profile_cycle()'s comment), see
+ *               agc_profile_button_callback()
  *               below. Moved here from where BW used to live
  *               31/07/2026, per the project owner: this slot gets
  *               more use as an interactive control than BW did as a
@@ -2251,13 +2419,27 @@ static uint8_t smeter_segments_from_peak(float peak)
 #define BADGE_ROW_STEP (BADGE_H + 6)
 
 /* Indexed directly by agc_profile_t (demod_am.h) - MANUAL, SLOW,
- * MEDIUM, FAST in that order. Matches what the project owner asked
- * for verbatim: "MAN, SLW, MED, FST". */
-static const char *k_agc_profile_labels[4] = { "MAN", "SLW", "MED", "FST" };
+ * MEDIUM, FAST in that order. Originally "MAN, SLW, MED, FST" per the
+ * project owner's verbatim request; MAN relabeled to OFF on
+ * 01/09/2026 (also per the project owner) once MANUAL was re-added to
+ * the cycle as an explicit "AGC off" rung - OFF reads more clearly
+ * than MAN for that purpose. */
+static const char *k_agc_profile_labels[4] = { "OFF", "SLW", "MED", "FST" };
 
 /* Indexed directly by audio_bw_t (demod_am.h) - AUDIO_BW_4K0,
  * AUDIO_BW_2K3, AUDIO_BW_1K8 in that order. */
 static const char *k_audio_bw_labels[3] = { "4K0", "2K3", "1K8" };
+
+/* Indexed directly by aic3204_rin_t (aic3204.h) - AIC3204_RIN_10K,
+ * AIC3204_RIN_20K, AIC3204_RIN_40K in that order, same "index into a
+ * table, don't try to derive a string from the raw value" shape as
+ * k_agc_profile_labels/k_audio_bw_labels above. 10k/20k/40k are the
+ * AIC3204 MIC_PGA differential input impedances - see
+ * aic3204_set_input_impedance()'s comment in aic3204.c - which work
+ * out to 0/-6/-12dB of relative input attenuation (each doubling of
+ * Rin is a 6dB drop in the signal presented to the PGA), hence "ATT"
+ * as the manual tile's name rather than "RIN". */
+static const char *k_att_labels[3] = { "0DB", "-6DB", "-12DB" };
 
 /* RTTY BAUD tile table (DIG page) - added 09/08/2026, per the project
  * owner. Cycles the bit rate through the common ham/commercial rates,
@@ -2293,32 +2475,27 @@ static const uint32_t k_audio_bw_hz[3] = { 4000UL, 2300UL, 1800UL };
  * for more controls). Factored out so both entry points can't drift
  * out of sync with each other.
  *
- * MANUAL removed from the cycle 07/08/2026, per the project owner
- * ("no tiene sentido por ahora") - the enum value, the demod_am.c
- * MANUAL branch (fixed unity gain, peak-tracking bypassed), and
- * k_agc_profile_labels[0]="MAN" are all left exactly as they were on
- * purpose: nothing reachable from the UI can ever land on MANUAL
- * again (s_agc_profile starts at MEDIUM and this cycle no longer
- * mentions it), but the underlying support isn't ripped out, in case
- * it's worth reviving later. If MANUAL is ever wanted back, this is
- * the only place that needs a case re-added.
+ * MANUAL was removed from the cycle 07/08/2026, per the project owner
+ * ("no tiene sentido por ahora"), then RE-ADDED 01/09/2026 (also per
+ * the project owner: an explicit "AGC off" option is wanted after
+ * all) - the enum value, the demod_am.c MANUAL branch (fixed unity
+ * gain, peak-tracking bypassed), and k_agc_profile_labels[0]="OFF"
+ * were never actually removed in between, so reviving it is just this
+ * one switch case. Cycle order is now MANUAL -> SLOW -> MEDIUM ->
+ * FAST -> MANUAL, i.e. "MAN" reads as the explicit AGC-off rung at
+ * one end of the cycle rather than a hidden extra state - tapping the
+ * tile four times returns to wherever you started, same as before.
  */
 static void agc_profile_cycle(void)
 {
     agc_profile_t p = demod_am_get_agc_profile();
 
     switch (p) {
+    case AGC_PROFILE_MANUAL: p = AGC_PROFILE_SLOW;   break;
     case AGC_PROFILE_SLOW:   p = AGC_PROFILE_MEDIUM; break;
     case AGC_PROFILE_MEDIUM: p = AGC_PROFILE_FAST;   break;
-    case AGC_PROFILE_MANUAL: /* unreachable now - see this function's
-                               * comment - but if it's ever seen here
-                               * anyway, fall through to the same
-                               * "start the real cycle over" recovery
-                               * as FAST rather than a 4th distinct
-                               * case, so a leftover/persisted MANUAL
-                               * value can't get stuck forever. */
     case AGC_PROFILE_FAST:
-    default:                  p = AGC_PROFILE_SLOW;   break;
+    default:                  p = AGC_PROFILE_MANUAL; break;
     }
     demod_am_set_agc_profile(p);
     debug_print("agc: profile now ");
@@ -2472,8 +2649,12 @@ static void badges_draw(void)
  *
  * Per-page option assignment (all pre-existing tiles, just
  * relocated - no settings were dropped):
- *   RADIO (slots 0-5): AGC, SQL (squelch), VOL, BW, PGA, NR (Spectral
- *                       Subtraction strength, AM/USB/LSB only).
+ *   RADIO (slots 0-7): AGC, SQL (squelch), VOL, BW, PGA, NR (Spectral
+ *                       Subtraction strength, AM/USB/LSB only), RFAGC
+ *                       (RF-level auto-AGC toggle, slot 6, added
+ *                       07/08/2026), ATT (manual codec input
+ *                       attenuator, slot 7, added 01/09/2026 - see
+ *                       menu_tile_att_callback()'s comment).
  *   UI    (slots 0-5): BL (backlight), SCALE, SPT, SMH (smooth),
  *                       SPC (spectrum trace style, HEATMAP<->LINE),
  *                       ZOOM.
@@ -3669,6 +3850,27 @@ static void apply_demod_mode(demod_mode_t mode)
          * right after the switch. */
         aic3204_set_volume_db((float)s_volume_db_x2 * 0.5f);
         rf_agc_apply_pga();
+        /* *** 01/09/2026, found alongside the ATT tile work *** -
+         * aic3204_configure_rate() above unconditionally rewrites
+         * P1R52/54/55/57 back to the captured 10k baseline (see its
+         * own "ADC input routing" comment) as part of the SAME
+         * captured register sequence that resets DAC volume/MIC_PGA -
+         * exactly the state-loss bug the volume/PGA re-apply just
+         * above already fixed for those two, but Rin was missed: if
+         * RFAGC's auto-escalation (or a manual ATT tap) had the codec
+         * sitting at 20k/40k before this switch, s_rf_agc_rin_level
+         * still SAYS 20k/40k afterward while the codec itself is
+         * silently back at 10k - a real desync, not just a cosmetic
+         * one, since rf_agc_poll()'s escalate/deescalate math assumes
+         * s_rf_agc_rin_level matches hardware. Re-apply it here too,
+         * same "whatever's actually live, regardless of how it got
+         * there" reasoning as the volume/PGA re-apply - no extra mute
+         * needed, the demod_wfm_reset_diag()/demod_am_reset_diag()
+         * call above already just armed this mode entry's own settle
+         * window. */
+        if (s_rf_agc_rin_level != 0U) {
+            aic3204_set_input_impedance((aic3204_rin_t)s_rf_agc_rin_level);
+        }
     }
 
     /* See s_settings_ready_for_autosave's comment (same reasoning as
@@ -3810,6 +4012,70 @@ static void menu_tile_rfagc_callback(void *widget, ui_event_t event, void *user_
          * enough to just always do it. */
         menu_tile_rfagc_refresh();
         badges_draw();
+    }
+}
+
+/*
+ * ATT (RADIO page, slot 7) - manual, direct control of the AIC3204's
+ * MIC_PGA input impedance (10k/20k/40k, i.e. 0/-6/-12dB of front-end
+ * attenuation ahead of the PGA - see k_att_labels' comment and
+ * aic3204_set_input_impedance()'s in aic3204.c). Same "CYCLE DIRECTLY
+ * on tap, stay on this screen" shape as AGC/BW (menu_grid_show()'s
+ * tile-behavior comment) rather than a DETAIL view: only 3 fixed
+ * rungs, nothing to dial in.
+ *
+ * Shares s_rf_agc_rin_level with the RF-level auto-AGC (RFAGC tile/
+ * rf_agc_poll()) as the single source of truth for the codec's
+ * CURRENT Rin setting, the same way the manual PGA control
+ * (s_pga_gain_db_x2) and RFAGC's own PGA backoff both feed into one
+ * shared rf_agc_apply_pga() rather than fighting over two separate
+ * variables. Unlike PGA gain, though, there's no "baseline plus
+ * backoff" math for Rin - rf_agc_escalate_rin()/rf_agc_deescalate_rin()
+ * step s_rf_agc_rin_level up/down directly - so this tile just does
+ * the same thing manually, one step per tap. That means an ATT
+ * selection made here can get walked away from by rf_agc_poll() on
+ * its own schedule WHILE RFAGC is switched on (escalating further on
+ * a clip, or deescalating back down once things go quiet): this tile
+ * is really only meaningful as a fixed, sticky choice with RFAGC
+ * turned OFF. Nothing stops tapping it with RFAGC on - it applies the
+ * change immediately either way - but the project owner should treat
+ * that as "the auto system may well overwrite this again shortly"
+ * rather than a persistent override, unless/until RFAGC's own logic
+ * is taught to respect a manual floor.
+ *
+ * Reuses rf_agc_mute_for_transition() around the switch for the same
+ * reason rf_agc_escalate_rin()/rf_agc_deescalate_rin() do - Rin
+ * switching is an abrupt analog reconnection, not soft-stepped like
+ * the PGA gain register, so it pops without a brief mute.
+ */
+static void menu_tile_att_refresh(void)
+{
+    const char *v = k_att_labels[s_rf_agc_rin_level];
+    uint8_t j = 4U;
+    uint8_t i;
+
+    s_menu_tile_att_buf[0] = 'A'; s_menu_tile_att_buf[1] = 'T';
+    s_menu_tile_att_buf[2] = 'T'; s_menu_tile_att_buf[3] = ' ';
+    for (i = 0; v[i] != '\0'; i++) {
+        s_menu_tile_att_buf[j++] = v[i];
+    }
+    s_menu_tile_att_buf[j] = '\0';
+
+    s_menu_tile_att.label = s_menu_tile_att_buf;
+    ui_button_draw(&s_menu_tile_att);
+}
+
+static void menu_tile_att_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+
+    if (event == UI_EVENT_RELEASE) {
+        s_rf_agc_rin_level = (uint8_t)((s_rf_agc_rin_level + 1U) % 3U);
+        aic3204_set_input_impedance((aic3204_rin_t)s_rf_agc_rin_level);
+        rf_agc_mute_for_transition();
+        debug_print_dec("att: manual Rin now (0=10k/1=20k/2=40k)", (uint32_t)s_rf_agc_rin_level);
+        menu_tile_att_refresh();
     }
 }
 
@@ -4878,7 +5144,14 @@ static void menu_grid_show(void)
             MENU_OPT_COL(6), MENU_OPT_ROW(6), MENU_TILE_W, MENU_TILE_H,
             "RFAGC", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
             2, 0, 1, menu_tile_rfagc_callback, NULL};
-        /* Slot 7 intentionally empty - room to grow RADIO further. */
+        /* ATT: manual AIC3204 input attenuator (Rin 10k/20k/40k =
+         * 0/-6/-12dB), added 01/09/2026 - see
+         * menu_tile_att_callback()'s comment. Fills slot 7 - RADIO is
+         * now 8/8. */
+        s_menu_tile_att = (ui_button_t){
+            MENU_OPT_COL(7), MENU_OPT_ROW(7), MENU_TILE_W, MENU_TILE_H,
+            "ATT", GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_att_callback, NULL};
 
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_agc);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_squelch);
@@ -4887,6 +5160,7 @@ static void menu_grid_show(void)
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_pga);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_nr);
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_rfagc);
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_att);
 
         ui_screen_draw(&s_menu_screen);
         /* ui_screen_draw() just painted each tile with its STATIC
@@ -4900,6 +5174,7 @@ static void menu_grid_show(void)
         menu_tile_pga_refresh();
         menu_tile_nr_refresh();
         menu_tile_rfagc_refresh();
+        menu_tile_att_refresh();
         break;
 
     case MENU_PAGE_UI:
@@ -7040,6 +7315,8 @@ static void sdr_spectrum_waterfall_tick(void)
             s_db_frame[bi] = s_db_smooth[bi];
         }
     }
+
+    snr_update_and_draw(s_db_frame);
 
     t_spec0 = DWT->CYCCNT;
     /* Spectrum trace inside its panel (see the RADIO UI LAYOUT block):

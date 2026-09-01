@@ -635,16 +635,19 @@ void aic3204_start_bclk_wclk(aic3204_rate_t rate)
 }
 
 /*
- * Cold-boot entry point - now just the 96kHz call into the shared
- * sequence above, plus the power-up that used to be inlined at the
- * end of this function. Kept as its own name/signature (no
- * parameters) since main.c already calls it that way and there's no
- * reason to disturb that call site.
+ * Cold-boot entry point - now just the shared sequence above,
+ * parameterized by `rate`, plus the power-up that used to be inlined
+ * at the end of this function. Was hardcoded to AIC3204_RATE_96K with
+ * no parameter until 01/09/2026 - see this function's header comment
+ * in aic3204.h for why main() now needs to pick the boot rate itself
+ * (matching whatever mode the saved config says to boot into, so WFM
+ * gets a single genuine cold reset instead of a 96K cold boot
+ * immediately followed by a second, warm switch into 192K).
  */
-void aic3204_phase2_init(void)
+void aic3204_phase2_init(aic3204_rate_t rate)
 {
     aic3204_rate_switch_reset();
-    aic3204_configure_rate(AIC3204_RATE_96K);
+    aic3204_configure_rate(rate);
     /* Cold boot's own GD32-side bring-up (gd32_i2s_init_slave()/
      * sdr_rx_init(), both called earlier in main.c's boot sequence)
      * already left SPI1/I2S1_ADD freshly enabled and listening before
@@ -654,12 +657,12 @@ void aic3204_phase2_init(void)
      * live switch now go through this exact same two-call sequence, in
      * the exact same order, with no separate code path to drift out of
      * sync again. */
-    aic3204_start_bclk_wclk(AIC3204_RATE_96K);
+    aic3204_start_bclk_wclk(rate);
     aic3204_set_rate_power_up();
-    debug_print("aic3204: phase 2 complete - full sequence ported from a real I2C "
-                "capture of the original firmware. PLL sourced from BCLK (not MCLK), "
-                "J=14/D=0 -> CODEC_CLKIN=86.016MHz -> Fs=96kHz exact on both ADC and "
-                "DAC divider chains.\n");
+    debug_print_dec("aic3204: phase 2 complete - full sequence ported from a real I2C "
+                     "capture of the original firmware. PLL sourced from BCLK (not MCLK), "
+                     "J=14/D=0 -> CODEC_CLKIN=86.016MHz -> Fs exact on both ADC and DAC "
+                     "divider chains (0=96K,1=192K)", (uint32_t)rate);
 }
 
 

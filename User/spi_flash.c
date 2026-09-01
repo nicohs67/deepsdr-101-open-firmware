@@ -488,6 +488,7 @@ void spi_flash_probe_fat_scan(spi_flash_fat_scan_t *out)
     uint8_t fat[FAT_BYTES]; /* stack, not static - see spi_flash_block_read_modify_write()'s comment on why that's fine here */
     uint32_t cluster;
     uint32_t block_idx;
+    uint8_t fat_is_blank;
 
     out->total_data_clusters = DATA_CLUSTER_COUNT;
     out->free_data_clusters = 0U;
@@ -497,8 +498,34 @@ void spi_flash_probe_fat_scan(spi_flash_fat_scan_t *out)
 
     spi_flash_read(FAT1_LBA * ROOT_DIR_SECTOR_BYTES, fat, sizeof(fat));
 
+    /*
+     * *** 01/09/2026, added alongside dir_find_end_marker_offset()'s
+     * fix - same "genuinely blank chip" bug, different spot *** - a
+     * cluster is normally "free" when its FAT12 entry reads 0x000, but
+     * on NOR flash that has NEVER been formatted at all, every entry
+     * reads back as 0xFFF (all bits from the erased 0xFF bytes) - the
+     * SAME bit pattern FAT12 also uses for a real file's legitimate
+     * end-of-chain marker on its last cluster. Unlike the directory
+     * fix above, 0xFFF can't just be treated as "also free"
+     * everywhere - that would risk mistaking a real file's actual last
+     * cluster for free space once at least one real file exists.
+     * Instead, detect the unambiguous special case directly: if the
+     * ENTIRE FAT1 copy just read back is 0xFF (i.e. nothing has EVER
+     * been written to this volume's FAT at all, not even one file),
+     * every cluster genuinely is free, full stop - fat_is_blank makes
+     * that case bypass the normal per-entry check below instead of
+     * redefining what 0xFFF means in general.
+     */
+    fat_is_blank = 1U;
+    for (cluster = 0U; cluster < sizeof(fat); cluster++) {
+        if (fat[cluster] != 0xFFU) {
+            fat_is_blank = 0U;
+            break;
+        }
+    }
+
     for (cluster = 2U; cluster < (2U + DATA_CLUSTER_COUNT); cluster++) {
-        if (fat12_entry(fat, cluster) == 0x000U) {
+        if (fat_is_blank || (fat12_entry(fat, cluster) == 0x000U)) {
             out->free_data_clusters++;
         }
     }
@@ -506,6 +533,10 @@ void spi_flash_probe_fat_scan(spi_flash_fat_scan_t *out)
     debug_print("\n--- spi_flash_probe_fat_scan: FAT12 free-space scan ---\n");
     debug_print_dec("  total_data_clusters", out->total_data_clusters);
     debug_print_dec("  free_data_clusters", out->free_data_clusters);
+    if (fat_is_blank) {
+        debug_print("  FAT1 copy read back entirely 0xFF - treating volume as never-formatted, "
+                     "every cluster counted free\n");
+    }
 
     /* Data sector 48 is itself 4KB-block-aligned (48/8=6), so cluster
      * 2 starts exactly on a block boundary and every CLUSTERS_PER_BLOCK
@@ -517,7 +548,7 @@ void spi_flash_probe_fat_scan(spi_flash_fat_scan_t *out)
         uint32_t c;
 
         for (c = first_cluster; c < (first_cluster + CLUSTERS_PER_BLOCK); c++) {
-            if (fat12_entry(fat, c) != 0x000U) {
+            if (!fat_is_blank && (fat12_entry(fat, c) != 0x000U)) {
                 all_free = 0U;
                 break;
             }
@@ -628,21 +659,78 @@ static void fat_write_chain(uint32_t fat_start_lba, uint32_t first_cluster, uint
     spi_flash_block_read_modify_write(abs_addr, off_in_block, buf, span_bytes);
 }
 
-/* Finds the first end-of-directory marker (name[0]==0x00) in the root
- * directory's FIRST sector - see spi_flash.h's comment on why only
- * the first sector is handled. Returns 1 and sets *out_offset (byte
- * offset within that sector) if found. */
-static int dir_find_end_marker_offset(uint32_t *out_offset)
+/* Finds the first end-of-directory marker in the root directory's
+ * FIRST sector - see spi_flash.h's comment on why only the first
+ * sector is handled. Returns 1 and sets *out_offset (byte offset
+ * within that sector) and *out_needs_terminator if found.
+ *
+ * *** 01/09/2026, fixed for the "CONFIG.CSV never gets created on a
+ * genuinely blank chip" bug *** - a real end-of-directory marker
+ * (name[0]==0x00) is what a proper FAT12 format (mkfs.fat) leaves
+ * behind, since a formatter explicitly ZEROES the unused tail of the
+ * root directory area. But a chip that has NEVER been formatted at
+ * all - no CHANNEL.CSV, no CONFIG.CSV, nothing ever written here -
+ * reads back as the NOR flash's own erased state, 0xFF, everywhere,
+ * not 0x00. The project owner confirmed this exact split: CONFIG.CSV
+ * gets created fine once at least one other file already exists on
+ * the volume (which only happens because THAT file's own creation,
+ * at some point in this volume's history, established a real 0x00
+ * terminator after it), but never on a truly virgin chip. In this
+ * project's own write path (write_file_data_and_entry()), the byte at
+ * a directory slot's offset 0 is NEVER deliberately left at 0xFF for
+ * any real entry - every entry this driver ever writes gets a real
+ * 8.3 name or an explicit 0x00 terminator - so seeing 0xFF here can
+ * only mean "genuinely never written," making it just as valid an
+ * insertion point as a real 0x00 terminator, with no ambiguity to
+ * worry about (unlike the FAT free-cluster scan below, where 0xFFF
+ * is also the legitimate EOC value for a real file's last cluster).
+ *
+ * *** 01/09/2026, second fix, same day - real hardware log from the
+ * project owner *** - the 0x00/0xFF fix above still isn't enough on a
+ * volume that has real history: a directory entry gets marked 0xE5
+ * ("deleted") when a file is removed, but nothing about deletion ever
+ * restores a 0x00 terminator afterward (that's not how FAT deletion
+ * works - see e.g. spi_flash_probe_root_dir()'s own comment on
+ * skipping 0xE5 silently). A volume previously touched by a PC/Mac
+ * (this project's own hardware log shows leftover UNTITL~1/TRASH-~1
+ * entries - classic macOS volume litter) can easily end up with every
+ * one of the first sector's 16 slots consumed at some point in its
+ * history, with several later deleted (0xE5) but the sector never
+ * getting a fresh 0x00 anywhere - "root directory full" was the
+ * genuinely correct answer for the STRICT 0x00/0xFF definition, but
+ * wrong in spirit, since 0xE5 slots ARE free for reuse, just without
+ * the strong "everything after this is also unused" guarantee 0x00
+ * carries. So: still prefer a real 0x00/0xFF (a bigger, safer
+ * contiguous free region, when one exists) via a first pass, but fall
+ * back to the FIRST 0xE5 slot seen if no 0x00/0xFF exists anywhere in
+ * the sector - reusing a hole needs no fresh terminator afterward
+ * (whatever already follows it, terminator or more real entries, is
+ * unaffected and still correct), hence *out_needs_terminator. */
+static int dir_find_end_marker_offset(uint32_t *out_offset, uint8_t *out_needs_terminator)
 {
     uint8_t sector[ROOT_DIR_SECTOR_BYTES];
     uint32_t i;
+    uint32_t deleted_offset = 0U;
+    uint8_t have_deleted = 0U;
 
     spi_flash_read(ROOT_DIR_LBA * ROOT_DIR_SECTOR_BYTES, sector, sizeof(sector));
     for (i = 0U; i < (sizeof(sector) / 32U); i++) {
-        if (sector[i * 32U] == 0x00U) {
+        if ((sector[i * 32U] == 0x00U) || (sector[i * 32U] == 0xFFU)) {
             *out_offset = i * 32U;
+            *out_needs_terminator = 1U;
             return 1;
         }
+        if ((sector[i * 32U] == 0xE5U) && !have_deleted) {
+            deleted_offset = i * 32U; /* remember the FIRST one - matches this
+                                        * driver's existing "earliest usable
+                                        * slot" preference elsewhere */
+            have_deleted = 1U;
+        }
+    }
+    if (have_deleted) {
+        *out_offset = deleted_offset;
+        *out_needs_terminator = 0U;
+        return 1;
     }
     return 0;
 }
@@ -782,6 +870,7 @@ int spi_flash_write_new_file(const spi_flash_fat_scan_t *scan,
                               const uint8_t *data, uint32_t len)
 {
     uint32_t dir_off;
+    uint8_t needs_terminator;
 
     if (!scan->found_free_block) {
         debug_print("spi_flash_write_new_file: no confirmed-free block in `scan` - aborting\n");
@@ -791,16 +880,19 @@ int spi_flash_write_new_file(const spi_flash_fat_scan_t *scan,
         debug_print("spi_flash_write_new_file: file too big for one confirmed-free block (4096 bytes max right now) - aborting\n");
         return 0;
     }
-    if (!dir_find_end_marker_offset(&dir_off)) {
-        debug_print("spi_flash_write_new_file: root directory's first sector has no end-of-directory marker (full?) - aborting\n");
+    if (!dir_find_end_marker_offset(&dir_off, &needs_terminator)) {
+        debug_print("spi_flash_write_new_file: root directory's first sector has no end-of-directory marker AND no reusable deleted (0xE5) slot either - genuinely full - aborting\n");
         return 0;
     }
-    if ((dir_off + 64U) > ROOT_DIR_SECTOR_BYTES) {
-        debug_print("spi_flash_write_new_file: not enough room in the root directory's first sector for a new entry + terminator - aborting\n");
+    /* A reused 0xE5 slot only needs room for the entry itself (32
+     * bytes) - the fresh terminator (needs_terminator) is what
+     * pushes this to 64. */
+    if ((dir_off + (needs_terminator ? 64U : 32U)) > ROOT_DIR_SECTOR_BYTES) {
+        debug_print("spi_flash_write_new_file: not enough room in the root directory's first sector for the new entry - aborting\n");
         return 0;
     }
 
-    if (!write_file_data_and_entry(dir_off, 1U, 1U, scan, name8, ext3, data, len)) {
+    if (!write_file_data_and_entry(dir_off, needs_terminator, 1U, scan, name8, ext3, data, len)) {
         return 0;
     }
     debug_print("spi_flash_write_new_file: done\n");
@@ -905,16 +997,20 @@ int spi_flash_write_or_update_file(const char name8[8], const char ext3[3],
         debug_print("spi_flash_write_or_update_file: no free block - aborting\n");
         return 0;
     }
-    if (!dir_find_end_marker_offset(&dir_off)) {
-        debug_print("spi_flash_write_or_update_file: root directory full - aborting\n");
+    {
+    uint8_t needs_terminator;
+
+    if (!dir_find_end_marker_offset(&dir_off, &needs_terminator)) {
+        debug_print("spi_flash_write_or_update_file: root directory full (no end-of-directory marker AND no reusable deleted (0xE5) slot) - aborting\n");
         return 0;
     }
-    if ((dir_off + 64U) > ROOT_DIR_SECTOR_BYTES) {
-        debug_print("spi_flash_write_or_update_file: not enough room for entry+terminator - aborting\n");
+    if ((dir_off + (needs_terminator ? 64U : 32U)) > ROOT_DIR_SECTOR_BYTES) {
+        debug_print("spi_flash_write_or_update_file: not enough room for the new entry - aborting\n");
         return 0;
     }
-    if (!write_file_data_and_entry(dir_off, 1U, 1U, &scan, name8, ext3, data, len)) {
+    if (!write_file_data_and_entry(dir_off, needs_terminator, 1U, &scan, name8, ext3, data, len)) {
         return 0;
+    }
     }
     debug_print("spi_flash_write_or_update_file: created new entry\n");
     return 1;

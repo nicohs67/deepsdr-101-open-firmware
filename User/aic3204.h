@@ -86,18 +86,30 @@ void aic3204_scan_bus(void);
  * already generating a real clock towards the codec
  * (gd32_i2s_init_slave_192k already executed) - phase 2 configures
  * clock registers that depend on BCLK/WCLK already running.
+ *
+ * `rate` parameterizes the cold-boot rate itself - added 01/09/2026
+ * so main() can boot directly into AIC3204_RATE_192K when the saved
+ * config's last mode was WFM, instead of always cold-booting at 96K
+ * and immediately following up with a second, WARM apply_demod_mode()
+ * switch into WFM. See main()'s boot sequence comment for the full
+ * "double reset" reasoning this closes - every OTHER caller/scenario
+ * (any non-WFM saved mode, or no saved mode at all) still passes
+ * AIC3204_RATE_96K here, unchanged from this function's old
+ * no-parameter behavior.
  */
-void aic3204_phase2_init(void);
-
 /*
  * Which sample rate the codec's ADC/DAC divider chains are currently
  * configured for - see aic3204_set_rate()'s comment in aic3204.c for
- * exactly which registers each value touches.
+ * exactly which registers each value touches. Declared here, ahead of
+ * aic3204_phase2_init() below, since that function's own signature
+ * now needs this type in scope.
  */
 typedef enum {
     AIC3204_RATE_96K = 0,  /* AM/USB/LSB/NFM - the default after aic3204_phase2_init() */
     AIC3204_RATE_192K      /* WFM */
 } aic3204_rate_t;
+
+void aic3204_phase2_init(aic3204_rate_t rate);
 
 /*
  * Live rate switch, split into SEVERAL calls - see main.c's

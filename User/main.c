@@ -1115,6 +1115,7 @@ static ui_button_t s_menu_tile_speaker_pa; /* speaker PA enable/mute (PB7) - HW 
 static ui_button_t s_menu_tile_sleep; /* screen SLEEP one-shot action - HW page, added 10/08/2026, see screen_sleep_enter()'s comment */
 static ui_button_t s_menu_tile_cal; /* touch CALibration one-shot action - HW page, see touch_calib.h/menu_tile_cal_callback() */
 static ui_button_t s_menu_tile_cal_ppm; /* MS5351 crystal PPM CALibration one-shot action - HW page, added 26/08/2026, see menu_tile_cal_ppm_callback() */
+static ui_button_t s_menu_tile_ifbw; /* WFM pre-discriminator channel filter width (96K/80K) - HW page slot 4, added 01/09/2026, see menu_tile_ifbw_callback() */
 /* s_speaker_pa_enabled: backs BOTH the tile's label (menu_tile_speaker_pa_refresh())
  * and the actual GPIO level (speaker_pa_set_enabled(), defined down
  * with the rest of the GPIO drivers near led_gpio_init() - declared
@@ -1148,6 +1149,7 @@ static char s_menu_tile_spec_style_buf[16];
 static char s_menu_tile_bw_buf[16];
 static char s_menu_tile_zoom_buf[16];
 static char s_menu_tile_att_buf[16];
+static char s_menu_tile_ifbw_buf[16];
 
 /* NR master on/off (Spectral Subtraction - see nr_ss.h), mirrored into
  * nr_ss_set_enabled() on every change - toggled by the bottom bar's NR
@@ -2451,6 +2453,11 @@ static const char *k_agc_profile_labels[4] = { "OFF", "SLW", "MED", "FST" };
 /* Indexed directly by audio_bw_t (demod_am.h) - AUDIO_BW_4K0,
  * AUDIO_BW_2K3, AUDIO_BW_1K8 in that order. */
 static const char *k_audio_bw_labels[3] = { "4K0", "2K3", "1K8" };
+/* Indexed the same way (AUDIO_BW_4K0/2K3/1K8), but a completely
+ * different set of filters, shown only while mode==WFM - see
+ * demod_am_set_audio_bw()'s comment in demod_am.h for why the same
+ * enum/tile now means two different things depending on mode. */
+static const char *k_wfm_audio_bw_labels[3] = { "15K", "8K0", "4K0" };
 
 /* Indexed directly by aic3204_rin_t (aic3204.h) - AIC3204_RIN_10K,
  * AIC3204_RIN_20K, AIC3204_RIN_40K in that order, same "index into a
@@ -2557,24 +2564,22 @@ static void badge_draw(uint16_t x, uint16_t y, const char *label,
 
 static void badges_draw(void)
 {
-    /* BW's label: NFM/WFM show their own ACTUAL channel-filter -3dB
-     * corner (see demod_am.c's NFM_CHF_COEFFS comment; WFM has no
-     * channel filter at all - see demod_am.h's WFM note - "96K" here
-     * means the full +/-96kHz complex Nyquist bandwidth it uses
-     * instead, not a -3dB corner, so it's not quite the same kind of
-     * number as the others, but it's the closest honest one-badge
-     * answer to "how wide is this mode listening"). AM/USB/LSB instead
-     * show the currently SELECTED audio filter width (see
-     * demod_am_set_audio_bw()'s comment in demod_am.h) - this is the
-     * one case where the badge is genuinely live/user-controlled, not
-     * just informative. */
+    /* BW's label: NFM shows its own ACTUAL, fixed channel-filter -3dB
+     * corner (see demod_am.c's NFM_CHF_COEFFS comment) - not
+     * adjustable, purely informative. WFM (01/09/2026: now genuinely
+     * adjustable, see demod_am_set_audio_bw()'s comment in demod_am.h)
+     * and AM/USB/LSB both show the currently SELECTED audio filter
+     * width, just from two different label sets for the same
+     * underlying s_audio_bw value - see demod_wfm_process_raw()'s own
+     * WFM_ALPF_WIDE/NORM/NARROW_COEFFS selection in demod_am.c. */
     demod_mode_t mode = demod_am_get_mode();
     const char *bw_label;
     uint8_t bw_interactive;
 
     switch (mode) {
     case DEMOD_MODE_NFM: bw_label = "6K3"; bw_interactive = 0U; break; /* NFM_CHF_COEFFS, ~6.25kHz */
-    case DEMOD_MODE_WFM: bw_label = "96K"; bw_interactive = 0U; break; /* no channel filter - full Nyquist */
+    case DEMOD_MODE_WFM: bw_label = k_wfm_audio_bw_labels[(uint8_t)demod_am_get_audio_bw()];
+                          bw_interactive = 1U; break;
     default:              bw_label = k_audio_bw_labels[(uint8_t)demod_am_get_audio_bw()];
                            bw_interactive = 1U; break;
     }
@@ -2680,10 +2685,13 @@ static void badges_draw(void)
  *   UI    (slots 0-5): BL (backlight), SCALE, SPT, SMH (smooth),
  *                       SPC (spectrum trace style, HEATMAP<->LINE),
  *                       ZOOM.
- *   HW    (slot 0):    SPK - speaker PA enable/mute (PB7, see
+ *   HW    (slots 0-1, 4): SPK - speaker PA enable/mute (PB7, see
  *                       speaker_pa_set_enabled()'s comment - pin/
- *                       polarity UNCONFIRMED as of 03/08/2026).
- *                       Slots 1-7 reserved for future hardware
+ *                       polarity UNCONFIRMED as of 03/08/2026). IFBW -
+ *                       WFM pre-discriminator channel filter width
+ *                       (96K/80K, slot 4, added 01/09/2026 - see
+ *                       menu_tile_ifbw_callback()'s comment).
+ *                       Slots 5-7 reserved for future hardware
  *                       settings.
  *   DIG   (slots 0-2), added 09/08/2026: digital-mode (currently just
  *                       RTTY) parameters that no longer fit on RADIO
@@ -3436,7 +3444,11 @@ static void audio_bw_cycle(void)
 
 static void menu_tile_bw_refresh(void)
 {
-    const char *v = k_audio_bw_labels[(uint8_t)demod_am_get_audio_bw()];
+    /* Mode-dependent label set, same reasoning as badges_draw()'s WFM
+     * case - see demod_am_set_audio_bw()'s comment in demod_am.h. */
+    const char *v = (demod_am_get_mode() == DEMOD_MODE_WFM) ?
+        k_wfm_audio_bw_labels[(uint8_t)demod_am_get_audio_bw()] :
+        k_audio_bw_labels[(uint8_t)demod_am_get_audio_bw()];
     uint8_t j = 3U;
     uint8_t i;
 
@@ -3512,10 +3524,12 @@ static void menu_tile_rtty_baud_callback(void *widget, ui_event_t event, void *u
 /* s_btn_audio_bw's callback - unlike menu_tile_bw_callback() above,
  * this one is MODE-GATED: it's a live, always-visible readout (see
  * badges_draw()'s comment), so cycling it while its own label is
- * showing NFM/WFM's unrelated fixed "6K3"/"96K" would silently change
- * AM/SSB's filter with zero visible feedback right now - confusing,
- * not "harmless". Tapping it outside AM/USB/LSB is simply a no-op
- * instead. */
+ * showing NFM's unrelated fixed "6K3" would silently change AM/SSB's
+ * filter with zero visible feedback right now - confusing, not
+ * "harmless". WFM (01/09/2026) is NOT gated out anymore - its badge
+ * genuinely reflects and controls WFM's own audio filter now, so
+ * tapping it there is exactly as meaningful as tapping it in AM/USB/
+ * LSB. Tapping it in NFM remains a no-op. */
 static void audio_bw_button_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
@@ -3523,10 +3537,11 @@ static void audio_bw_button_callback(void *widget, ui_event_t event, void *user_
     if (event == UI_EVENT_RELEASE) {
         demod_mode_t mode = demod_am_get_mode();
 
-        if (mode == DEMOD_MODE_AM || mode == DEMOD_MODE_USB || mode == DEMOD_MODE_LSB) {
+        if (mode == DEMOD_MODE_AM || mode == DEMOD_MODE_USB || mode == DEMOD_MODE_LSB
+            || mode == DEMOD_MODE_WFM) {
             audio_bw_cycle();
         } else {
-            debug_print("audio filter: BW badge tap ignored - not in AM/USB/LSB\n");
+            debug_print("audio filter: BW badge tap ignored - not in AM/USB/LSB/WFM\n");
         }
     }
 }
@@ -4098,6 +4113,57 @@ static void menu_tile_att_callback(void *widget, ui_event_t event, void *user_da
         rf_agc_mute_for_transition();
         debug_print_dec("att: manual Rin now (0=10k/1=20k/2=40k)", (uint32_t)s_rf_agc_rin_level);
         menu_tile_att_refresh();
+    }
+}
+
+/*
+ * IFBW (HW page, slot 4) - WFM's pre-discriminator channel filter
+ * width, WIDE(96K, default, no filter)<->NARROW(80K) - see
+ * demod_am_set_wfm_ifbw()'s comment in demod_am.h for what this
+ * actually controls (the RAW baseband ahead of the discriminator, NOT
+ * the demodulated audio - that's the BW tile/badge, a completely
+ * separate control - see its own comment for the distinction). Lives
+ * on HW rather than RADIO because RADIO is already full (8/8 - see
+ * the "Settings grid PAGES" comment) and this is WFM-only anyway, same
+ * "genuinely full elsewhere" reasoning DIG's own tiles already used
+ * when they were split off RADIO. Two-state cycle (not a 3-way like
+ * BW/ATT) - tap simply toggles, same shape as the RFAGC tile's
+ * enable/disable. Unlike RFAGC/ATT, this ISN'T RADIO-page-gated by
+ * mode (it's reachable and tappable even outside WFM, harmlessly - the
+ * state only ever gets APPLIED in demod_wfm_process_raw(), same
+ * "setting it elsewhere is a no-op until you're actually in WFM"
+ * precedent as s_audio_bw's own comment in demod_am.h), so there's no
+ * need to hide or grey it out on other pages/modes.
+ */
+static void menu_tile_ifbw_refresh(void)
+{
+    const char *v = (demod_am_get_wfm_ifbw() == WFM_IFBW_NARROW) ? "80K" : "96K";
+    uint8_t j = 5U;
+    uint8_t i;
+
+    s_menu_tile_ifbw_buf[0] = 'I'; s_menu_tile_ifbw_buf[1] = 'F';
+    s_menu_tile_ifbw_buf[2] = 'B'; s_menu_tile_ifbw_buf[3] = 'W';
+    s_menu_tile_ifbw_buf[4] = ' ';
+    for (i = 0; v[i] != '\0'; i++) {
+        s_menu_tile_ifbw_buf[j++] = v[i];
+    }
+    s_menu_tile_ifbw_buf[j] = '\0';
+
+    s_menu_tile_ifbw.label = s_menu_tile_ifbw_buf;
+    ui_button_draw(&s_menu_tile_ifbw);
+}
+
+static void menu_tile_ifbw_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+
+    if (event == UI_EVENT_RELEASE) {
+        wfm_ifbw_t bw = (demod_am_get_wfm_ifbw() == WFM_IFBW_WIDE) ? WFM_IFBW_NARROW : WFM_IFBW_WIDE;
+
+        demod_am_set_wfm_ifbw(bw);
+        debug_print(bw == WFM_IFBW_NARROW ? "wfm ifbw: now 80K (narrow)\n" : "wfm ifbw: now 96K (wide/off)\n");
+        menu_tile_ifbw_refresh();
     }
 }
 
@@ -5397,9 +5463,19 @@ static void menu_grid_show(void)
             2, 0, 1, menu_tile_cal_ppm_callback, NULL};
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_cal_ppm);
 
+        /* IFBW: WFM pre-discriminator channel filter width, added
+         * 01/09/2026 - see menu_tile_ifbw_callback()'s comment. Fills
+         * slot 4 - slots 5-7 still intentionally empty. */
+        s_menu_tile_ifbw = (ui_button_t){
+            MENU_OPT_COL(4), MENU_OPT_ROW(4), MENU_TILE_W, MENU_TILE_H,
+            "IFBW", GFX_COLOR_BLACK, GFX_COLOR_CYAN, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_ifbw_callback, NULL};
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_ifbw);
+
         ui_screen_draw(&s_menu_screen);
         menu_tile_speaker_pa_refresh();
         menu_tile_cal_ppm_refresh();
+        menu_tile_ifbw_refresh();
         break;
 
     case MENU_PAGE_DIG:

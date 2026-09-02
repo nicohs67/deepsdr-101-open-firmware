@@ -387,10 +387,22 @@ float demod_am_get_sam_carrier_hz(void);
  * NONE of these three is the same filter NFM uses (ALPF_COEFFS,
  * s_alpf_inst, still ~6kHz, completely untouched by this selector) -
  * deliberately kept separate so tightening AM/SSB's audio bandwidth
- * can never accidentally narrow NFM's too. Setting this while in NFM/
- * WFM is harmless (just has no audible effect until you switch to AM/
- * USB/LSB - the state itself is unconditional, only its APPLICATION in
+ * can never accidentally narrow NFM's too. Setting this while in NFM
+ * is harmless (no audible effect until you switch to AM/USB/LSB - the
+ * state itself is unconditional, only its APPLICATION in
  * demod_am_process_raw() is mode-gated).
+ *
+ * *** 01/09/2026: WFM is DIFFERENT from NFM here - this selector now
+ * DOES have an audible, immediate effect in WFM too *** - see
+ * demod_wfm_process_raw()'s own WFM_ALPF_WIDE/NORM/NARROW_COEFFS
+ * selection in demod_am.c. Same three enum values, same underlying
+ * s_audio_bw storage and BW tile, but a completely different set of
+ * three filters (15kHz/8kHz/4kHz, not 4.0kHz/2.3kHz/1.8kHz) - the
+ * value only means one specific filter once combined with the
+ * CURRENT mode, never on its own. main.c's badges_draw()/
+ * menu_tile_bw_refresh() swap the displayed label text between the
+ * two meanings depending on demod_am_get_mode(), so the screen never
+ * shows "BW 4K0" while WFM is actually narrowed to 4kHz or vice versa.
  *
  * Same "single aligned uint8_t-sized enum, no critical section"
  * reasoning as demod_am_set_mode()'s comment above - safe to call from
@@ -404,6 +416,34 @@ typedef enum {
 
 void demod_am_set_audio_bw(audio_bw_t bw);
 audio_bw_t demod_am_get_audio_bw(void);
+
+/*
+ * WFM pre-discriminator channel filter width - added 01/09/2026, per
+ * the project owner: a control over the RAW COMPLEX BASEBAND
+ * bandwidth reaching the FM discriminator, completely separate from
+ * audio_bw_t/WFM_ALPF_* above (which shape the DEMODULATED audio,
+ * after the discriminator has already run). See WFM_IFBW_NARROW_
+ * COEFFS' comment in demod_am.c for the full filter design/
+ * verification and why 80kHz specifically. WIDE (default) is a
+ * genuine no-op - the discriminator sees completely unfiltered I/Q,
+ * exactly as it always has - so nobody who never touches this control
+ * gets a different signal path than before this was added. NARROW
+ * trades a small amount of margin right at full +/-75kHz deviation
+ * (~0.4dB, ~22.5us group delay - both verified negligible) for real
+ * rejection of anything sitting further out in the +/-96kHz capture -
+ * useful on a crowded band, or a weak station near a strong neighbor.
+ *
+ * Same "plain uint8_t-sized enum, no critical section" reasoning as
+ * demod_am_set_mode()'s comment above - safe to call from the main
+ * loop while the ISR runs.
+ */
+typedef enum {
+    WFM_IFBW_WIDE = 0,
+    WFM_IFBW_NARROW
+} wfm_ifbw_t;
+
+void demod_am_set_wfm_ifbw(wfm_ifbw_t bw);
+wfm_ifbw_t demod_am_get_wfm_ifbw(void);
 
 /*
  * --- AGC profile (release speed / manual bypass) --------------------

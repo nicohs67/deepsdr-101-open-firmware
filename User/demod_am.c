@@ -152,10 +152,133 @@ static const float32_t ALPF_1K8_COEFFS[ALPF_1K8_STAGES * 5U] = {
  * WFM note for why 15kHz (not 53kHz+) is the right target: mono-only
  * reception, no stereo subcarrier decode.
  */
+/*
+ * WFM PRE-DISCRIMINATOR CHANNEL FILTER (IFBW), added 01/09/2026 - per
+ * the project owner: unlike the audio-domain WFM_ALPF_WIDE/NORM/
+ * NARROW_COEFFS above (which shape the DEMODULATED audio, after the
+ * discriminator), this filters the RAW COMPLEX BASEBAND I/Q, before
+ * fm_discriminate() ever sees it - see demod_wfm_process_raw()'s "0a.
+ * Deinterleave" step, right where this now gets applied. WFM's own
+ * note in demod_am.h explains why it otherwise runs the discriminator
+ * on completely unfiltered I/Q at the full +/-96kHz Nyquist width -
+ * that's still the WIDE/default option here, applied to neither
+ * channel (skipped entirely - a genuine no-op, not just a wide
+ * filter, so anyone who never touches this control gets byte-for-byte
+ * the same signal path as before). NARROW applies this SAME filter
+ * identically to I and Q (a "complex" lowpass, in the sense that it
+ * treats the analytic signal's real and imaginary parts alike, not
+ * that its coefficients are themselves complex) at a genuinely wide
+ * -3dB corner (80kHz) - nowhere near AM/SSB's CHF_COEFFS (~4kHz) or
+ * even NFM's NFM_CHF_COEFFS (~6.25kHz), which is exactly why those
+ * existing channel filters were never usable for WFM (see demod_am.h's
+ * WFM note) and this one is new rather than reusing either.
+ *
+ * PURPOSE: reject noise and any other signal sitting in the outer part
+ * of the +/-96kHz capture (adjacent-channel energy, wideband noise)
+ * before it reaches the discriminator, for stations that benefit from
+ * it (weak signals, or a crowded band) - broadcast FM channels are
+ * spaced 200kHz - here 400kHz - apart in Europe (100kHz - here 200kHz - in
+ * some other regions), so there's real out-of-channel energy sitting
+ * inside this receiver's own capture width whenever a neighboring
+ * station is also strong.
+ *
+ * WHY 80kHz AND NOT NARROWER: broadcast FM's own worst case is +/-75kHz
+ * peak deviation (Carson's rule territory) - 80kHz leaves only 5kHz of
+ * margin above that, verified numerically (scipy sosfreqz) to still be
+ * gentle enough right at the edge: only -0.41dB attenuation and ~22.5
+ * sample-us (4.3 samples) of group delay at 75kHz, rising to genuine
+ * rejection (-34.8dB) by 90kHz. A tighter corner would start visibly
+ * clipping/distorting genuine full-deviation peaks, not just rejecting
+ * noise - this project has no stereo pilot/subcarrier to protect here
+ * (that's WFM_ALPF_*'s job, downstream, on the demodulated audio, not
+ * this filter's), so 80kHz is chosen purely from the deviation
+ * envelope itself, not any subcarrier consideration.
+ *
+ * 4th-order Butterworth (scipy `signal.butter(4, 80000, fs=192000,
+ * output='sos')`), same CMSIS DF1 sign-flip conversion as
+ * WFM_ALPF_WIDE/NORM/NARROW_COEFFS' own comment above. Verified
+ * numerically, not on real hardware:
+ *   -3dB @ 79992Hz. 1kHz:0.00dB 60kHz:-0.00dB 75kHz:-0.41dB
+ *   80kHz:-3.01dB 90kHz:-34.77dB 96kHz:-239.86dB (i.e. essentially zero
+ *   energy makes it all the way out to the Nyquist edge).
+ *   Group delay: 0.35 samples @1kHz, 1.23 @60kHz, 4.32 @75kHz - smooth,
+ *   no peaking near the corner that would suggest ringing on fast
+ *   deviation swings.
+ *
+ * wfm_ifbw_t itself (WFM_IFBW_WIDE/NARROW) is declared in demod_am.h,
+ * alongside demod_am_set_wfm_ifbw()/demod_am_get_wfm_ifbw() - see its
+ * comment there for the control's own rationale; this comment is only
+ * about the filter's DSP design.
+ */
+#define WFM_IFBW_STAGES 2U
+static const float32_t WFM_IFBW_NARROW_COEFFS[WFM_IFBW_STAGES * 5U] = {
+    0.4998149976f, 0.9996299951f, 0.4998149976f, -1.1847620863f, -0.3680454189f,
+    1.0000000000f, 2.0000000000f, 1.0000000000f, -1.4538656576f, -0.6787794575f
+};
+
 #define WFM_ALPF_STAGES 2U
-static const float32_t WFM_ALPF_COEFFS[WFM_ALPF_STAGES * 5U] = {
+/*
+ * *** 01/09/2026: three selectable widths added, was one fixed 15kHz
+ * filter (WFM_ALPF_COEFFS) before *** - per the project owner: give
+ * WFM a real bandwidth control instead of a single hardcoded corner.
+ * Reuses the EXISTING audio_bw_t/s_audio_bw selector and BW tile that
+ * already drove AM/SSB's three-way audio filter (see
+ * demod_am_set_audio_bw()'s comment in demod_am.h) rather than adding
+ * a fourth menu tile - the enum's three values now mean "15kHz/8kHz/
+ * 4kHz" while in WFM instead of "4.0kHz/2.3kHz/1.8kHz" while in AM/
+ * SSB, same physical control, mode-dependent meaning (see
+ * badges_draw()'s WFM case and menu_tile_bw_refresh() in main.c for
+ * the label swap, and audio_bw_button_callback()'s comment for why
+ * that's now a live control in WFM too, not just AM/USB/LSB).
+ * WIDE(15kHz) is the untouched original filter, byte-for-byte
+ * identical coefficients to what shipped before this change - picking
+ * it is a no-op change in sound. NORM(8kHz) and NARROW(4kHz) trade
+ * fidelity for less hiss/multipath noise on weaker stations, same
+ * "AUDIO_BW_2K3/1K8 for weak/noisy signals" spirit as AM/SSB's own
+ * narrower options.
+ *
+ * All three are 4th-order Butterworth (scipy `signal.butter(4, fc,
+ * fs=192000, output='sos')`, converted to CMSIS DF1's [b0,b1,b2,a1,a2]
+ * form with a1/a2 SIGN-FLIPPED from scipy's convention - CMSIS DF1 is
+ * y[n]=b0 x[n]+b1 x[n-1]+b2 x[n-2] + a1 y[n-1] + a2 y[n-2], POSITIVE
+ * feedback, opposite of scipy's y[n]=... - a1 y[n-1] - a2 y[n-2]),
+ * same generation method as WFM_ALPF_WIDE_COEFFS itself (reproducing
+ * WIDE's own coefficients through this exact process was used as the
+ * sanity check that the method was right before designing NORM/
+ * NARROW - see the project's build notes/session log, not committed
+ * here). Actual -3dB points and reference attenuations, verified
+ * numerically (scipy sosfreqz), not measured on real hardware:
+ *
+ *   WIDE   (fc=15000Hz): -3dB @ 14988Hz. 1kHz:-0.00dB 8kHz:-0.03dB
+ *           15kHz:-3.01dB 19kHz:-9.20dB 23kHz:-15.96dB 38kHz:-36.52dB
+ *           (unchanged from the original WFM_ALPF_COEFFS - see
+ *           demod_am.h's WFM note for why these particular pilot/
+ *           subcarrier reference points matter: mono-only reception,
+ *           this filter's whole job besides voice/music fidelity is
+ *           knocking the 19kHz pilot and 38kHz L-R subcarrier down
+ *           hard enough that they never beat audibly against the
+ *           audio band).
+ *   NORM   (fc=8000Hz):  -3dB @ 7992Hz.  1kHz:-0.00dB 4kHz:-0.02dB
+ *           8kHz:-3.02dB 15kHz:-22.37dB 19kHz:-30.99dB 38kHz:-58.87dB
+ *   NARROW (fc=4000Hz):  -3dB @ 3996Hz.  1kHz:-0.00dB 2.5kHz:-0.10dB
+ *           4kHz:-2.99dB 8kHz:-24.27dB 15kHz:-46.58dB 19kHz:-55.22dB
+ *
+ * NORM and NARROW knock the pilot/subcarrier down even harder than
+ * WIDE already does (steeper rolloff further below them), so neither
+ * needed its own separate check against those two reference points -
+ * WIDE was already the tightest-margin case by design.
+ */
+static const float32_t WFM_ALPF_WIDE_COEFFS[WFM_ALPF_STAGES * 5U] = {
     0.0020570668f, 0.0041141336f, 0.0020570668f,  1.2287186181f, -0.3932293820f,
     1.0000000000f, 2.0000000000f, 1.0000000000f,  1.4942806865f, -0.6943470431f
+};
+static const float32_t WFM_ALPF_NORM_COEFFS[WFM_ALPF_STAGES * 5U] = {
+    0.0002131387f, 0.0004262775f, 0.0002131387f,  1.5590543011f, -0.6140517819f,
+    1.0000000000f, 2.0000000000f, 1.0000000000f,  1.7577536095f, -0.8197604429f
+};
+static const float32_t WFM_ALPF_NARROW_COEFFS[WFM_ALPF_STAGES * 5U] = {
+    0.0000155517f, 0.0000311034f, 0.0000155517f,  1.7695043485f, -0.7847733318f,
+    1.0000000000f, 2.0000000000f, 1.0000000000f,  1.8885559539f, -0.9048522288f
 };
 
 /*
@@ -624,8 +747,16 @@ static float32_t s_alpf_1k8_state[ALPF_1K8_STAGES * 4U];
 
 /* WFM audio LPF instance/state - separate from s_alpf_inst above
  * (NFM), see WFM_ALPF_COEFFS' comment for why. */
-static arm_biquad_casd_df1_inst_f32 s_wfm_alpf_inst;
-static float32_t s_wfm_alpf_state[WFM_ALPF_STAGES * 4U];
+static arm_biquad_casd_df1_inst_f32 s_wfm_ifbw_i_inst;
+static arm_biquad_casd_df1_inst_f32 s_wfm_ifbw_q_inst;
+static arm_biquad_casd_df1_inst_f32 s_wfm_alpf_wide_inst;
+static arm_biquad_casd_df1_inst_f32 s_wfm_alpf_norm_inst;
+static arm_biquad_casd_df1_inst_f32 s_wfm_alpf_narrow_inst;
+static float32_t s_wfm_ifbw_i_state[WFM_IFBW_STAGES * 4U];
+static float32_t s_wfm_ifbw_q_state[WFM_IFBW_STAGES * 4U];
+static float32_t s_wfm_alpf_wide_state[WFM_ALPF_STAGES * 4U];
+static float32_t s_wfm_alpf_norm_state[WFM_ALPF_STAGES * 4U];
+static float32_t s_wfm_alpf_narrow_state[WFM_ALPF_STAGES * 4U];
 
 /* NFM channel filter instance/state - separate from s_chf_i/q_inst
  * above (AM/SSB) - see NFM_CHF_COEFFS' comment for why NFM can't just
@@ -994,6 +1125,28 @@ audio_bw_t demod_am_get_audio_bw(void)
     return s_audio_bw;
 }
 
+/* WFM pre-discriminator channel filter selector - see WFM_IFBW_NARROW_
+ * COEFFS' comment above for what this actually does (filters the raw
+ * I/Q ahead of fm_discriminate(), NOT the demodulated audio - that's
+ * s_audio_bw/WFM_ALPF_*, a completely separate control). Same "plain
+ * uint8_t-sized enum, no critical section" reasoning as s_mode/
+ * s_audio_bw. Default WFM_IFBW_WIDE (no filter) - matches this
+ * project's usual "the new control's default is the old, already-
+ * validated behavior" rule (see agc_profile_cycle()'s MANUAL note,
+ * the ATT tile's comment, etc.) - nobody who never touches this tile
+ * gets a different signal path than before 01/09/2026. */
+static wfm_ifbw_t s_wfm_ifbw = WFM_IFBW_WIDE;
+
+void demod_am_set_wfm_ifbw(wfm_ifbw_t bw)
+{
+    s_wfm_ifbw = bw;
+}
+
+wfm_ifbw_t demod_am_get_wfm_ifbw(void)
+{
+    return s_wfm_ifbw;
+}
+
 /*
  * s_agc_profile/s_agc_release: same "plain aligned variable, no
  * critical section" reasoning as s_mode above - main.c writes,
@@ -1246,7 +1399,11 @@ void demod_am_init(void)
     arm_biquad_cascade_df1_init_f32(&s_alpf_4k0_inst, ALPF_4K0_STAGES, ALPF_4K0_COEFFS, s_alpf_4k0_state);
     arm_biquad_cascade_df1_init_f32(&s_alpf_2k3_inst, ALPF_2K3_STAGES, ALPF_2K3_COEFFS, s_alpf_2k3_state);
     arm_biquad_cascade_df1_init_f32(&s_alpf_1k8_inst, ALPF_1K8_STAGES, ALPF_1K8_COEFFS, s_alpf_1k8_state);
-    arm_biquad_cascade_df1_init_f32(&s_wfm_alpf_inst, WFM_ALPF_STAGES, WFM_ALPF_COEFFS, s_wfm_alpf_state);
+    arm_biquad_cascade_df1_init_f32(&s_wfm_ifbw_i_inst, WFM_IFBW_STAGES, WFM_IFBW_NARROW_COEFFS, s_wfm_ifbw_i_state);
+    arm_biquad_cascade_df1_init_f32(&s_wfm_ifbw_q_inst, WFM_IFBW_STAGES, WFM_IFBW_NARROW_COEFFS, s_wfm_ifbw_q_state);
+    arm_biquad_cascade_df1_init_f32(&s_wfm_alpf_wide_inst, WFM_ALPF_STAGES, WFM_ALPF_WIDE_COEFFS, s_wfm_alpf_wide_state);
+    arm_biquad_cascade_df1_init_f32(&s_wfm_alpf_norm_inst, WFM_ALPF_STAGES, WFM_ALPF_NORM_COEFFS, s_wfm_alpf_norm_state);
+    arm_biquad_cascade_df1_init_f32(&s_wfm_alpf_narrow_inst, WFM_ALPF_STAGES, WFM_ALPF_NARROW_COEFFS, s_wfm_alpf_narrow_state);
     arm_biquad_cascade_df1_init_f32(&s_nfm_chf_i_inst, NFM_CHF_STAGES, NFM_CHF_COEFFS, s_nfm_chf_i_state);
     arm_biquad_cascade_df1_init_f32(&s_nfm_chf_q_inst, NFM_CHF_STAGES, NFM_CHF_COEFFS, s_nfm_chf_q_state);
 
@@ -1461,10 +1618,20 @@ void demod_wfm_process_raw(const int16_t *raw_interleaved)
         s_wfm_q_buf[n] = (float32_t)raw_interleaved[2U * n + 1U];
     }
 
+    /* 0b. Pre-discriminator channel filter (IFBW), NARROW only - see
+     * WFM_IFBW_NARROW_COEFFS' comment. WIDE (default) skips this
+     * entirely: zero extra ISR cycles, byte-for-byte the same signal
+     * path as before this control existed. */
+    if (s_wfm_ifbw == WFM_IFBW_NARROW) {
+        arm_biquad_cascade_df1_f32(&s_wfm_ifbw_i_inst, s_wfm_i_buf, s_wfm_i_buf, SDR_RX_BLOCK_SAMPLES_WFM);
+        arm_biquad_cascade_df1_f32(&s_wfm_ifbw_q_inst, s_wfm_q_buf, s_wfm_q_buf, SDR_RX_BLOCK_SAMPLES_WFM);
+    }
+
     /* 1. Discriminate - delay-and-conjugate-multiply, straight on the
-     * RAW (unfiltered, un-down-mixed) I/Q, at the full 192kHz rate -
-     * see demod_am.h's WFM note for the full derivation and why
-     * atan2f() rather than arm_atan2_f32() here. */
+     * RAW (unfiltered unless IFBW NARROW just applied above, un-down-
+     * mixed) I/Q, at the full 192kHz rate - see demod_am.h's WFM note
+     * for the full derivation and why atan2f() rather than
+     * arm_atan2_f32() here. */
     fm_discriminate(s_wfm_i_buf, s_wfm_q_buf, s_wfm_env, WFM_DISC_GAIN, SDR_RX_BLOCK_SAMPLES_WFM);
 
     if (do_log) {
@@ -1512,9 +1679,22 @@ void demod_wfm_process_raw(const int16_t *raw_interleaved)
         s_wfm_deemph_y1 = y1;
     }
 
-    /* 3b. WFM audio LPF, 4th-order Butterworth ~15kHz (see
-     * WFM_ALPF_COEFFS' comment) - in-place CMSIS call. */
-    arm_biquad_cascade_df1_f32(&s_wfm_alpf_inst, s_wfm_env, s_wfm_env, SDR_RX_BLOCK_SAMPLES_WFM);
+    /* 3b. WFM audio LPF, 4th-order Butterworth, width per s_audio_bw -
+     * see WFM_ALPF_WIDE/NORM/NARROW_COEFFS' comment (01/09/2026: now
+     * selectable, was unconditionally WIDE/15kHz before). Same
+     * selector-pointer shape as AM/SSB's own BW switch in
+     * demod_am_process_raw() just above. */
+    {
+        arm_biquad_casd_df1_inst_f32 *wfm_alpf;
+
+        switch (s_audio_bw) {
+        case AUDIO_BW_2K3: wfm_alpf = &s_wfm_alpf_norm_inst;   break; /* "NORM", 8kHz */
+        case AUDIO_BW_1K8: wfm_alpf = &s_wfm_alpf_narrow_inst; break; /* "NARROW", 4kHz */
+        case AUDIO_BW_4K0:
+        default:            wfm_alpf = &s_wfm_alpf_wide_inst;   break; /* "WIDE", 15kHz - original/default */
+        }
+        arm_biquad_cascade_df1_f32(wfm_alpf, s_wfm_env, s_wfm_env, SDR_RX_BLOCK_SAMPLES_WFM);
+    }
 
     if (do_log) {
         float mn = s_wfm_env[0], mx = s_wfm_env[0];

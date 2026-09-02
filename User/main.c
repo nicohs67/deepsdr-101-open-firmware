@@ -1019,10 +1019,11 @@ static uint8_t s_menu_freq_active = 0U;
 /*
  * s_freq_entry_value/s_freq_entry_digits: the digits typed so far on
  * the keypad, plain integer accumulation (value = value*10 + digit),
- * no decimal point - see menu_freq_keypad_show()'s comment for why:
- * the kHz/MHz accept buttons already cover fractional MHz entry (type
- * "146520" + kHz = 146.520MHz) without needing float parsing on a
- * bare-metal target. Capped at FREQ_ENTRY_MAX_DIGITS so the value
+ * position of the decimal point tracked SEPARATELY (s_freq_entry_point_pos
+ * below) rather than as a float - see menu_freq_keypad_show()'s
+ * comment for why: no float parsing needed on a bare-metal target,
+ * matching the kHz/MHz accept buttons' own existing uint64_t-then-
+ * divide approach. Capped at FREQ_ENTRY_MAX_DIGITS so the value
  * itself never risks overflowing uint32_t (999,999,999 fits easily);
  * the SEPARATE overflow risk - value*1000000 for the MHz button -
  * is handled in the accept callback via a uint64_t intermediate, not
@@ -1033,6 +1034,27 @@ static uint8_t s_menu_freq_active = 0U;
 #define FREQ_ENTRY_MAX_DIGITS 9U
 static uint32_t s_freq_entry_value = 0U;
 static uint8_t  s_freq_entry_digits = 0U;
+/*
+ * s_freq_entry_point_pos: how many digits had been typed BEFORE the
+ * decimal point was pressed - FREQ_ENTRY_NO_POINT (0xFF) if no point
+ * has been entered yet. Deliberately a digit COUNT, not a flag plus a
+ * separately-tracked fractional value: this survives the DEL key
+ * cleanly (deleting back past the point just needs comparing this
+ * count against the current s_freq_entry_digits, see
+ * menu_freq_keypad_del_callback()) and survives leading zeros
+ * correctly (typing "0" "." "6" "2" "1" for 0.621 records point_pos=1
+ * regardless of the fact that a leading zero contributes nothing
+ * numerically to s_freq_entry_value - the fractional digit COUNT at
+ * accept time is (s_freq_entry_digits - s_freq_entry_point_pos)
+ * either way). Added 01/09/2026, replacing the plain HZ accept button
+ * - see menu_freq_keypad_show()'s comment for why: typing a
+ * frequency out to bare-Hz precision digit-by-digit had no practical
+ * use once kHz/MHz entry existed, so that keypad slot became a
+ * decimal point instead, letting a frequency be typed exactly the way
+ * it's normally written (e.g. "14.200" + MHZ, or "0.621" + MHZ)
+ * rather than only as a bare integer count of the chosen unit. */
+#define FREQ_ENTRY_NO_POINT 0xFFU
+static uint8_t  s_freq_entry_point_pos = FREQ_ENTRY_NO_POINT;
 /*
  * --- Settings grid PAGES (RADIO / UI / HW) -------------------------------
  *
@@ -4635,32 +4657,70 @@ static void menu_mode_list_show(void)
  */
 static void freq_keypad_readout_draw(void)
 {
-    /* FREQ_ENTRY_MAX_DIGITS(9) + NUL - same fixed-width-field
-     * reasoning as tune_freq_format()'s comment: always clear/redraw
-     * the WHOLE field so a shorter new value can't leave a ghost
-     * digit from a longer old one (e.g. CLR after typing 5 digits). */
-    char buf[FREQ_ENTRY_MAX_DIGITS + 1U];
+    /* FREQ_ENTRY_MAX_DIGITS(9) digits + 1 decimal point + NUL - same
+     * fixed-width-field reasoning as tune_freq_format()'s comment:
+     * always clear/redraw the WHOLE field so a shorter new value
+     * can't leave a ghost digit from a longer old one (e.g. CLR after
+     * typing 5 digits). */
+    char buf[FREQ_ENTRY_MAX_DIGITS + 1U + 1U];
     uint8_t i;
+    uint8_t n;
+    uint32_t v;
 
     gfx_fill_rect(MENU_AREA_X, (uint16_t)(MENU_AREA_Y + 8),
                   MENU_AREA_W, FREQ_KEYPAD_READOUT_H, GFX_COLOR_BLACK);
 
-    if (s_freq_entry_digits == 0U) {
+    if (s_freq_entry_digits == 0U && s_freq_entry_point_pos == FREQ_ENTRY_NO_POINT) {
         /* Nothing typed yet - a lone placeholder rather than "0", so
          * it doesn't look like a real (zero) frequency was entered. */
         gfx_text((uint16_t)(MENU_AREA_X + 16), (uint16_t)(MENU_AREA_Y + 16),
-                 "HZ----", GFX_COLOR_GRAY, GFX_COLOR_BLACK, 4);
+                 "------", GFX_COLOR_GRAY, GFX_COLOR_BLACK, 4);
         return;
     }
 
-    {
-        uint32_t v = s_freq_entry_value;
-        i = FREQ_ENTRY_MAX_DIGITS;
-        buf[i] = '\0';
-        do {
-            buf[--i] = (char)('0' + (v % 10U));
-            v /= 10U;
-        } while (v > 0U && i > 0U);
+    /* Print exactly s_freq_entry_digits characters (leading zeros
+     * preserved, not collapsed away) rather than "however many
+     * nonzero digits v has" - the decimal-point insertion below
+     * relies on the printed digit COUNT matching s_freq_entry_digits
+     * exactly, and this also just displays what was actually typed
+     * (e.g. "0" "6" "2" "1" now shows as 0621, not a silently-shorter
+     * 621). */
+    i = (uint8_t)sizeof(buf) - 1U;
+    buf[i] = '\0';
+    v = s_freq_entry_value;
+    n = s_freq_entry_digits;
+    while (n > 0U) {
+        buf[--i] = (char)('0' + (v % 10U));
+        v /= 10U;
+        n--;
+    }
+    if (s_freq_entry_point_pos != FREQ_ENTRY_NO_POINT) {
+        /* Insert '.' after the first s_freq_entry_point_pos of the
+         * digits just written. digit_start..digit_start+digits-1 is
+         * the digit string as filled above; open one new slot in
+         * FRONT of it (new_start = digit_start-1, always valid since
+         * buf is sized for exactly MAX_DIGITS+point+NUL, so there's
+         * always at least one spare slot), copy the first point_pos
+         * digits down into that widened range, then drop the point
+         * into the gap that copy leaves behind at new_start+point_pos
+         * - the digits AFTER the point were never touched and are
+         * already sitting exactly where they need to be, one to the
+         * right of where they started. (A previous version of this
+         * shifted from the OLD digit_start using the OLD point_at as
+         * the loop bound, which is off by the very slot being
+         * inserted - it silently copied the string's own NUL
+         * terminator forward over the point character, which is why
+         * the point never actually showed up until another digit was
+         * typed - confirmed and fixed 01/09/2026.) */
+        uint8_t digit_start = i;
+        uint8_t new_start = (uint8_t)(digit_start - 1U);
+        uint8_t k;
+
+        for (k = 0U; k < s_freq_entry_point_pos; k++) {
+            buf[new_start + k] = buf[digit_start + k];
+        }
+        buf[new_start + s_freq_entry_point_pos] = '.';
+        i = new_start;
     }
     gfx_text((uint16_t)(MENU_AREA_X + 16), (uint16_t)(MENU_AREA_Y + 16),
              &buf[i], GFX_COLOR_CYAN, GFX_COLOR_BLACK, 5);
@@ -4678,14 +4738,43 @@ static void menu_freq_keypad_digit_callback(void *widget, ui_event_t event, void
     }
 }
 
+/* Decimal point - see s_freq_entry_point_pos's declaration comment.
+ * Ignored if a point is already placed (only one per entry makes
+ * sense) - matches the digit callback's own "ignore once the cap is
+ * hit" guard shape. */
+static void menu_freq_keypad_point_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+    if (event == UI_EVENT_RELEASE && s_freq_entry_point_pos == FREQ_ENTRY_NO_POINT) {
+        s_freq_entry_point_pos = s_freq_entry_digits;
+        freq_keypad_readout_draw();
+    }
+}
+
 static void menu_freq_keypad_del_callback(void *widget, ui_event_t event, void *user_data)
 {
     (void)widget;
     (void)user_data;
-    if (event == UI_EVENT_RELEASE && s_freq_entry_digits > 0U) {
-        s_freq_entry_value /= 10U;
-        s_freq_entry_digits--;
-        freq_keypad_readout_draw();
+    if (event == UI_EVENT_RELEASE) {
+        if (s_freq_entry_digits > 0U) {
+            s_freq_entry_value /= 10U;
+            s_freq_entry_digits--;
+            /* Deleted back past the point itself (or exactly onto
+             * it) - the point goes too, same as backspacing over a
+             * "." in any normal numeric entry field. */
+            if (s_freq_entry_point_pos != FREQ_ENTRY_NO_POINT
+                && s_freq_entry_point_pos > s_freq_entry_digits) {
+                s_freq_entry_point_pos = FREQ_ENTRY_NO_POINT;
+            }
+            freq_keypad_readout_draw();
+        } else if (s_freq_entry_point_pos != FREQ_ENTRY_NO_POINT) {
+            /* No digits left, but a lone point is still showing
+             * (e.g. user pressed "." then DEL with nothing typed
+             * either side) - one more DEL clears it. */
+            s_freq_entry_point_pos = FREQ_ENTRY_NO_POINT;
+            freq_keypad_readout_draw();
+        }
     }
 }
 
@@ -4696,29 +4785,56 @@ static void menu_freq_keypad_clr_callback(void *widget, ui_event_t event, void *
     if (event == UI_EVENT_RELEASE) {
         s_freq_entry_value = 0U;
         s_freq_entry_digits = 0U;
+        s_freq_entry_point_pos = FREQ_ENTRY_NO_POINT;
         freq_keypad_readout_draw();
     }
 }
 
 /*
- * Shared by the Hz/kHz/MHz buttons - user_data is the multiplier
- * (1/1000/1000000), passed the same (void*)(uintptr_t) way the
+ * Shared by the kHz/MHz buttons - user_data is the multiplier
+ * (1000/1000000), passed the same (void*)(uintptr_t) way the
  * digit callback's digit is. Ignored entirely if nothing was typed
- * (s_freq_entry_digits==0) - no accidental retune to TUNE_MIN_HZ from
- * an empty "0 Hz" entry. The multiply happens in a uint64_t
- * intermediate on purpose: s_freq_entry_value is capped at 9 digits
- * (max 999,999,999) precisely so it can never overflow uint32_t on
- * its own, but 999,999,999 * 1,000,000 overflows uint32_t many times
- * over - the same int64_t-then-clamp pattern tune_encoder_poll() and
- * spec_drag_tune_apply() already use for exactly this reason.
+ * (s_freq_entry_digits==0 and no lone point either) - no accidental
+ * retune to TUNE_MIN_HZ from an empty entry. The multiply happens in
+ * a uint64_t intermediate on purpose: s_freq_entry_value is capped at
+ * 9 digits (max 999,999,999) precisely so it can never overflow
+ * uint32_t on its own, but 999,999,999 * 1,000,000 overflows uint32_t
+ * many times over - the same int64_t-then-clamp pattern
+ * tune_encoder_poll() and spec_drag_tune_apply() already use for
+ * exactly this reason.
+ *
+ * *** 01/09/2026, decimal-point support added, plain HZ button
+ * removed *** - per the project owner: entering a frequency out to
+ * bare-Hz precision digit-by-digit (the old HZ button, multiplier=1)
+ * had no practical use once kHz/MHz entry already existed, and typing
+ * a frequency exactly the way it's normally written (e.g. "14.200" +
+ * MHZ, or "0.621" + MHZ) is far more natural than only being able to
+ * type a bare integer count of the chosen unit (the old "146520" +
+ * KHZ for 146.520MHz still works exactly as before - the point is
+ * purely additive). If a point was entered, divide back out by
+ * 10^(fractional digit count) AFTER the multiply, same uint64_t
+ * intermediate as the multiply itself so a full 9-digit entry times
+ * 10^6 still can't overflow before the divide brings it back down.
  */
 static void menu_freq_keypad_accept_callback(void *widget, ui_event_t event, void *user_data)
 {
     uint32_t multiplier = (uint32_t)(uintptr_t)user_data;
 
     (void)widget;
-    if (event == UI_EVENT_RELEASE && s_freq_entry_digits > 0U) {
+    if (event == UI_EVENT_RELEASE
+        && (s_freq_entry_digits > 0U || s_freq_entry_point_pos != FREQ_ENTRY_NO_POINT)) {
         uint64_t hz64 = (uint64_t)s_freq_entry_value * (uint64_t)multiplier;
+
+        if (s_freq_entry_point_pos != FREQ_ENTRY_NO_POINT) {
+            uint8_t frac_digits = (uint8_t)(s_freq_entry_digits - s_freq_entry_point_pos);
+            uint32_t divisor = 1U;
+            uint8_t i;
+
+            for (i = 0U; i < frac_digits; i++) {
+                divisor *= 10U;
+            }
+            hz64 /= (uint64_t)divisor;
+        }
 
         if (hz64 < (uint64_t)TUNE_MIN_HZ) {
             hz64 = (uint64_t)TUNE_MIN_HZ;
@@ -4757,8 +4873,11 @@ static void menu_freq_keypad_show(void)
         {0, 2, "7",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 7},
         {1, 2, "8",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 8},
         {2, 2, "9",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback, 9},
-        /* row3: HZ 0 KHZ MHZ */
-        {0, 3, "HZ", GFX_COLOR_BLACK, GFX_COLOR_CYAN,     menu_freq_keypad_accept_callback, 1UL},
+        /* row3: . 0 KHZ MHZ - was HZ/0/KHZ/MHZ until 01/09/2026, see
+         * menu_freq_keypad_accept_callback()'s comment for why the
+         * HZ (multiplier=1) accept button became a decimal point
+         * instead. */
+        {0, 3, ".",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_point_callback,  0},
         {1, 3, "0",  GFX_COLOR_WHITE, GFX_COLOR_DARKGRAY, menu_freq_keypad_digit_callback,  0},
         {2, 3, "KHZ",GFX_COLOR_BLACK, GFX_COLOR_CYAN,     menu_freq_keypad_accept_callback, 1000UL},
         {3, 3, "MHZ",GFX_COLOR_BLACK, GFX_COLOR_CYAN,     menu_freq_keypad_accept_callback, 1000000UL},
@@ -4771,6 +4890,7 @@ static void menu_freq_keypad_show(void)
 
     s_freq_entry_value = 0U;
     s_freq_entry_digits = 0U;
+    s_freq_entry_point_pos = FREQ_ENTRY_NO_POINT;
     freq_keypad_readout_draw();
 
     for (i = 0; i < 15U; i++) {

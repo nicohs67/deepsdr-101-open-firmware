@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Construye una imagen FAT12 en crudo con la MISMA geometria que
-spi_flash.c tiene "quemada" en sus constantes - en vez de confiar en
-que mkfs.vfat adivine la misma geometria no estandar (root dir de 512
-entradas/32 sectores, 4 sectores reservados, FAT de 6 sectores) que
-uso originalmente para formatear esta tarjeta de fabrica.
+Builds a raw FAT12 image with the EXACT same geometry that
+spi_flash.c has "hardcoded" in its constants - instead of relying on
+mkfs.vfat guessing the same non-standard geometry (root dir of 512
+entries/32 sectors, 4 reserved sectors, FAT of 6 sectors) that
+was originally used to format this card from the factory.
 
-Geometria (de spi_flash.c, 21/08/2026):
+Geometry (from spi_flash.c, 08/21/2026):
   bytes_per_sector   = 512
   sectors_per_cluster= 1
   reserved_sectors   = 4   (FAT1_LBA=4)
@@ -16,11 +16,11 @@ Geometria (de spi_flash.c, 21/08/2026):
   root_dir_entries   = 512 (32*512/32)
   total_sectors      = 2048 (48 + DATA_CLUSTER_COUNT=2000)
 
-Uso:
-  python3 build_fat12_image.py salida.img
-  sudo dd if=salida.img of=/dev/sdX bs=512 conv=fsync status=progress
+Usage:
+  python3 build_fat12_image.py output.img
+  sudo dd if=output.img of=/dev/sdX bs=512 conv=fsync status=progress
 
-*** CONFIRMA EL DISPOSITIVO CON lsblk ANTES DE USAR dd A UN /dev/sdX REAL ***
+*** CONFIRM THE DEVICE WITH lsblk BEFORE RUNNING dd TO A REAL /dev/sdX ***
 """
 import sys
 import struct
@@ -70,7 +70,7 @@ def build_fat_sectors():
 
 def main():
     if len(sys.argv) != 2:
-        print(f"uso: {sys.argv[0]} salida.img")
+        print(f"use: {sys.argv[0]} output.img")
         sys.exit(1)
 
     out_path = sys.argv[1]
@@ -99,12 +99,13 @@ def main():
     with open(out_path, 'wb') as f:
         f.write(image)
 
-    print(f"escrito {out_path}: {len(image)} bytes ({len(image)/1024:.0f} KiB, {TOTAL_SECTORS} sectores)")
+    print(f"written {out_path}: {len(image)} bytes ({len(image)/1024:.0f} KiB, {TOTAL_SECTORS} sectors)")
     print(f"  boot sector: sector 0")
-    print(f"  FAT1: sector {RESERVED}, {FAT_SECTORS} sectores")
-    print(f"  FAT2: sector {RESERVED + FAT_SECTORS}, {FAT_SECTORS} sectores")
-    print(f"  directorio raiz: sector {root_dir_start_sector}, {ROOT_DIR_SECTORS} sectores (512 entradas)")
-    print(f"  datos: sector {data_start_sector} en adelante, {TOTAL_SECTORS - data_start_sector} sectores")
+    print(f"  FAT1: sector {RESERVED}, {FAT_SECTORS} sectors")
+    print(f"  FAT2: sector {RESERVED + FAT_SECTORS}, {FAT_SECTORS} sectors")
+    print(f"  root directory: sector {root_dir_start_sector}, {ROOT_DIR_SECTORS} sectors (512 entries)")
+    print(f"  data: sector {data_start_sector} onwards, {TOTAL_SECTORS - data_start_sector} sectors")
+
 
 if __name__ == '__main__':
     main()

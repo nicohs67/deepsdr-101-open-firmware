@@ -13,6 +13,7 @@
 #include "rtty.h"
 #include "rtty_scope.h"
 #include "ms5351.h"
+#include "lo_gen_gd32.h"
 #include "rf_lpf.h"
 #include "encoder.h"
 #include "battery.h"
@@ -45,6 +46,7 @@ static void badges_draw(void);
 static void smeter_draw(uint8_t segs);
 static uint8_t smeter_segments_from_peak(float peak);
 static void snr_update_and_draw(const float *db_frame);
+static void spec_agc_apply(const float *db_frame);
 static void tune_encoder_poll(void);
 static void menu_screen_open(void);
 static void menu_screen_close(void);
@@ -417,19 +419,58 @@ int main(void)
     /* PA6/PA7 explicit Hi-Z (21/08/2026) - CLK0/CLK1 from the MS5351
      * route through these pins via 100-ohm series resistors (found by
      * inspection of the real board, not from any schematic on file).
-     * Never configured anywhere in this codebase before now - left at
-     * the GD32F4's power-on-reset default (floating input), which
-     * SHOULD already be high-impedance, but doing it explicitly here
-     * removes any doubt (no other init code accidentally claims these
-     * pins for something else later, and it documents the intent).
-     * Run before ms5351_init() so the LO never sees anything other
-     * than Hi-Z on these lines from the moment it starts up. */
+     * Was never configured anywhere in this codebase before that date
+     * - left at the GD32F4's power-on-reset default (floating input),
+     * which SHOULD already be high-impedance, but doing it explicitly
+     * here removes any doubt (no other init code accidentally claims
+     * these pins for something else later, and it documents the
+     * intent). Run before ms5351_init() so the LO never sees anything
+     * other than Hi-Z on these lines from the moment it starts up.
+     *
+     * *** 01/09/2026: these same two pins are now ALSO the GD32-
+     * generated quadrature LO for the lowest tuning range - see
+     * lo_gen_gd32.h's big comment for why. This boot-time Hi-Z is
+     * still the correct starting state either way (whichever source
+     * ends up driving the net gets decided per-tune, the first time
+     * apply_lo_tune() runs, by s_lo_source_is_gd32's sentinel) - only
+     * now there's a second piece of code (lo_gen_gd32_set_freq()/
+     * lo_gen_gd32_stop()) that also reconfigures these same two pins
+     * later, switching them between this Hi-Z input mode and TIMER2
+     * AF2 output mode as tuning crosses LO_GEN_CROSSOVER_HZ. */
     rcu_periph_clock_enable(RCU_GPIOA);
     gpio_mode_set(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO_PIN_6 | GPIO_PIN_7);
 
     ms5351_init();
+    lo_gen_gd32_init(); /* GPIOA/TIMER2 clock enable only - PA6/PA7 stay
+                          * in the Hi-Z input mode just set above until
+                          * the first low-band tune actually needs them -
+                          * see lo_gen_gd32.h's comment. */
 
-    debug_print("\n--- MCLK: TIMER2_CH0/PC6, 1.536MHz ---\n");
+    /*
+     * *** 01/09/2026, full history: disabled, reverted, then properly
+     * resolved same day *** - MCLK was briefly disabled entirely as a
+     * real-hardware experiment (per the project owner) to free TIMER2
+     * for lo_gen_gd32.c's PA6/PA7 quadrature generator, on the theory
+     * that aic3204.c's own (then-uncorrected) comment made it sound
+     * vestigial. That caused a real regression (frequencies off,
+     * degraded WFM reception) and was reverted - MCLK is genuinely
+     * required (see aic3204.c's corrected clock-chain comment: the
+     * codec's PLL takes MCLK, not BCLK, as its reference - the
+     * project owner's own objection that a BCLK-sourced PLL made no
+     * sense for an I2S-master codec is what prompted re-decoding the
+     * real register bits and catching this).
+     *
+     * With MCLK confirmed genuinely necessary, the real fix was
+     * finding it a DIFFERENT timer rather than removing it: the
+     * project owner's own real datasheet pinout table showed PC6 also
+     * has TIMER7_CH0 available (alongside the TIMER2_CH0 this
+     * function used before) - gd32_i2s_mclk_timer_start() (gd32_i2s.c)
+     * now uses that instead, freeing TIMER2 for real. See that
+     * function's own comment for the exact frequency math and its AF
+     * number (AF3, confirmed 01/09/2026 against the real datasheet's
+     * Port C AF table, same source as the pin mapping itself).
+     */
+    debug_print("\n--- MCLK: TIMER7_CH0/PC6, 1.536MHz ---\n");
     gd32_i2s_mclk_timer_start();
 
     debug_print("\n--- I2S1: phase 3 (clocks + circular DMA, test tone) ---\n");
@@ -1116,6 +1157,7 @@ static ui_button_t s_menu_tile_sleep; /* screen SLEEP one-shot action - HW page,
 static ui_button_t s_menu_tile_cal; /* touch CALibration one-shot action - HW page, see touch_calib.h/menu_tile_cal_callback() */
 static ui_button_t s_menu_tile_cal_ppm; /* MS5351 crystal PPM CALibration one-shot action - HW page, added 26/08/2026, see menu_tile_cal_ppm_callback() */
 static ui_button_t s_menu_tile_ifbw; /* WFM pre-discriminator channel filter width (96K/80K) - HW page slot 4, added 01/09/2026, see menu_tile_ifbw_callback() */
+static ui_button_t s_menu_tile_specagc; /* Spectrum/waterfall auto-scale toggle - HW page slot 5, added 01/09/2026, see menu_tile_specagc_callback() */
 /* s_speaker_pa_enabled: backs BOTH the tile's label (menu_tile_speaker_pa_refresh())
  * and the actual GPIO level (speaker_pa_set_enabled(), defined down
  * with the rest of the GPIO drivers near led_gpio_init() - declared
@@ -1193,14 +1235,21 @@ static uint8_t s_spec_smooth_passes = 0U;
  * captured-replay frequency to this one at boot - the two are
  * decoupled on purpose now, see that comment.
  *
- * The button cycles the tuning step. Limits: 100kHz is
- * ms5351_set_lo_freq()'s own LOWF_FLOOR_HZ (see ms5351.c) - lowered
- * from 4.8MHz on 31/07/2026 when the low-band quadrature technique
- * was ported in; NOT bench-confirmed down at the very bottom of that
- * range yet, see ms5351_set_lo_freq_lowband()'s comment for why. 180MHz
- * is the top of the front-end LPF bank (rf_lpf.c).
+ * The button cycles the tuning step. Limits: 30kHz (lowered
+ * 01/09/2026 from 100kHz, per the project owner, specifically to
+ * reach DCF77/similar LF time-signal stations - 77.5kHz - with
+ * comfortable margin) - no longer tied to ms5351.c's own LOWF_FLOOR_HZ
+ * the way the old 100kHz value was: anything this low routes through
+ * lo_gen_gd32.c instead (LO_GEN_CROSSOVER_HZ=300kHz), whose own
+ * achievable range comfortably covers this with margin to spare (see
+ * that module's own comment). Kept comfortably above
+ * DEMOD_IF_OFFSET_HZ (24kHz) - see apply_lo_tune()'s own comment and
+ * the "TUNE_MIN_HZ > DEMOD_IF_OFFSET_HZ" invariant a few other
+ * comments in this file rely on to avoid a uint32_t underflow - going
+ * any lower than this would need re-checking those too. 180MHz is the
+ * top of the front-end LPF bank (rf_lpf.c).
  */
-#define TUNE_MIN_HZ 100000UL
+#define TUNE_MIN_HZ 30000UL
 #define TUNE_MAX_HZ 180000000UL
 
 /* s_tune_hz's actual declaration moved up near s_menu_open, 17/08/2026
@@ -1587,6 +1636,54 @@ static uint8_t s_scale_adjust_max = 0U; /* 0 = knob moves db_min, 1 = moves db_m
                                       * keeps spectrum_draw()'s scale_t = 1/(max-min)
                                       * from blowing up into a useless few-pixel
                                       * sliver of range. */
+
+/*
+ * --- Spectrum AGC, added 01/09/2026 -------------------------------------
+ *
+ * Per the project owner: auto-track s_db_min/s_db_max from the actual
+ * spectrum instead of only ever setting them by hand. Off by default
+ * (matches this project's usual "the new control's default is the
+ * old, already-validated behavior" rule) - manual SCALE adjustment
+ * (tune_encoder_poll()'s ENCODER_TARGET_SCALE handler) still works
+ * exactly as before either way, and now also auto-disables this if it
+ * was on, so turning the knob always means "I'm taking over," never
+ * "fight the auto-tracker."
+ *
+ * Reuses s_db_frame[] - the exact same per-frame FFT data already
+ * computed for the panadapter/waterfall and the SNR readout, no new
+ * signal path. Each frame (same "!s_menu_open" gate as s_db_frame
+ * itself - see sdr_spectrum_waterfall_tick()'s own comment on why):
+ * take the CURRENT frame's own min across all FFT_BINS_IQ bins as the
+ * floor reference, pad it down by SPEC_AGC_FLOOR_MARGIN_DB (so the
+ * noise floor itself doesn't sit clipped right at the bottom edge),
+ * clamp to the same SPECTRUM_DB_FLOOR/CEIL/MIN_GAP bounds manual
+ * adjustment already respects, then move s_db_min/s_db_max toward
+ * that target with a SLOW exponential smoothing factor
+ * (SPEC_AGC_SMOOTH_ALPHA) rather than snapping straight to it - a
+ * strong signal appearing or fading should widen or narrow the
+ * visible range gradually, not visibly jump the whole waterfall's
+ * color mapping every single frame.
+ *
+ * *** 01/09/2026, CEILING FIXED same day - real hardware feedback ***
+ * - the first version set the ceiling to frame_max + a small fixed
+ * margin (SPEC_AGC_CEIL_MARGIN_DB), which looked fine with a strong
+ * signal present but rode up uncomfortably close to the very top of
+ * the display with no strong signal at all: plain background noise
+ * has very little spread between its own min and max, so "max + a
+ * few dB" ends up hugging just above the noise floor itself, leaving
+ * almost no visible headroom even though the display is nowhere near
+ * SPECTRUM_DB_CEIL. Fixed by giving the ceiling a GUARANTEED minimum
+ * distance above the floor (SPEC_AGC_MIN_SPAN_DB) regardless of
+ * frame_max, only widening further than that when an actual signal
+ * needs the room: target_max = max(target_min + MIN_SPAN_DB,
+ * frame_max + CEIL_MARGIN_DB). With no strong signals, the display now
+ * always keeps at least MIN_SPAN_DB of headroom above the floor.
+ */
+static uint8_t s_spec_agc_enabled = 1U;
+#define SPEC_AGC_FLOOR_MARGIN_DB 0.0f
+#define SPEC_AGC_CEIL_MARGIN_DB  6.0f
+#define SPEC_AGC_MIN_SPAN_DB     50.0f /* guaranteed floor-to-ceiling headroom, signal or not */
+#define SPEC_AGC_SMOOTH_ALPHA    0.05f
 
 /*
  * --- Squelch (AM + NFM, encoder target) -------------------------------
@@ -2366,6 +2463,43 @@ static void snr_update_and_draw(const float *db_frame)
 }
 
 /*
+ * Auto-tracks s_db_min/s_db_max from the current frame - see
+ * s_spec_agc_enabled's declaration comment for the full design. A
+ * no-op unless the SAGC tile has turned this on (s_spec_agc_enabled),
+ * checked by the caller, not in here.
+ */
+static void spec_agc_apply(const float *db_frame)
+{
+    float frame_min = db_frame[0];
+    float frame_max = db_frame[0];
+    float target_min, target_max;
+    uint32_t k;
+
+    for (k = 1U; k < FFT_BINS_IQ; k++) {
+        if (db_frame[k] < frame_min) { frame_min = db_frame[k]; }
+        if (db_frame[k] > frame_max) { frame_max = db_frame[k]; }
+    }
+
+    target_min = frame_min - SPEC_AGC_FLOOR_MARGIN_DB;
+    /* Guaranteed minimum headroom above the floor, regardless of how
+     * little spread the current frame has (see this function's
+     * declaration comment for why frame_max alone isn't enough) -
+     * only widen further than that when an actual signal needs it. */
+    target_max = target_min + SPEC_AGC_MIN_SPAN_DB;
+    if (frame_max + SPEC_AGC_CEIL_MARGIN_DB > target_max) {
+        target_max = frame_max + SPEC_AGC_CEIL_MARGIN_DB;
+    }
+    if (target_min < SPECTRUM_DB_FLOOR) { target_min = SPECTRUM_DB_FLOOR; }
+    if (target_max > SPECTRUM_DB_CEIL)  { target_max = SPECTRUM_DB_CEIL; }
+    if (target_max < target_min + SPECTRUM_DB_MIN_GAP) {
+        target_max = target_min + SPECTRUM_DB_MIN_GAP;
+    }
+
+    s_db_min += (target_min - s_db_min) * SPEC_AGC_SMOOTH_ALPHA;
+    s_db_max += (target_max - s_db_max) * SPEC_AGC_SMOOTH_ALPHA;
+}
+
+/*
  * STATUS BADGES: up to 6, in a 2x3 grid under the S-meter. Each shows
  * a radio state at a glance:
  *   NR / SPT  - NR (03/08/2026) is real again: lit whenever the
@@ -2685,13 +2819,16 @@ static void badges_draw(void)
  *   UI    (slots 0-5): BL (backlight), SCALE, SPT, SMH (smooth),
  *                       SPC (spectrum trace style, HEATMAP<->LINE),
  *                       ZOOM.
- *   HW    (slots 0-1, 4): SPK - speaker PA enable/mute (PB7, see
+ *   HW    (slots 0-1, 4-5): SPK - speaker PA enable/mute (PB7, see
  *                       speaker_pa_set_enabled()'s comment - pin/
  *                       polarity UNCONFIRMED as of 03/08/2026). IFBW -
  *                       WFM pre-discriminator channel filter width
  *                       (96K/80K, slot 4, added 01/09/2026 - see
- *                       menu_tile_ifbw_callback()'s comment).
- *                       Slots 5-7 reserved for future hardware
+ *                       menu_tile_ifbw_callback()'s comment). SAGC -
+ *                       spectrum/waterfall auto-scale toggle (slot 5,
+ *                       added 01/09/2026 - see
+ *                       menu_tile_specagc_callback()'s comment).
+ *                       Slots 6-7 reserved for future hardware
  *                       settings.
  *   DIG   (slots 0-2), added 09/08/2026: digital-mode (currently just
  *                       RTTY) parameters that no longer fit on RADIO
@@ -2877,7 +3014,7 @@ static spec_zoom_t s_spec_zoom = SPEC_ZOOM_1X;
  * the CURRENT zoom shows (96/48/24/12kHz - see the switch below), so
  * they track ZOOM automatically, same as the marker/tint do.
  * panel_center_hz +/- half_span_hz can, in principle, run outside
- * TUNE_MIN_HZ/MAX_HZ (e.g. tuned near the 100kHz floor, minus 96kHz
+ * TUNE_MIN_HZ/MAX_HZ (e.g. tuned near the tunable floor, minus 96kHz
  * of span) - int64_t math + a floor-at-0 clamp keeps that from
  * wrapping a uint32_t negative into a huge bogus frequency; showing
  * an edge label below the tunable floor is harmless (there's no
@@ -2918,10 +3055,11 @@ static void spec_span_labels_draw(void)
     /* See this function's PANEL-CENTER FREQUENCY comment above - same
      * condition sdr_spectrum_waterfall_tick() uses for
      * center_mark_offset_px. s_tune_hz > DEMOD_IF_OFFSET_HZ always
-     * holds here (TUNE_MIN_HZ=100kHz > DEMOD_IF_OFFSET_HZ=24kHz, was
-     * 12kHz before AM/SSB/NFM moved from 48kHz to 96kHz - see
-     * sdr_rx.h's SDR_RX_BLOCK_SAMPLES comment), so the subtraction
-     * below never underflows. */
+     * holds here (TUNE_MIN_HZ=30kHz > DEMOD_IF_OFFSET_HZ=24kHz - was
+     * 100kHz before 01/09/2026, lowered to reach DCF77/similar LF
+     * stations, still comfortably above this invariant's floor - see
+     * TUNE_MIN_HZ's own comment), so the subtraction below never
+     * underflows. */
     panel_center_hz = s_tune_hz;
     if (s_spec_zoom == SPEC_ZOOM_1X && demod_am_get_if_offset_active()) {
         panel_center_hz = s_tune_hz - DEMOD_IF_OFFSET_HZ;
@@ -4164,6 +4302,29 @@ static void menu_tile_ifbw_callback(void *widget, ui_event_t event, void *user_d
         demod_am_set_wfm_ifbw(bw);
         debug_print(bw == WFM_IFBW_NARROW ? "wfm ifbw: now 80K (narrow)\n" : "wfm ifbw: now 96K (wide/off)\n");
         menu_tile_ifbw_refresh();
+    }
+}
+
+/*
+ * SAGC (HW page, slot 5) - spectrum/waterfall auto-scale toggle, see
+ * s_spec_agc_enabled's declaration comment for the full design.
+ * Two-state cycle, same shape as the RFAGC/IFBW tiles.
+ */
+static void menu_tile_specagc_refresh(void)
+{
+    s_menu_tile_specagc.label = s_spec_agc_enabled ? "SAGC ON" : "SAGC OFF";
+    ui_button_draw(&s_menu_tile_specagc);
+}
+
+static void menu_tile_specagc_callback(void *widget, ui_event_t event, void *user_data)
+{
+    (void)widget;
+    (void)user_data;
+
+    if (event == UI_EVENT_RELEASE) {
+        s_spec_agc_enabled = (uint8_t)(s_spec_agc_enabled ? 0U : 1U);
+        debug_print(s_spec_agc_enabled ? "spectrum AGC: on\n" : "spectrum AGC: off\n");
+        menu_tile_specagc_refresh();
     }
 }
 
@@ -5472,10 +5633,20 @@ static void menu_grid_show(void)
             2, 0, 1, menu_tile_ifbw_callback, NULL};
         ui_screen_add_button(&s_menu_screen, &s_menu_tile_ifbw);
 
+        /* SAGC: spectrum/waterfall auto-scale toggle, added
+         * 01/09/2026 - see menu_tile_specagc_callback()'s comment.
+         * Fills slot 5 - slots 6-7 still intentionally empty. */
+        s_menu_tile_specagc = (ui_button_t){
+            MENU_OPT_COL(5), MENU_OPT_ROW(5), MENU_TILE_W, MENU_TILE_H,
+            "SAGC", GFX_COLOR_BLACK, GFX_COLOR_CYAN, GFX_COLOR_GRAY,
+            2, 0, 1, menu_tile_specagc_callback, NULL};
+        ui_screen_add_button(&s_menu_screen, &s_menu_tile_specagc);
+
         ui_screen_draw(&s_menu_screen);
         menu_tile_speaker_pa_refresh();
         menu_tile_cal_ppm_refresh();
         menu_tile_ifbw_refresh();
+        menu_tile_specagc_refresh();
         break;
 
     case MENU_PAGE_DIG:
@@ -5651,30 +5822,68 @@ static void screen_wake(void)
  * complex bandwidth centered on the station, not shifted 48kHz off
  * it). AM/USB/LSB keep the existing low-IF behavior unchanged.
  */
+/*
+ * s_lo_source_is_gd32: which physical oscillator is currently driving
+ * CLK0/CLK1's net - 0xFF (unknown) forces the very first call to fully
+ * set up whichever side is actually needed, same "sentinel forces
+ * first-time full init" shape as ms5351.c's own s_last_div=0. See
+ * lo_gen_gd32.h's big comment for why the crossover exists and why
+ * it's narrow (LO_GEN_CROSSOVER_HZ, 300kHz) rather than covering the
+ * whole <5MHz range the project owner originally asked about.
+ *
+ * *** 01/09/2026, full history: forced off, then genuinely re-enabled
+ * same day *** - disabling MCLK to free TIMER2 caused a real
+ * regression (frequencies off, degraded WFM reception) and was
+ * reverted, which briefly meant TIMER2 wasn't actually available for
+ * this module (want_gd32 was hardcoded to 0 here for a while). Real
+ * fix: gd32_i2s_mclk_timer_start() (gd32_i2s.c) was moved to
+ * TIMER7_CH0/PC6 instead - a different alternate function the project
+ * owner's own datasheet table showed was also available on that same
+ * pin - freeing TIMER2 for real, no MCLK tradeoff needed. want_gd32 is
+ * evaluated normally again below.
+ */
+static uint8_t s_lo_source_is_gd32 = 0xFFU;
+
 static void apply_lo_tune(uint32_t freq_hz)
 {
-    if (demod_am_get_mode() == DEMOD_MODE_WFM) {
-        if (!ms5351_set_lo_freq(freq_hz)) {
-            debug_print_dec("tune: ms5351_set_lo_freq FAILED (WFM, no offset) at Hz", freq_hz);
+    uint8_t is_wfm = (demod_am_get_mode() == DEMOD_MODE_WFM) ? 1U : 0U;
+    /* Same low-IF offset math as before, just computed once up front
+     * so both the MS5351 and the GD32 generator branches below tune
+     * to the identical actual LO frequency the old code already used -
+     * this offset need is about avoiding the LO-leakage artifact
+     * landing on the wanted signal, which has nothing to do with
+     * which physical oscillator produces the LO. */
+    uint32_t actual_lo_hz = is_wfm ? freq_hz : (freq_hz - DEMOD_IF_OFFSET_HZ);
+    uint8_t want_gd32 = (actual_lo_hz < LO_GEN_CROSSOVER_HZ) ? 1U : 0U;
+    uint8_t ok;
+
+    /* Only touch the OTHER side when actually crossing the boundary -
+     * same "don't redo I2C/timer work (and don't risk an audible
+     * click) on every single retune, only on a real zone change"
+     * discipline ms5351.c's own s_last_div/s_last_lowf_zone checks
+     * already use. */
+    if (want_gd32 != s_lo_source_is_gd32) {
+        if (want_gd32) {
+            (void)ms5351_lo_disable();
         } else {
-            demod_am_set_if_offset_active(0U);
+            lo_gen_gd32_stop();
+        }
+        s_lo_source_is_gd32 = want_gd32;
+    }
+
+    if (want_gd32) {
+        ok = lo_gen_gd32_set_freq(actual_lo_hz);
+        if (!ok) {
+            debug_print_dec("tune: lo_gen_gd32_set_freq FAILED at Hz", actual_lo_hz);
         }
     } else {
-        /* Low-IF tuning (2nd attempt, Fs/4 sign-flip rotation - see
-         * demod_am.h's LOW-IF TUNING note for the full history): the
-         * LO sits DEMOD_IF_OFFSET_HZ below the selected station so
-         * demod_am_process_raw()'s down-mix can pull the wanted
-         * signal off the LO-leakage artifact at 0Hz. s_tune_hz itself
-         * stays the selected/displayed frequency. The
-         * demod_am_set_if_offset_active(1) call keeps the digital
-         * down-mix in sync with the LO actually being offset from
-         * here on (idempotent - fine to call on every retune, not
-         * just the first). */
-        if (!ms5351_set_lo_freq(freq_hz - DEMOD_IF_OFFSET_HZ)) {
-            debug_print_dec("tune: ms5351_set_lo_freq FAILED at Hz", freq_hz);
-        } else {
-            demod_am_set_if_offset_active(1U);
+        ok = ms5351_set_lo_freq(actual_lo_hz);
+        if (!ok) {
+            debug_print_dec("tune: ms5351_set_lo_freq FAILED at Hz", actual_lo_hz);
         }
+    }
+    if (ok) {
+        demod_am_set_if_offset_active(is_wfm ? 0U : 1U);
     }
 
     /* See s_settings_ready_for_autosave's comment: only a REAL retune
@@ -6415,6 +6624,14 @@ static void tune_encoder_poll(void)
 
         if (detents != 0) {
             float step = (float)detents * SPECTRUM_DB_STEP;
+
+            /* Manual adjustment always wins - turning the knob means
+             * "I'm taking over," never "fight the auto-tracker". See
+             * s_spec_agc_enabled's declaration comment. */
+            if (s_spec_agc_enabled) {
+                s_spec_agc_enabled = 0U;
+                debug_print("spectrum AGC: off (manual SCALE adjustment)\n");
+            }
 
             if (s_scale_adjust_max) {
                 float v = s_db_max + step;
@@ -7512,6 +7729,9 @@ static void sdr_spectrum_waterfall_tick(void)
         }
     }
 
+    if (s_spec_agc_enabled) {
+        spec_agc_apply(s_db_frame);
+    }
     snr_update_and_draw(s_db_frame);
 
     t_spec0 = DWT->CYCCNT;

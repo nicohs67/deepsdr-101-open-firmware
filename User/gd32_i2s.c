@@ -176,9 +176,16 @@ void gd32_i2s_init_slave(aic3204_rate_t rate)
     /*
      * MCLK: TIMER2_CH0/PC6, started once at cold boot by
      * gd32_i2s_mclk_timer_start() (main.c) and never touched again -
-     * fixed 1.536MHz regardless of `rate` (see aic3204.c's header
-     * comment: the codec's own PLL is sourced from BCLK, not MCLK, so
-     * MCLK doesn't need to change with the audio sample rate).
+     * fixed 1.536MHz regardless of `rate`. This is genuinely required
+     * (confirmed both by a real-hardware experiment and by re-decoding
+     * the actual I2C capture - see aic3204.c's header comment,
+     * corrected 01/09/2026): the codec's PLL takes MCLK as its
+     * reference (PLL_CLKIN=MCLK, NOT BCLK - the earlier version of
+     * this comment had that backwards) and always produces the same
+     * fixed CODEC_CLKIN=86.016MHz from it, regardless of `rate` - it's
+     * the NDAC/MDAC/DOSR dividers downstream of CODEC_CLKIN (which DO
+     * change with `rate`) that actually produce the different Fs, not
+     * MCLK/PLL_CLKIN itself.
      *
      * i2s_psc_config's audiosample argument IS now rate-dependent -
      * this is the one piece of this function that actually differs
@@ -309,22 +316,38 @@ static float sinf_approx(float x)
 static const int16_t s_silence_buf[16] = {0}; /* small, doesn't need to match any tone period */
 
 /*
- * MCLK generation via TIMER2_CH0 on PC6, AF2 - confirmed against the
- * GD32F450xx datasheet's Port C alternate function table (Table 2-8),
- * cross-checked against the already-empirically-confirmed AF5=I2S1_MCK
- * on the same row.
+ * MCLK generation via TIMER7_CH0 on PC6 - moved here 01/09/2026 from
+ * TIMER2_CH0 (same pin, different timer) specifically to free TIMER2
+ * for lo_gen_gd32.c's PA6/PA7 quadrature LO generator, which needs
+ * TIMER2_CH0/CH1 and has no other option on those two exact pins -
+ * see lo_gen_gd32.h's own comment for why, and main.c's boot sequence
+ * comment for the two failed workarounds tried first (disabling MCLK
+ * entirely broke reception - see aic3204.c's corrected clock-chain
+ * comment for why MCLK is genuinely required, not vestigial). The
+ * project owner's own real datasheet pinout table confirmed PC6 also
+ * has TIMER7_CH0 as an alternate function, alongside the TIMER2_CH0
+ * this project already used - a straight swap, not a redesign.
+ *
+ * *** AF NUMBER CONFIRMED 01/09/2026 *** - the project owner supplied
+ * the real GD32F450xx datasheet's Table 2-8 (Port C alternate
+ * functions summary): PC6's row shows TIMER2_CH0 under AF2 and
+ * TIMER7_CH0 under AF3, exactly matching this family's usual
+ * convention (TIMER0/1 typically AF1, TIMER2-5 AF2, TIMER7-11 AF3,
+ * TIMER12-14 AF9) that GPIO_AF_3 below was originally chosen from
+ * before this table was available. No longer a guess.
  *
  * Targets exactly 1.536MHz, matching the real board's confirmed MCLK
- * frequency. With this project's clock config (PSC=8/PLLN=260/PLLP=2
- * in system_gd32f4xx.c -> SYSCLK=199.68MHz, APB1_PSC=4 -> PCLK1=
- * 49.92MHz -> TIMER2CLK=2xPCLK1=99.84MHz when APB1 prescaler != 1,
- * standard on this family): 99.84MHz / 65 = 1.536MHz exactly. PSC=0,
- * period=64 (65 total counts) gives that division with no remainder -
- * a clean, exact match, not a rounded approximation.
- *
- * Duty cycle is close to but not exactly 50% (32/65 ~= 49.2%) since 65
- * is odd and can't split evenly - a minor asymmetry that should not
- * matter for a clock reference input.
+ * frequency. TIMER7 is on APB2 (an advanced-control timer, same bus
+ * as TIMER0 - both share BRKIN/CH0_ON alternate functions on PA6/PA7,
+ * a strong family-architecture tell even without a direct clock-tree
+ * confirmation table). With this project's clock config (APB2_PSC=2
+ * in system_gd32f4xx.c -> PCLK2=SYSCLK/2=99.84MHz -> TIMER7CLK=
+ * 2xPCLK2=199.68MHz when the APB2 prescaler != 1, standard on this
+ * family): 199.68MHz / 130 = 1.536MHz exactly. PSC=0, period=129 (130
+ * total counts) gives that division with no remainder - AND, unlike
+ * the old TIMER2-based 65-count division, 130 is even, so this also
+ * gets an exact 50% duty cycle (65/65) as a free bonus, not just an
+ * approximation.
  */
 void gd32_i2s_mclk_timer_start(void)
 {
@@ -332,36 +355,43 @@ void gd32_i2s_mclk_timer_start(void)
     timer_oc_parameter_struct oc_init_struct;
 
     rcu_periph_clock_enable(RCU_GPIOC);
-    rcu_periph_clock_enable(RCU_TIMER2);
+    rcu_periph_clock_enable(RCU_TIMER7);
 
     gpio_mode_set(GPIOC, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_6);
     gpio_output_options_set(GPIOC, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_6);
-    gpio_af_set(GPIOC, GPIO_AF_2, GPIO_PIN_6);
+    gpio_af_set(GPIOC, GPIO_AF_3, GPIO_PIN_6);
 
-    timer_deinit(TIMER2);
+    timer_deinit(TIMER7);
 
     timer_struct_para_init(&timer_init_struct);
     timer_init_struct.prescaler         = 0U;
     timer_init_struct.alignedmode       = TIMER_COUNTER_EDGE;
     timer_init_struct.counterdirection  = TIMER_COUNTER_UP;
     timer_init_struct.clockdivision     = TIMER_CKDIV_DIV1;
-    timer_init_struct.period            = 64U; /* 65 counts: 99.84MHz/65 = 1.536MHz exact */
+    timer_init_struct.period            = 129U; /* 130 counts: 199.68MHz/130 = 1.536MHz exact */
     timer_init_struct.repetitioncounter = 0U;
-    gd32_timer_init(TIMER2, &timer_init_struct);
+    gd32_timer_init(TIMER7, &timer_init_struct);
 
     timer_channel_output_struct_para_init(&oc_init_struct);
     oc_init_struct.outputstate  = TIMER_CCX_ENABLE;
     oc_init_struct.ocpolarity   = TIMER_OC_POLARITY_HIGH;
-    timer_channel_output_config(TIMER2, TIMER_CH_0, &oc_init_struct);
+    timer_channel_output_config(TIMER7, TIMER_CH_0, &oc_init_struct);
 
-    timer_channel_output_pulse_value_config(TIMER2, TIMER_CH_0, 32U); /* ~49.2% duty */
-    timer_channel_output_mode_config(TIMER2, TIMER_CH_0, TIMER_OC_MODE_PWM0);
+    timer_channel_output_pulse_value_config(TIMER7, TIMER_CH_0, 65U); /* exact 50% duty */
+    timer_channel_output_mode_config(TIMER7, TIMER_CH_0, TIMER_OC_MODE_PWM0);
 
-    timer_auto_reload_shadow_enable(TIMER2);
-    timer_enable(TIMER2);
+    /* TIMER7 is an advanced-control timer (like TIMER0) - its outputs
+     * stay disabled at the peripheral level until the main output
+     * enable is set, unlike the plain general-purpose TIMER2 this
+     * function used before. Without this, PC6 would stay silent
+     * despite everything above looking correctly configured. */
+    timer_primary_output_config(TIMER7, ENABLE);
 
-    debug_print("gd32_i2s: MCLK started via TIMER2_CH0/PC6 (AF2), target 1.536MHz "
-                "exact - verify with a scope before relying on it\n");
+    timer_auto_reload_shadow_enable(TIMER7);
+    timer_enable(TIMER7);
+
+    debug_print("gd32_i2s: MCLK started via TIMER7_CH0/PC6 (AF3, confirmed against the real "
+                "datasheet's Port C AF table), target 1.536MHz exact\n");
 }
 
 

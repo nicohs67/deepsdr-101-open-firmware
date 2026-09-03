@@ -113,9 +113,14 @@ uint8_t ms5351_init(void);
 uint8_t ms5351_tune_captured(void);
 
 /*
- * General quadrature tune: puts freq_hz on CLK0 and CLK1, CLK0 leading
- * by 90 degrees. TWO different techniques under the hood, picked
- * automatically by frequency - see ms5351.c for both:
+ * General quadrature tune: puts freq_hz on CLK0 and CLK1, CLK1 leading
+ * by 90 degrees (corrected 01/09/2026 - this used to say "CLK0
+ * leading", which was backwards: the Si5351/MS5351 datasheet defines
+ * CLKx_PHOFF as a time DELAY, and the register-offset scheme below
+ * writes its nonzero value to CLK0 - so CLK0 LAGS, CLK1 leads. Real
+ * hardware (SSB sideband sense) confirms this). TWO different
+ * techniques under the hood, picked automatically by frequency - see
+ * ms5351.c for both:
  *
  *   >= 4.8MHz: the ORIGINAL phase-offset-register scheme (unchanged
  *   from before 31/07/2026) - PLLB fractional feedback + an EVEN

@@ -71,16 +71,27 @@ void aic3204_scan_bus(void);
  * - not derived, not extrapolated, not guessed.
  *
  * This capture revealed the actual clock architecture: the AIC3204's
- * own PLL is enabled, clocked from BCLK (not a separate MCLK signal).
- * Confirmed by exact arithmetic against oscilloscope measurements:
- * BCLK=6.144MHz, PLL J=14/D=0 -> PLL_CLK=86.016MHz=CODEC_CLKIN, which
- * both the ADC (NADC=1/MADC=28/AOSR=64) and DAC (NDAC=2/MDAC=7/DOSR=128)
- * divider chains reduce to exactly Fs=48kHz (was MADC=7/DOSR=32 ->
- * 192kHz before 04/08/2026 - see aic3204_phase2_init()'s header
- * comment for the full story, including the DAC processing-block
- * change that had to come with it). See gd32_i2s.c - no MCLK pin is
- * configured at all now, since the codec doesn't need one for this
- * design.
+ * own PLL is enabled, clocked from MCLK - NOT from BCLK, despite what
+ * an earlier version of this comment claimed; corrected 01/09/2026
+ * after the project owner pointed out that claim made no physical
+ * sense (the codec is the I2S MASTER here, so BCLK is ITS OWN output -
+ * a PLL can't sensibly derive its own reference from a signal
+ * downstream of that same PLL). Re-decoded directly against the real
+ * register bit fields (P0R4=0x43, P0R5=0x94 - see
+ * aic3204_configure_rate()'s own comment for the full derivation):
+ * PLL_CLKIN=MCLK, P=1, R=4, J=14, D=0 -> PLL_CLK = MCLK x R x J / P =
+ * 1.536MHz x 4 x 14 / 1 = 86.016MHz = CODEC_CLKIN exactly, using this
+ * project's own TIMER2_CH0/PC6-generated 1.536MHz MCLK signal (see
+ * gd32_i2s_mclk_timer_start()) - which both the ADC (NADC=1/MADC=28/
+ * AOSR=64) and DAC (NDAC=2/MDAC=7/DOSR=128) divider chains reduce to
+ * exactly Fs=48kHz (was MADC=7/DOSR=32 -> 192kHz before 04/08/2026 -
+ * see aic3204_phase2_init()'s header comment for the full story,
+ * including the DAC processing-block change that had to come with
+ * it). A same-day real-hardware experiment (disabling MCLK generation
+ * on the theory that this comment's old, wrong claim made it
+ * vestigial) directly confirmed MCLK is genuinely required - it broke
+ * reception (off-frequency, degraded WFM, other odd behavior) - and
+ * was restored.
  *
  * Call this after aic3204_probe_and_reset() AND after the I2S side is
  * already generating a real clock towards the codec

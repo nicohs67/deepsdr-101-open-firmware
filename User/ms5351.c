@@ -236,25 +236,39 @@ uint8_t ms5351_tune_captured(void)
  *      few Hz below the real target (LOWF_PHASE_DF_HZ) - then reset
  *      PLLB. Both channels start out perfectly IN PHASE (0 degrees
  *      apart), running slightly slow.
- *   3. Immediately retune MS0 (CLK0 only) up to the CORRECT divider
- *      for the real freq - CLK0 jumps to the right frequency, CLK1
+ *   3. Immediately retune MS1 (CLK1 only) up to the CORRECT divider
+ *      for the real freq - CLK1 jumps to the right frequency, CLK0
  *      keeps running df Hz slow.
- *   4. Wait exactly LOWF_PHASE_SHIFT_US - during this window CLK1
- *      keeps falling behind CLK0 at a rate of df cycles/second. The
+ *   4. Wait exactly LOWF_PHASE_SHIFT_US - during this window CLK0
+ *      keeps falling behind CLK1 at a rate of df cycles/second. The
  *      wait time is chosen so the accumulated lag comes out to EXACTLY
  *      90 degrees: phase_lag = 2*pi*df*t, solved for t at phase_lag=
  *      pi/2 (90 degrees) gives t = 1/(4*df) - note the pi cancels
  *      completely, so this works out to a clean constant (62500us for
  *      df=4Hz) that DOESN'T depend on the target frequency at all.
- *   5. Retune MS1 (CLK1) up to the same correct divider CLK0 already
- *      has. CLK1 jumps to the right frequency too, but by now carries
- *      exactly 90 degrees of lag relative to CLK0 - and since both
+ *   5. Retune MS0 (CLK0) up to the same correct divider CLK1 already
+ *      has. CLK0 jumps to the right frequency too, but by now carries
+ *      exactly 90 degrees of lag relative to CLK1 - and since both
  *      channels share the IDENTICAL, unchanging divider ratio from
  *      here on, that 90-degree relationship survives any further
  *      retuning THAT ONLY MOVES PLLB'S FEEDBACK (fVCO) - which is
  *      exactly what normal tuning within a zone does (see the "always"
  *      block below, and why steps 1-5 only run when the ZONE changes,
  *      not on every retune).
+ *
+ *   *** 01/09/2026: steps 3+5 SWAPPED (CLK1 sped up first now, not
+ *   CLK0) - real hardware bug fix, confirmed by the project owner:
+ *   SSB sidebands came out correct above 5MHz (the register-offset
+ *   trick, ms5351_set_lo_freq()'s main path) but swapped below it
+ *   (this function, before the fix). The two techniques were meant to
+ *   agree on which clock leads, but didn't: the register-offset trick
+ *   writes its nonzero CLKx_PHOFF value to CLK0, and the Si5351/MS5351
+ *   datasheet defines PHOFF as a time DELAY - so CLK0 actually LAGS
+ *   over there, meaning CLK1 leads in the (already-working) high-band
+ *   path, not CLK0 as this function's own steps used to assume.
+ *   Speeding up CLK1 first here (instead of CLK0) makes this function
+ *   agree with that real, empirically-confirmed convention instead of
+ *   its own previous (wrong) assumption.
  *
  * PLL FEEDBACK MULTIPLIER WARNING: the SI5351 datasheet's nominal
  * range for the PLL feedback multiplier (fVCO/fXTAL) is roughly
@@ -377,6 +391,15 @@ static uint8_t ms5351_set_lo_freq_lowband(uint32_t freq_hz)
 
         ok &= wr_reg(REG_CLK0_CTRL, CLKCTRL_QUAD_PLLB, "reg16 CLK0 on/PLLB (low-band)");
         ok &= wr_reg(REG_CLK0_CTRL + 1U, CLKCTRL_QUAD_PLLB, "reg17 CLK1 on/PLLB (low-band)");
+        /* Re-assert the output-enable mask here too - same gap-fix
+         * and same "s_last_lowf_zone gets force-invalidated by
+         * ms5351_lo_disable(), so THIS is where a prior disable
+         * actually gets undone" reasoning as ms5351_set_lo_freq()'s
+         * own high-band reprogram branch - see its comment. Without
+         * this, retuning back into the low band after a
+         * ms5351_lo_disable() would silently stay Hi-Z even though
+         * every other register looks correctly reprogrammed. */
+        ok &= wr_reg(REG_OE_CTRL, 0xFCU, "reg3 OE=CLK0|CLK1 (re-assert, low-band)");
 
         /* Step 1: PLLB feedback for fVCO. The "always" block below
          * redoes this identically right after we return - a harmless
@@ -395,17 +418,41 @@ static uint8_t ms5351_set_lo_freq_lowband(uint32_t freq_hz)
         ok &= wr_reg(REG_CLK1_PHASE, 0U, "reg166 CLK1 phase=0 (low-band)");
         ok &= wr_reg(REG_PLL_RESET, PLL_RESET_B, "reg177 PLLB reset (low-band align)");
 
-        /* Step 3: MS0 (CLK0 only) up to the real freq - CLK0 jumps,
-         * CLK1 keeps running slow. */
+        /* Step 3: MS1 (CLK1 only) up to the real freq - CLK1 jumps,
+         * CLK0 keeps running slow.
+         *
+         * *** 01/09/2026, SWAPPED from MS0/CLK0 - real hardware bug
+         * fix *** - this maneuver's own comment (and this file's
+         * general "CLK0 leads CLK1 by 90 degrees" framing) always
+         * described CLK0 as the one that should end up leading, and
+         * this used to speed up MS0/CLK0 first to make that happen.
+         * But the HIGH-band path (ms5351_set_lo_freq()'s main branch)
+         * achieves its OWN 90-degree relationship a completely
+         * different way - via CLKx_PHOFF, which the Si5351/MS5351
+         * datasheet defines as a time DELAY (not an advance): whichever
+         * clock gets the nonzero PHOFF value LAGS, not leads. That
+         * path writes the nonzero value to CLK0 and leaves CLK1 at 0 -
+         * meaning CLK1 actually leads CLK0 in the ALREADY-WORKING
+         * high-band path, the opposite of what this file's comments
+         * claimed. The project owner confirmed this exactly on real
+         * hardware: SSB sidebands came out correct above 5MHz (high-
+         * band) but swapped below it (low-band, this function) - two
+         * DIFFERENT techniques that were meant to agree ended up
+         * producing opposite conventions instead. Swapping which
+         * MultiSynth gets sped up first here (CLK1, not CLK0) makes
+         * this function ALSO produce "CLK1 leads CLK0", matching the
+         * high-band path's real, empirically-correct behavior instead
+         * of its own comment's (wrong) description of itself. */
         frac_divide(fvco, freq_hz, &ms_p1, &ms_p2);
-        ok &= wr_ms(REG_MS0_BASE, ms_p1, ms_p2, FRAC_C, "MS0 -> freq (low-band align)");
+        ok &= wr_ms(REG_MS1_BASE, ms_p1, ms_p2, FRAC_C, "MS1 -> freq (low-band align)");
 
         /* Step 4: wait for exactly 90 degrees of accumulated lag. */
         delay_us_dwt(LOWF_PHASE_SHIFT_US);
 
-        /* Step 5: MS1 (CLK1) catches up to the real freq too - now
-         * carrying the 90-degree lag forward. */
-        ok &= wr_ms(REG_MS1_BASE, ms_p1, ms_p2, FRAC_C, "MS1 -> freq (low-band align)");
+        /* Step 5: MS0 (CLK0) catches up to the real freq too - now
+         * carrying the 90-degree lag forward (see step 3's comment
+         * for why CLK0, not CLK1, is the one left behind now). */
+        ok &= wr_ms(REG_MS0_BASE, ms_p1, ms_p2, FRAC_C, "MS0 -> freq (low-band align)");
 
         if (ok) {
             s_last_lowf_zone = zone;
@@ -505,7 +552,20 @@ uint8_t ms5351_set_lo_freq(uint32_t freq_hz)
         /* Divider (and therefore phase offset) changed: reprogram the
          * output Multisynths and phases, then reset PLLB to latch the
          * 90-degree relationship. Kept out of the common retune path
-         * because the PLL reset produces an audible click. */
+         * because the PLL reset produces an audible click. This is
+         * ALSO the natural place to re-assert the output-enable mask
+         * (added 01/09/2026, alongside ms5351_lo_disable() below,
+         * fixing a real gap): s_last_div gets force-invalidated to 0
+         * both by ms5351_lo_disable() and by the high-band/low-band
+         * crossover paths precisely so the NEXT call always lands
+         * here - but before this fix, nothing in this branch actually
+         * touched REG_OE_CTRL, so a prior ms5351_lo_disable() (which
+         * DOES mask the outputs off in reg3) was never actually
+         * undone by a plain ms5351_set_lo_freq() call, contradicting
+         * ms5351_lo_disable()'s own header comment ("no separate
+         * re-enable call needed"). Writing it unconditionally here
+         * every time the full reprogram runs makes that claim true
+         * without adding any new state to track. */
         ok &= wr_ms(REG_MS0_BASE, ms_p1, 0UL, 1UL, "MS0");
         ok &= wr_reg(REG_CLK0_CTRL, CLKCTRL_QUAD_PLLB, "reg16 CLK0 on/PLLB");
         ok &= wr_reg(REG_CLK0_PHASE, (uint8_t)div, "reg165 CLK0 phase");
@@ -514,6 +574,7 @@ uint8_t ms5351_set_lo_freq(uint32_t freq_hz)
         ok &= wr_reg(REG_CLK0_CTRL + 1U, CLKCTRL_QUAD_PLLB, "reg17 CLK1 on/PLLB");
         ok &= wr_reg(REG_CLK1_PHASE, 0U, "reg166 CLK1 phase=0");
 
+        ok &= wr_reg(REG_OE_CTRL, 0xFCU, "reg3 OE=CLK0|CLK1 (re-assert)");
         ok &= wr_reg(REG_PLL_RESET, PLL_RESET_B, "reg177 PLLB reset");
 
         if (ok) {
@@ -525,6 +586,43 @@ uint8_t ms5351_set_lo_freq(uint32_t freq_hz)
         /* Keep the front-end low-pass bank tracking the LO. */
         rf_lpf_select(freq_hz);
     }
+
+    return ok;
+}
+
+/*
+ * *** IMPLEMENTED 01/09/2026 - was declared in ms5351.h (13/08/2026)
+ * but never actually written here until now *** - needed for real
+ * this time by lo_gen_gd32.c: PA6/PA7 share the same physical nets as
+ * CLK0/CLK1 (through 100-ohm series resistors - see main.c's boot-time
+ * Hi-Z comment), so generating the LO via the GD32's own timer instead
+ * (below LO_GEN_CROSSOVER_HZ - see lo_gen_gd32.h) requires the MS5351
+ * side to be a GENUINE Hi-Z, not just quiet - two drivers on the same
+ * node otherwise. Bench-test signal injection (this function's
+ * original motivating use case, per its header comment) has the exact
+ * same real requirement, which is presumably why it was already
+ * documented even before anything called it.
+ *
+ * OE mask off (reg3) AND PDN bit set (reg16/17) - same "belt and
+ * braces" pairing ms5351_init()'s own power-down sequence uses.
+ * Invalidates BOTH s_last_div and s_last_lowf_zone (whichever path
+ * the next ms5351_set_lo_freq() call takes - high-band or low-band -
+ * is what actually re-asserts OE_CTRL again, per the gap-fix
+ * described in both of their "div/zone changed" branches above) so
+ * that next call is unconditionally a full reprogram, matching this
+ * function's own header comment ("no separate re-enable call
+ * needed").
+ */
+uint8_t ms5351_lo_disable(void)
+{
+    uint8_t ok = 1;
+
+    ok &= wr_reg(REG_OE_CTRL, 0xFFU, "reg3 OE=all off (lo_disable)");
+    ok &= wr_reg(REG_CLK0_CTRL, 0x80U, "reg16 CLK0 power down (lo_disable)");
+    ok &= wr_reg(REG_CLK0_CTRL + 1U, 0x80U, "reg17 CLK1 power down (lo_disable)");
+
+    s_last_div = 0U;
+    s_last_lowf_zone = 0U;
 
     return ok;
 }

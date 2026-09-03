@@ -187,12 +187,31 @@ void aic3204_scan_bus(void)
  * on the same bus - filtered out here).
  *
  * The clock chain this reveals is genuinely different from what this
- * driver assumed for a long time: the AIC3204's own PLL is enabled,
- * clocked from BCLK (not from a separate MCLK signal). Confirmed by
- * exact arithmetic against oscilloscope measurements: BCLK=6.144MHz,
- * PLL J=14 (D=0) -> PLL_CLK = 6.144MHz x 14 = 86.016MHz = CODEC_CLKIN.
- * This is why gd32_i2s.c no longer configures an MCLK pin at all - the
- * codec doesn't need one for this design.
+ * driver assumed for a long time - and was STILL wrong even after that
+ * revision, corrected again 01/09/2026 after the project owner
+ * pointed out the earlier claim made no physical sense: the codec is
+ * the I2S MASTER here (BCLK/WCLK are ITS outputs, per R27 above), so
+ * "the PLL is clocked from BCLK" would mean the PLL derives its own
+ * reference from a signal the codec itself only generates downstream
+ * of that very PLL - backwards. Re-decoded directly against register
+ * 4's real bit fields (confirmed against two independent real AIC3204
+ * configs, not this project's own guess): P0R4=0x43's low nibble
+ * matches the documented "0x03" pattern (PLL_CLKIN=MCLK device pin,
+ * CODEC_CLKIN=PLL_CLK) exactly - PLL_CLKIN is MCLK, not BCLK. P0R5=0x94
+ * decodes as PLL_ON=1, P=1 (bits 6:4=001), R=4 (bits 3:0=0100) using
+ * the same bit layout confirmed against a real working AIC3204 config
+ * (P0R5=0x91 documented there as "P=1 and R=1"). With PLL_CLKIN=MCLK=
+ * 1.536MHz (this project's own TIMER2_CH0/PC6 signal - see
+ * gd32_i2s_mclk_timer_start()) and R=4, J=14, D=0, P=1: CODEC_CLKIN =
+ * MCLK x R x J / P = 1.536MHz x 4 x 14 / 1 = 86.016MHz exactly -
+ * matches independently, with no need to invoke BCLK at all. This is
+ * ALSO now consistent with a real-hardware experiment the SAME day:
+ * disabling gd32_i2s_mclk_timer_start() (on the theory that this
+ * comment's old, wrong claim made it vestigial) caused real, observed
+ * problems (frequencies off, degraded WFM reception) - MCLK generation
+ * is genuinely required, not vestigial, and was restored. The earlier
+ * "gd32_i2s.c no longer configures an MCLK pin at all" note that used
+ * to follow this paragraph was simply wrong and has been removed.
  *
  * *** 04/08/2026: Fs 192kHz -> 48kHz *** (per the project owner, to
  * fit the SSB/NR audio ISR back inside its real-time budget - see
@@ -341,8 +360,12 @@ void aic3204_configure_rate(aic3204_rate_t rate)
 
     wr(0, 0x00, 0x00, "select page 0 (after hardware nRESET)");
 
-    /* --- Clock/PLL: CODEC_CLKIN sourced via PLL from BCLK, PLL ON,
-     * J=14/D=0, giving CODEC_CLKIN=86.016MHz from BCLK=6.144MHz --- */
+    /* --- Clock/PLL: CODEC_CLKIN sourced via PLL from MCLK (P0R4's
+     * real bits - see this function's header comment for the
+     * corrected 01/09/2026 decode; NOT from BCLK, the earlier
+     * comment here was wrong), PLL ON, P=1/R=4/J=14/D=0, giving
+     * CODEC_CLKIN=86.016MHz from MCLK=1.536MHz (this project's own
+     * TIMER2_CH0/PC6 signal) --- */
 #if AIC3204_TEST_LOOPBACK
     wr(0, 0x04, 0x43, "R4 CODEC_CLKIN mux (captured)");
     wr(0, 0x05, 0x94, "R5 PLL on + P/R (captured)");
@@ -660,9 +683,9 @@ void aic3204_phase2_init(aic3204_rate_t rate)
     aic3204_start_bclk_wclk(rate);
     aic3204_set_rate_power_up();
     debug_print_dec("aic3204: phase 2 complete - full sequence ported from a real I2C "
-                     "capture of the original firmware. PLL sourced from BCLK (not MCLK), "
-                     "J=14/D=0 -> CODEC_CLKIN=86.016MHz -> Fs exact on both ADC and DAC "
-                     "divider chains (0=96K,1=192K)", (uint32_t)rate);
+                     "capture of the original firmware. PLL sourced from MCLK (not BCLK - "
+                     "corrected 01/09/2026), P=1/R=4/J=14/D=0 -> CODEC_CLKIN=86.016MHz -> Fs "
+                     "exact on both ADC and DAC divider chains (0=96K,1=192K)", (uint32_t)rate);
 }
 
 

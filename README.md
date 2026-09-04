@@ -1,4 +1,4 @@
-# Descrption
+# DEEPSDR 101 / HTOOL/ BAJEI SDR V5 GD32F450 Open Source Firmware
 
 This project is a collaboration between EA8DGL Esteban, UA6YKK Alexandr and 
 EA7GIB Blas, aiming to create open firmware for the DEEPSDR 101 and BAJEI SDR V5 
@@ -30,7 +30,8 @@ or any third party.
 
 You are solely responsible for:
 - Verifying that this firmware is suitable for and compatible with
-  your specific hardware before flashing it.
+  your specific hardware before flashing it (check that your mcu is
+  the GD32F450VET6/VGT6!!!).
 - Complying with all applicable radio spectrum, transmission, and
   equipment regulations in your country/region. (This firmware
   targets a *receiver* - it is not designed or intended to transmit -
@@ -44,8 +45,7 @@ No support, maintenance, or fitness for any particular use case is
 guaranteed. Use of this project constitutes acceptance of this
 disclaimer.
 
-# DEEPSDR 101 / HTOOL/ BAJEI SDR V5 GD32F450 Open Firmware — Project, 
-# Flashing & UI Overview
+## Overview
 
 This document covers three things deliberately kept separate from the
 hardware/clock-tree description: what the project is, how to build
